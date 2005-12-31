@@ -51,8 +51,8 @@
 #include "chan_capi20.h"
 #include "chan_capi.h"
 
-/* #define CC_VERSION "cm-x.y.z" */
-#define CC_VERSION "$Revision$"
+#define CC_VERSION "cm-0.6.2"
+/* #define CC_VERSION "$Revision$" */
 
 /*
  * personal stuff
