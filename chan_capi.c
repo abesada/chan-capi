@@ -270,30 +270,37 @@ static MESSAGE_EXCHANGE_ERROR check_wait_get_cmsg(_cmsg *CMSG)
 {
 	MESSAGE_EXCHANGE_ERROR Info;
 	struct timeval tv;
+
+ repeat:
+	Info = capi_get_cmsg(CMSG, capi_ApplID);
+
+#if (CAPI_OS_HINT == 1) || (CAPI_OS_HINT == 2)
+	/*
+	 * For BSD allow controller 0:
+	 */
+	if ((HEADER_CID(CMSG) & 0xFF) == 0) {
+		HEADER_CID(CMSG) += capi_num_controllers;
+ 	}
+#endif
+
+	/* if queue is empty */
+	if (Info == 0x1104) {
+		/* try waiting a maximum of 0.100 seconds for a message */
+		tv.tv_sec = 0;
+		tv.tv_usec = 10000;
+		
+		Info = capi20_waitformessage(capi_ApplID, &tv);
+
+		if (Info == 0x0000)
+			goto repeat;
+	}
 	
-	tv.tv_sec = 0;
-	tv.tv_usec = 10000;
-	
-	Info = capi20_waitformessage(capi_ApplID, &tv);
 	if ((Info != 0x0000) && (Info != 0x1104)) {
 		if (capidebug) {
 			cc_log(LOG_DEBUG, "Error waiting for cmsg... INFO = %#x\n", Info);
 		}
-		return Info;
 	}
     
-	if (Info == 0x0000) {
-		Info = capi_get_cmsg(CMSG, capi_ApplID);
-
-  		/* There is no reason not to
-		 * allow controller 0 !
- 		 *
- 		 * For BSD hide problem from "chan_capi":
- 		 */
- 		if((HEADER_CID(CMSG) & 0xFF) == 0) {
-			HEADER_CID(CMSG) += capi_num_controllers;
- 		}
-	}
 	return Info;
 }
 
@@ -303,7 +310,8 @@ static MESSAGE_EXCHANGE_ERROR check_wait_get_cmsg(_cmsg *CMSG)
 static unsigned ListenOnController(unsigned long CIPmask, unsigned controller)
 {
 	MESSAGE_EXCHANGE_ERROR error;
-	_cmsg                  CMSG,CMSG2;
+	_cmsg CMSG;
+	int waitcount = 100;
 
 	LISTEN_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), controller);
 
@@ -311,13 +319,26 @@ static unsigned ListenOnController(unsigned long CIPmask, unsigned controller)
 		/* 0x00ff if no early B3 should be done */
 		
 	LISTEN_REQ_CIPMASK(&CMSG) = CIPmask;
-	if ((error = _capi_put_cmsg(&CMSG)) != 0) {
-		return error;
+	error = _capi_put_cmsg(&CMSG);
+
+	if (error)
+		goto done;
+
+	while (waitcount) {
+		error = check_wait_get_cmsg(&CMSG);
+
+		if (IS_LISTEN_CONF(&CMSG)) {
+			error = LISTEN_CONF_INFO(&CMSG);
+			break;
+		}
+		usleep(20000);
+		waitcount--;
 	}
-	while (!IS_LISTEN_CONF(&CMSG2)) {
-		error = check_wait_get_cmsg(&CMSG2);
-	}
-	return 0;
+	if (!waitcount)
+		error = 0x100F;
+
+ done:
+	return error;
 }
 
 #ifdef CC_AST_CHANNEL_HAS_TRANSFERCAP
@@ -3291,8 +3312,8 @@ static void capi_handle_connect_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 				i->name, i->cid, i->dnid);
 
 			*interface = i;
-			cc_mutex_lock(&i->lock);
 			cc_mutex_unlock(&iflock);
+			cc_mutex_lock(&i->lock);
 		
 #ifdef CC_AST_CHANNEL_HAS_TRANSFERCAP	
 			pbx_builtin_setvar_helper(i->owner, "TRANSFERCAPABILITY", transfercapability2str(i->owner->transfercapability));
@@ -4152,6 +4173,13 @@ static void *do_monitor(void *data)
 		case 0x1104:
 			/* CAPI queue is empty */
 			break;
+		case 0x1101:
+			/* The application ID is no longer valid.
+			 * This error is fatal, and "chan_capi" 
+			 * should restart.
+			 */
+			cc_log(LOG_ERROR, "CAPI reports application ID no longer valid, PANIC\n");
+			return NULL;
 		default:
 			/* something is wrong! */
 			break;
@@ -4628,11 +4656,13 @@ static int cc_init_capi(void)
 static int cc_post_init_capi(void)
 {
 	int controller;
+	unsigned error;
 
 	for (controller = 1; controller <= capi_num_controllers; controller++) {
 		if (capi_used_controllers & (1 << controller)) {
-			if (ListenOnController(ALL_SERVICES, controller) != 0) {
-				cc_log(LOG_ERROR,"Unable to listen on contr%d\n", controller);
+			if ((error = ListenOnController(ALL_SERVICES, controller)) != 0) {
+				cc_log(LOG_ERROR,"Unable to listen on contr%d (error=0x%x)\n",
+					controller, error);
 			} else {
 				cc_verbose(2, 0, VERBOSE_PREFIX_3 "listening on contr%d CIPmask = %#x\n",
 					controller, ALL_SERVICES);
