@@ -51,7 +51,7 @@
 #include "chan_capi20.h"
 #include "chan_capi.h"
 
-/* #define CC_VERSION "cm-0.6.3" */
+/* #define CC_VERSION "cm-x.y.z" */
 #define CC_VERSION "$Revision$"
 
 /*
@@ -77,6 +77,36 @@ STANDARD_LOCAL_USER;
 LOCAL_USER_DECL;
 
 static int usecnt;
+
+/*
+ * LOCKING RULES
+ * =============
+ *
+ * This channel driver uses several locks. One must be 
+ * careful not to reverse the locking order, which will
+ * lead to a so called deadlock. Here is the locking order
+ * that must be followed:
+ *
+ * struct capi_pvt *i;
+ *
+ * 1. cc_mutex_lock(&i->owner->lock); **
+ *
+ * 2. cc_mutex_lock(&i->lock);
+ *
+ * 3. cc_mutex_lock(&iflock);
+ * 4. cc_mutex_lock(&contrlock);
+ *
+ * 5. cc_mutex_lock(&messagenumber_lock);
+ * 6. cc_mutex_lock(&usecnt_lock);
+ * 7. cc_mutex_lock(&capi_put_lock);
+ *
+ *
+ *  ** the PBX will call the callback functions with 
+ *     this lock locked. This lock protects the 
+ *     structure pointed to by 'i->owner'. Also note
+ *     that calling some PBX functions will lock
+ *     this lock!
+ */
 
 AST_MUTEX_DEFINE_STATIC(messagenumber_lock);
 AST_MUTEX_DEFINE_STATIC(usecnt_lock);
