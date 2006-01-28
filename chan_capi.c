@@ -3034,7 +3034,7 @@ static void capi_handle_disconnect_indication(_cmsg *CMSG, unsigned int PLCI, un
 	
 	if (pipe_frame(i, &fr) == -1) {
 		/*
-		 * in this case * did not read our hangup control frame
+		 * in this case the PBX did not read our hangup control frame
 		 * so we must hangup the channel!
 		 */
 		if ( (i->owner) && (state != CAPI_STATE_DISCONNECTED) && (state != CAPI_STATE_INCALL) &&
