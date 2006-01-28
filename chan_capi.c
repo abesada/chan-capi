@@ -33,6 +33,7 @@
 #include <asterisk/utils.h>
 #include <asterisk/cli.h>
 #include <asterisk/causes.h>
+#include <asterisk/strings.h>
 #ifndef CC_AST_NO_DEVICESTATE
 #include <asterisk/devicestate.h>
 #endif
@@ -915,7 +916,7 @@ static int capi_call(struct ast_channel *c, char *idest, int timeout)
 	_cmsg CMSG;
 	MESSAGE_EXCHANGE_ERROR  error;
 
-	strncpy(buffer, idest, sizeof(buffer) - 1);
+	cc_copy_string(buffer, idest, sizeof(buffer));
 	parse_dialstring(buffer, &interface, &dest, &param, &ocid);
 
 	cc_mutex_lock(&i->lock);
@@ -1000,7 +1001,7 @@ static int capi_call(struct ast_channel *c, char *idest, int timeout)
 	CONNECT_REQ_CIPVALUE(&CMSG) = 0x10; /* Telephony */
 #endif
 	if ((i->doOverlap) && (strlen(dest))) {
-		strncpy(i->overlapdigits, dest, sizeof(i->overlapdigits) - 1);
+		cc_copy_string(i->overlapdigits, dest, sizeof(i->overlapdigits));
 		called[0] = 1;
 	} else {
 		i->doOverlap = 0;
@@ -1013,18 +1014,18 @@ static int capi_call(struct ast_channel *c, char *idest, int timeout)
 
 #ifdef CC_AST_CHANNEL_HAS_CID
 	if (c->cid.cid_num) 
-		strncpy(callerid, c->cid.cid_num, sizeof(callerid) - 1);
+		cc_copy_string(callerid, c->cid.cid_num, sizeof(callerid));
 #else
 	if (c->callerid) 
-		strncpy(callerid, c->callerid, sizeof(callerid) - 1);
+		cc_copy_string(callerid, c->callerid, sizeof(callerid));
 #endif
 	else
 		memset(callerid, 0, sizeof(callerid));
 
 	if (use_defaultcid) {
-		strncpy(callerid, i->defaultcid, sizeof(callerid) - 1);
+		cc_copy_string(callerid, i->defaultcid, sizeof(callerid));
 	} else if (ocid) {
-		strncpy(callerid, ocid, sizeof(callerid) - 1);
+		cc_copy_string(callerid, ocid, sizeof(callerid));
 	}
 
 	calling[0] = strlen(callerid) + 2;
@@ -1585,7 +1586,7 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 	tmp->pvt->rawreadformat = fmt;
 	tmp->pvt->rawwriteformat = fmt;
 #endif
-	strncpy(tmp->context, i->context, sizeof(tmp->context) - 1);
+	cc_copy_string(tmp->context, i->context, sizeof(tmp->context));
 #ifdef CC_AST_CHANNEL_HAS_CID
 	if (!ast_strlen_zero(i->cid))
 		tmp->cid.cid_num = strdup(i->cid);
@@ -1599,9 +1600,9 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 		tmp->dnid = strdup(i->dnid);
 #endif
 	
-	strncpy(tmp->exten, i->dnid, sizeof(tmp->exten) - 1);
-	strncpy(tmp->accountcode, i->accountcode, sizeof(tmp->accountcode) - 1);
-	strncpy(tmp->language, i->language, sizeof(tmp->language) - 1);
+	cc_copy_string(tmp->exten, i->dnid, sizeof(tmp->exten));
+	cc_copy_string(tmp->accountcode, i->accountcode, sizeof(tmp->accountcode));
+	cc_copy_string(tmp->language, i->language, sizeof(tmp->language));
 	i->owner = tmp;
 	cc_mutex_lock(&usecnt_lock);
 	usecnt++;
@@ -1632,7 +1633,7 @@ struct ast_channel *capi_request(char *type, int format, void *data)
 
 	cc_verbose(1, 1, VERBOSE_PREFIX_4 "data = %s\n", (char *)data);
 
-	strncpy(buffer, (char *)data, sizeof(buffer) - 1);
+	cc_copy_string(buffer, (char *)data, sizeof(buffer));
 	parse_dialstring(buffer, &interface, &dest, &param, &ocid);
 
 	if ((!interface) || (!dest)) {
@@ -1700,7 +1701,7 @@ struct ast_channel *capi_request(char *type, int format, void *data)
 			}
 		}
 		/* when we come here, we found a free controller match */
-		strncpy(i->dnid, dest, sizeof(i->dnid) - 1);
+		cc_copy_string(i->dnid, dest, sizeof(i->dnid));
 		i->controller = foundcontroller;
 		tmp = capi_new(i, AST_STATE_RESERVED);
 		if (!tmp) {
@@ -2033,7 +2034,7 @@ static int search_did(struct ast_channel *c)
 
 	if (ast_exists_extension(NULL, c->context, exten, 1, i->cid)) {
 		c->priority = 1;
-		strncpy(c->exten, exten, sizeof(c->exten) - 1);
+		cc_copy_string(c->exten, exten, sizeof(c->exten));
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: %s: %s matches in context %s\n",
 			i->name, c->name, exten, c->context);
 		return 0;
@@ -3233,14 +3234,14 @@ static void capi_handle_connect_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 			if (bchannelinfo[0] == '0')
 				continue;
 		}
-		strncpy(buffer, i->incomingmsn, sizeof(buffer) - 1);
+		cc_copy_string(buffer, i->incomingmsn, sizeof(buffer));
 		for (msn = strtok_r(buffer, ",", &buffer_rp); msn; msn = strtok_r(NULL, ",", &buffer_rp)) {
 			if (!strlen(DNID)) {
 				/* if no DNID, only accept if '*' was specified */
 				if (strncasecmp(msn, magicmsn, strlen(msn))) {
 					continue;
 				}
-				strncpy(i->dnid, emptydnid, sizeof(i->dnid) - 1);
+				cc_copy_string(i->dnid, emptydnid, sizeof(i->dnid));
 			} else {
 				/* make sure the number match exactly or may match on ptp mode */
 				cc_verbose(4, 1, VERBOSE_PREFIX_4 "%s: msn='%s' DNID='%s' %s\n",
@@ -3253,7 +3254,7 @@ static void capi_handle_connect_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 				   (strncasecmp(msn, magicmsn, strlen(msn)))) {
 					continue;
 				}
-				strncpy(i->dnid, DNID, sizeof(i->dnid) - 1);
+				cc_copy_string(i->dnid, DNID, sizeof(i->dnid));
 			}
 			if (CID != NULL) {
 				if ((callernplan & 0x70) == CAPI_ETSI_NPLAN_NATIONAL)
@@ -3266,7 +3267,7 @@ static void capi_handle_connect_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 					snprintf(i->cid, (sizeof(i->cid)-1), "%s%s",
 						i->prefix, CID);
 			} else {
-				strncpy(i->cid, emptyid, sizeof(i->cid) - 1);
+				cc_copy_string(i->cid, emptyid, sizeof(i->cid));
 			}
 			i->cip = CONNECT_IND_CIPVALUE(CMSG);
 			i->controller = controller;
@@ -4244,17 +4245,17 @@ int mkif(struct cc_capi_conf *conf)
 			snprintf(tmp->name, sizeof(tmp->name) - 1, "%s-pseudo-D", conf->name);
 			tmp->channeltype = CAPI_CHANNELTYPE_D;
 		} else {
-			strncpy(tmp->name, conf->name, sizeof(tmp->name) - 1);
+			cc_copy_string(tmp->name, conf->name, sizeof(tmp->name));
 			tmp->channeltype = CAPI_CHANNELTYPE_B;
 		}
-		strncpy(tmp->context, conf->context, sizeof(tmp->context) - 1);
-		strncpy(tmp->incomingmsn, conf->incomingmsn, sizeof(tmp->incomingmsn) - 1);
-		strncpy(tmp->defaultcid, conf->defaultcid, sizeof(tmp->defaultcid) - 1);
-		strncpy(tmp->prefix, conf->prefix, sizeof(tmp->prefix)-1);
-		strncpy(tmp->accountcode, conf->accountcode, sizeof(tmp->accountcode) - 1);
-		strncpy(tmp->language, conf->language, sizeof(tmp->language) - 1);
+		cc_copy_string(tmp->context, conf->context, sizeof(tmp->context));
+		cc_copy_string(tmp->incomingmsn, conf->incomingmsn, sizeof(tmp->incomingmsn));
+		cc_copy_string(tmp->defaultcid, conf->defaultcid, sizeof(tmp->defaultcid));
+		cc_copy_string(tmp->prefix, conf->prefix, sizeof(tmp->prefix));
+		cc_copy_string(tmp->accountcode, conf->accountcode, sizeof(tmp->accountcode));
+		cc_copy_string(tmp->language, conf->language, sizeof(tmp->language));
 
-		strncpy(buffer, conf->controllerstr, sizeof(buffer) - 1);
+		cc_copy_string(buffer, conf->controllerstr, sizeof(buffer));
 		contr = strtok_r(buffer, ",", &buffer_rp);
 		while (contr != NULL) {
 			u_int16_t unit = atoi(contr);
@@ -4661,7 +4662,7 @@ static int conf_interface(struct cc_capi_conf *conf, struct ast_variable *v)
 {
 #define CONF_STRING(var, token)            \
 	if (!strcasecmp(v->name, token)) { \
-		strncpy(var, v->value, sizeof(var) - 1); \
+		cc_copy_string(var, v->value, sizeof(var)); \
 		continue;                  \
 	}
 #define CONF_INTEGER(var, token)           \
@@ -4798,17 +4799,17 @@ static int capi_eval_config(struct ast_config *cfg)
 	float txgain = 1.0;
 
 	/* prefix defaults */
-	strncpy(capi_national_prefix, CAPI_NATIONAL_PREF, sizeof(capi_national_prefix) - 1);
-	strncpy(capi_international_prefix, CAPI_INTERNAT_PREF, sizeof(capi_international_prefix) - 1);
+	cc_copy_string(capi_national_prefix, CAPI_NATIONAL_PREF, sizeof(capi_national_prefix));
+	cc_copy_string(capi_international_prefix, CAPI_INTERNAT_PREF, sizeof(capi_international_prefix));
 
 	/* read the general section */
 	for (v = ast_variable_browse(cfg, "general"); v; v = v->next) {
 		if (!strcasecmp(v->name, "nationalprefix")) {
-			strncpy(capi_national_prefix, v->value, sizeof(capi_national_prefix) - 1);
+			cc_copy_string(capi_national_prefix, v->value, sizeof(capi_national_prefix));
 		} else if (!strcasecmp(v->name, "internationalprefix")) {
-			strncpy(capi_international_prefix, v->value, sizeof(capi_international_prefix) - 1);
+			cc_copy_string(capi_international_prefix, v->value, sizeof(capi_international_prefix));
 		} else if (!strcasecmp(v->name, "language")) {
-			strncpy(default_language, v->value, sizeof(default_language) - 1);
+			cc_copy_string(default_language, v->value, sizeof(default_language));
 		} else if (!strcasecmp(v->name, "rxgain")) {
 			if (sscanf(v->value,"%f",&rxgain) != 1) {
 				cc_log(LOG_ERROR,"invalid rxgain\n");
@@ -4843,8 +4844,8 @@ static int capi_eval_config(struct ast_config *cfg)
 		conf.ecoption = EC_OPTION_DISABLE_G165;
 		conf.ectail = EC_DEFAULT_TAIL;
 		conf.ecSelector = FACILITYSELECTOR_ECHO_CANCEL;
-		strncpy(conf.name, cat, sizeof(conf.name) - 1);
-		strncpy(conf.language, default_language, sizeof(conf.language) - 1);
+		cc_copy_string(conf.name, cat, sizeof(conf.name));
+		cc_copy_string(conf.language, default_language, sizeof(conf.language));
 
 		if (conf_interface(&conf, ast_variable_browse(cfg, cat))) {
 			cc_log(LOG_ERROR, "Error interface config.\n");
