@@ -309,7 +309,6 @@ struct capi_pvt {
 
 	/* outgoing queue count */
 	int B3q;
-	ast_mutex_t lockB3q;
 
 	/* do ECHO SURPRESSION */
 	int ES;
