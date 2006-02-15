@@ -1,0 +1,244 @@
+(CAPI*) chan_capi a Common ISDN API 2.0 implementation
+for Asterisk/OpenPBX
+
+ Copyright (C) 2006 Hans Petter Selasky 
+ <hselasky@c2i.net>
+
+ Copyright (C) 2005 Cytronics & Melware
+ Armin Schindler <armin@melware.de>
+ 
+ Reworked, but based on the work of
+ Copyright (C) 2002-2005 Junghanns.NET GmbH
+ Klaus-Peter Junghanns <kpj@junghanns.net>
+
+ Ported to OpenPBX.org 22nd October 2004,
+ Rob Thomas, <xrobau@gmail.com>
+
+This program is free software and may be modified and distributed under
+the terms of the GNU Public License. There is _NO_ warranty for this!
+
+Thanks go to the debuggers, bugfixers and contributors :)
+===========================================================================
+Lele Forzani <lele@windmill.it>
+Florian Overkamp <florian@obsimref.com>
+Gareth Watts <gareth@omnipotent.net>
+Jeff Noxon <jeff@planetfall.com>
+Petr Michalek <petr.michalek@aca.cz>
+Jan Stocker
+Frank Sautter, levigo group
+Hans Petter Selasky
+
+(...and all the others that have been forgotten...) :-)
+
+This chan_capi version includes:
+================================
+- Multiple controller support
+- CID,DNID (callling party, called party)
+- CLIR/CLIP
+- Supplementary services, CD,HOLD,RETRIEVE,ECT
+- DTMF (dependend on card) + software DTMF support
+- Early B3 connects (always,success,never)
+- Digital audio (what did you think?)
+- Incoming/outgoing calls
+- Overlap sending (dialtone and additional digits)
+- E(xplicit) C(all) T(ransfer) (...although it's done implicit-but don't tell!)
+- Tuneable latency:  you can configure the size of B3 blocks at compile time
+  (in chan_capi.h, AST_CAPI_MAX_B3_BLOCK_SIZE)
+  The default is 160 samples, for non-VoIP use you can tune it down to 130
+- Use asterisks internal DSP functions for DTMF
+- Alaw support 
+- Ulaw support! 
+- Eicon CAPI echo cancelation (echocancel=1)
+- Reject call waiting (ACO)
+- DID for Point to Point mode (a.k.a overlap receiving)
+- Rx/Tx gains (rxgain=1.0)
+- (Inter)national dialing prefix (for callerid) configurable in capi.conf
+- CLI command "capi info" shows B channel status of chan_capi
+  The called party can press # to drop the call
+- Catch all MSN (incomingmsn=*)
+- Some configuration enhancements (msn=123,124,125 and controller=1,2,3,4)
+- Added accountcode= 
+- Echo squelching (echosquelch=1)
+- Callgroup support
+- report correct DIALSTATUS and HANGUPCAUSE.
+- Updated to support the new frame->delivery field
+- Compiles with different Asterisk versions (automatic build configuration)
+- receive faxes over CAPI (see below)
+- Fixes and compatibility for BSD (Jan Stocker and Hans Petter Selasky)
+- Support 'type of number'.
+- ISDN hold.
+- CAPI Line Interconnect.
+
+Permissions
+===========
+
+OpenPBX.org, by default, runs as the non-root user/group
+openpbx/openpbx.  You must make sure that the /dev/capi* device files
+are readable by OpenPBX.org either by changing the ownership or the
+permissions of the the device files or by running OpenPBX.org as root.
+
+Example configuration files
+===========================
+
+See "capi.conf" and "extensions.conf"
+
+
+CAPI command application
+========================
+chan_capi provides an additional Asterisk application
+   capicommand()
+With this application, special capi commands and features can be used.
+
+Call Deflection:
+    Forwards an unanswered call to another number.
+        Example:
+        exten => s,1,capicommand(deflect|12345678)
+  
+Fax receive:
+    Receive a fax using CAPI.
+        Example:
+        exten => s,1,capicommand(receivefax|/tmp/${UNIQUEID}|+49 6137 555123|Asterisk)
+	(more see below)
+
+Enable/Disable echosquelch:
+    Enable or disable a very primitive echo suppressor.
+    Disable this before you start recording voicemail or your files may get choppy.
+        Example:
+        exten => s,1,capicommand(echosquelch|yes)
+          or
+        exten => s,1,capicommand(echosquelch|no)
+
+Malicious Call Identification:
+    Report a call of malicious nature.
+        Example:
+        exten => s,1,capicommand(malicious)
+
+Hold:
+    Puts an answered call on hold, this has nothing to do with asterisk's onhold
+    thingie (music et al).
+        Example:
+        exten => s,1,capicommand(hold)
+
+Holdtype:
+    Set the type of 'hold'. When Asterisk wants to put the call on hold, the specified method
+    will be used.
+        Example:
+        exten => s,1,capicommand(holdtype|local)  ;no hold, Asterisk can play MOH
+         or
+        exten => s,1,capicommand(holdtype|hold)   ;ISDN-HOLD 
+         or
+        ; not yet implemented
+        exten => s,1,capicommand(holdtype|notify) ;notify the peer only, Asterisk can play MOH
+
+
+Retrieve:
+    Gets back the holded call.
+        Example:
+        exten => s,1,capicommand(retrieve)
+
+ECT:
+    Explicit call transfer of the call on hold (must put call on hold first!)
+        [macro-capiect]
+        exten => s,1,capicommand(ect)
+        [default]
+        exten => s,1,capicommand(hold)
+        exten => s,2,Wait(1)
+        exten => s,3,Dial(CAPI/contr1/1234,60,M(capiect))
+
+
+Short HOWTO of capicommand(receivefax|<filename>[|<stationid>|<headline>]):
+==========================================================================
+For those of you who have a CAPI card with an on-board DSP (like some Eicon and
+DIVA Server), this patch allows you to receive faxes.
+If you want to answer a channel in fax mode, use capicommand(receivefax|...)
+instead of Answer()
+If you use Answer(), you will be in voice mode. If the hardware DSP detects 
+fax tone, you can switch from voice to fax mode by calling capicommand(receivefax|...).
+The parameter <filename> is mandatory and the parameters <stationid> and
+<headline> are optional.
+
+Example of use :
+line number 123, play something, if a fax tone is detected, handle it
+line number 124, answer directly in fax mode
+
+[incoming]
+exten => 123,1,Answer()
+exten => 123,2,BackGround(jpop)
+exten => 124,1,Goto(handle_fax,s,1)
+exten => fax,1,Goto(handle_fax,s,1)
+
+[handle_fax]
+exten => s,1,capicommand(receivefax|/tmp/${UNIQUEID}[|<stationid>|<headline>])
+exten => s,2,Hangup()
+exten => h,1,deadagi,fax.php // Run sfftobmp and mail it.
+
+The output of capicommand(receivefax|...) is a SFF file.
+Use sfftobmp to convert it.
+With a DIVA Server, following features are provided:
+ - fax up to 33600
+ - high resolution
+ - Color Fax 
+ - JPEG Compression is disabled (not tested yet)
+
+After successful receive of a fax, the following variables will be set for that channel:
+FAXRATE       : The baud rate of the fax connection
+FAXRESOLUTION : 0 = standard, 1 = high
+FAXFORMAT     : 0 = SFF
+FAXPAGES      : Number of pages received
+FAXID         : The ID of the remote fax maschine
+
+Asterisk variables used/set by chan_capi
+========================================
+
+BCHANNELINFO
+    On incomming call, this variable is set with the B-channel information value:
+     '0' : B-channel is used (default)
+     '1' : D-channel is used (not implemented yet)
+     '2' : neither B nor D channel is used (e.g. call waiting)
+    Call-Waiting: an incoming call with BCHANNELINFO not '0' cannot be accepted.
+    Another connection must be dropped before accepting or use
+    capicommand(deflect|<number>) to initiate call deflection to another destination.
+
+CALLEDTON
+    The 'type of number' value of the called number is saved in this variable on
+    incomming call.
+
+_CALLERHOLDID
+    If a call is put on hold (ISDN-HOLD), the reference id is saved in this variable.
+    This variable is inherited as CALLERHOLDID to the dialed channel and will be used
+    if e.g. capicommand(ect) is used to transfer the held call.
+
+CALLINGSUBADDRESS
+    If set on dial(), the calling subaddress will be set to the content.
+
+CALLEDSUBADDRESS
+    If set on dial(), the called subaddress will be set to the content.
+ 
+CONNECTEDNUMBER
+    Can be set before answering and if set, the content is used for
+    IE 'Connected Number' on answering.
+
+FAXEXTEN
+    If chan_capi sends the call to extensions 'fax', the original extension number
+    is saved in this variable.
+
+PRI_CAUSE
+    If set, this value will be used as hangup cause on hangup.
+
+REDIRECTINGNUMBER
+    On incoming call, if the call was redirected to you by someone, the
+    number of the redirecting party is saved in this variable.
+    RDNIS is set as well.
+
+REDIRECTREASON
+    If the incoming call was redirected to you, this variable is set
+    with the reason value.
+ 
+
+Functions (available with newer Asterisk only)
+==============================================
+
+VANITYNUMBER(<vanitynumber>)
+    Converts the 'vanitynumber' into a digit-only string. International keypad is
+    used, e.g. ABC=1, DEF=2, ...
+
