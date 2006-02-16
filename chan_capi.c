@@ -1570,7 +1570,8 @@ cd_free(struct call_desc *cd, u_int8_t hangup_what)
     struct ast_channel *pbx_chan = cd->pbx_chan;
     struct cc_capi_application *p_app = cd->p_app;
     u_int16_t wCause_in = cd->wCause_in;
-    u_int8_t hard_hangup = (cd->flags.pbx_started == 0);
+    u_int8_t hard_hangup = ((cd->flags.pbx_started == 0) &&
+			    (cd->flags.dir_outgoing == 0));
 
     if (p_app == NULL) {
         /* should not happen */
