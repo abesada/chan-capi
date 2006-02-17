@@ -1973,6 +1973,14 @@ cd_set_cep(struct call_desc *cd, struct config_entry_iface *cep)
 		  sizeof(pbx_chan->language));
     }
 
+    if (pbx_chan) {
+
+        /* set default channel name */
+
+	snprintf(pbx_chan->name, sizeof(pbx_chan->name), 
+		 "CAPI/%s/", cep->name);
+    }
+
     /* configure DSP, if present */
 
     if (pbx_dsp) {
@@ -4300,10 +4308,10 @@ capi_handle_info_indication(_cmsg *CMSG, struct call_desc **pp_cd)
 		break;
 
 	case 0x001e:	/* Progress Indicator */
-		cd_verbose(cd, 3, 1, 3, "PI 0x%02x 0x%02x\n",
-			   ie_buf[0], ie_buf[1]);
+		cd_verbose(cd, 3, 1, 3, "PI 0x%02x 0x%02x 0x%02x\n",
+			   ie_buf[0], ie_buf[1], ie_buf[2]);
 
-		x = (ie_buf[1] & 0x7F);
+		x = (ie_buf[2] & 0x7F);
 
 		cd_handle_progress_indicator(cd, x);
 		break;
