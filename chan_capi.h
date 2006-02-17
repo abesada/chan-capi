@@ -58,23 +58,8 @@
 	     (((cd) && (cd)->pbx_chan) ? (const char *)(cd)->pbx_chan->name : \
 	      (const char *)"") ,## __VA_ARGS__)
 
-/* some helper functions */
-static inline void write_capi_word(void *m, u_int16_t val)
-{
-	((u_int8_t *)m)[0] = val & 0xff;
-	((u_int8_t *)m)[1] = (val >> 8) & 0xff;
-}
-
-static inline void write_capi_dword(void *m, u_int32_t val)
-{
-	((u_int8_t *)m)[0] = val & 0xff;
-	((u_int8_t *)m)[1] = (val >> 8) & 0xff;
-	((u_int8_t *)m)[2] = (val >> 16) & 0xff;
-	((u_int8_t *)m)[3] = (val >> 24) & 0xff;
-}
-
 /*
- * PBX defines
+ * PBX mutex wrappers
  */
 #define CC_MUTEX_DEFINE_STATIC AST_MUTEX_DEFINE_STATIC
 #define cc_mutex_init(x) ast_mutex_init(x)

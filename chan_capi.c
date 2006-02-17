@@ -931,14 +931,17 @@ capi_application_usleep(struct cc_capi_application *p_app, u_int32_t us)
 
     cc_mutex_unlock(&p_app->lock);
 
-    if (us > 1000000) {
+    if (us >= 1000000) {
 
         sleep(us / 1000000);
 
 	us %= 1000000;
     }
 
-    usleep(us);
+    if (us) {
+
+        usleep(us);
+    }
     cc_mutex_lock(&p_app->lock);
 
     p_app->sleep_count--;
@@ -2046,8 +2049,8 @@ cd_detect_dtmf(struct call_desc *cd, int subclass, const void *__data, int len)
 	temp_fr.frametype = AST_FRAME_DTMF;
 	temp_fr.subclass = digit;
 
-        cd_verbose(cd, 1, 1, 3, "Detected DTMF digit: '%c'\n",
-		   digit);
+        cd_verbose(cd, 1, 1, 3, "Detected DTMF "
+		   "digit: '%c'\n", digit);
 
 	cd->tx_queue_len++;
 
@@ -2249,8 +2252,6 @@ cd_handle_progress_indicator(struct call_desc *cd, const u_int8_t prog_ind)
     case 0x08:
         cd_verbose(cd, 4, 1, 4, "In-band information available\n");
 
-#warning "Double check that 0x08 is not a bit-flag!"
-
 	if (cd->flags.early_b3_enable &&
 	    cd->flags.dir_outgoing) { 
 
@@ -2274,18 +2275,19 @@ cd_handle_progress_indicator(struct call_desc *cd, const u_int8_t prog_ind)
     return 0;
 }
 
-#if (OS_HINT == 0)
-#warning "TODO: need to add support for capi_encode() to Linux!"
-#endif
-
 static void
 cd_set_fax_config(struct call_desc *cd, u_int16_t fax_format, 
 		  const char *stationid, const char *headline)
 {
+#if (CAPI_OS_HINT == 0)
+#warning "TODO: need to add support for capi_encode() to Linux!"
+#else
 	struct CAPI_B3_CONFIG_FAX_G3_DECODED b3_conf;
 
 	cc_verbose(3, 1, VERBOSE_PREFIX_3 "Setup fax b3conf fmt=%d, stationid='%s' "
 		   "headline='%s'\n", fax_format, stationid, headline);
+
+	cc_mutex_assert(&cd->p_app->lock, MA_OWNED);
 
 	CAPI_INIT(CAPI_B3_CONFIG_FAX_G3, &b3_conf);
 
@@ -2298,7 +2300,7 @@ cd_set_fax_config(struct call_desc *cd, u_int16_t fax_format,
 
 	cd->b3_config[0] = 
 	  capi_encode(&cd->b3_config[1], sizeof(cd->b3_config)-1, &b3_conf);
-
+#endif
 	return;
 }
 
@@ -2661,11 +2663,11 @@ capi_send_ect_req(struct call_desc *cd)
     _cmsg CMSG;
     char fac[8];
 
-    fac[0] = 7;	/* len */
-    fac[1] = 0x06;	/* ECT (function) */
-    fac[2] = 0x00;
-    fac[3] = 0x04;	/* len */
-    write_capi_dword(&(fac[4]), cd->ect_plci);
+    fac[0] = 7;	/* msg len */
+    capi_put_1(fac, 0, 0x06);	/* ECT (function) */
+    capi_put_1(fac, 1, 0x00);
+    capi_put_1(fac, 2, 0x04);	/* len */
+    capi_put_4(fac, 3, cd->ect_plci);
 
     FACILITY_REQ_HEADER(&CMSG, cd->p_app->application_id, 
 			get_msg_num_other(cd->p_app), cd->msg_plci);
@@ -7089,7 +7091,7 @@ chan_capi_vanitynumber(struct ast_channel *chan, char *cmd, char *data,
 		}
 	}
 	buf[pos] = 0;
-	
+
 	return buf;
 }
 
