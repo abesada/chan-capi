@@ -1973,14 +1973,6 @@ cd_set_cep(struct call_desc *cd, struct config_entry_iface *cep)
 		  sizeof(pbx_chan->language));
     }
 
-    if (pbx_chan) {
-
-        /* set default channel name */
-
-	snprintf(pbx_chan->name, sizeof(pbx_chan->name), 
-		 "CAPI/%s/", cep->name);
-    }
-
     /* configure DSP, if present */
 
     if (pbx_dsp) {
@@ -3183,6 +3175,13 @@ chan_capi_request(const char *type, const struct ast_codec_pref *formats,
 
 	    pbx_chan = cd->pbx_chan;
 
+	    if (pbx_chan) {
+
+		/* set default channel name */
+
+		snprintf(pbx_chan->name, sizeof(pbx_chan->name),
+			"CAPI/%s/%s", cep->name, dest);
+	    }
 	}
 
 	cep_root_release();
@@ -5058,7 +5057,7 @@ cd_copy_telno_ext(struct call_desc *cd, const char *exten)
 
 	pbx_chan->cid.cid_num = strdup(cd->src_telno);
 	pbx_chan->cid.cid_dnid = strdup(cd->dst_telno);
-	pbx_chan->cid.cid_ton = cd->src_ton;
+	pbx_chan->cid.cid_ton = 0; /* NOTE: already prefixed number! */
 #else
 	if (pbx_chan->callerid) {
 	    free(pbx_chan->callerid);
