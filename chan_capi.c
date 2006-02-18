@@ -1,4 +1,4 @@
-/*
+/*-
  * (CAPI*)
  *
  * An implementation of Common ISDN API 2.0 for Asterisk
@@ -1574,7 +1574,9 @@ cd_free(struct call_desc *cd, u_int8_t hangup_what)
     struct cc_capi_application *p_app = cd->p_app;
     u_int16_t wCause_in = cd->wCause_in;
     u_int8_t hard_hangup = ((cd->flags.pbx_started == 0) &&
-			    (cd->flags.dir_outgoing == 0));
+			    (cd->flags.dir_outgoing == 0) &&
+			    (hangup_what & 1));
+    u_int8_t dir_outgoing = cd->flags.dir_outgoing;
 
     if (p_app == NULL) {
         /* should not happen */
@@ -1671,12 +1673,6 @@ cd_free(struct call_desc *cd, u_int8_t hangup_what)
 
     p_app->cd_root_used--;
 
-
-    /* release call descriptor lock */
-
-    cc_mutex_unlock(&p_app->lock);
-
-
     /* tell PBX to update use count */
 
     ast_update_use_count();
@@ -1684,51 +1680,40 @@ cd_free(struct call_desc *cd, u_int8_t hangup_what)
     /* NOTE: one cannot call into Asterisk
      * while holding "p_app->lock", hence this
      * will cause a possible deadlock! See the
-     * "LOCKING RULES".
+     * "LOCKING RULES". But one cannot unlock
+     * "p_app->lock" either, hence "pbx_chan->lock"
+     * might be held, and then there is a deadlock
+     * also. This code will therefore just write
+     * some values unlocked, in some cases.
      *
      * WARNING: Asterisk is not safe against
      * race conditions. But that is a problem
      * inside Asterisk. There is nothing one can
      * do about it until Asterisk changes its
-     * routines. Asterisk does not always
-     * check the validity of "pbx_chan" when 
-     * calling "ast_xxx()" functions! This can
-     * lead to accessing freed memory.
+     * routines.
      */
     if (pbx_chan)
     {
-         cc_mutex_lock(&pbx_chan->lock);
+        if (dir_outgoing) {
 
-	 ast_setstate(pbx_chan, AST_STATE_DOWN);
+	    cc_mutex_assert(&pbx_chan->lock, MA_OWNED);
 
-	 pbx_chan->hangupcause =
-	   ((wCause_in & 0xFF00) == 0x3400) ?
-	     (wCause_in & 0x7F) : AST_CAUSE_NORMAL_CLEARING;
+	    ast_setstate(pbx_chan, AST_STATE_DOWN);
 
-	 if(ast_check_hangup(pbx_chan)) {
-	     /* don't hangup while hanging up */
-	     hangup_what = 0;
-	 }
+	    pbx_chan->hangupcause =
+	      ((wCause_in & 0xFF00) == 0x3400) ?
+	      (wCause_in & 0x7F) : AST_CAUSE_NORMAL_CLEARING;
+	}
 
-	 cc_mutex_unlock(&pbx_chan->lock);
+	if (hard_hangup) {
 
-	 if (hangup_what & 1)
-	 {
-	     if (hard_hangup)
-	     {
-	         ast_hangup(pbx_chan);
-	     }
+	    ast_hangup(pbx_chan);
+	}
 
-	     /* else just wait for "ast_read()" to 
-	      * return NULL
-	      */
-	 }
+	/* else just wait for "ast_read()" to 
+	 * return NULL
+	 */
     }
-
-    /*
-     * depreceated re-lock:
-     */
-    cc_mutex_lock(&p_app->lock);
 
     return;
 }
@@ -3175,13 +3160,10 @@ chan_capi_request(const char *type, const struct ast_codec_pref *formats,
 
 	    pbx_chan = cd->pbx_chan;
 
-	    if (pbx_chan) {
+	    /* set default channel name */
 
-		/* set default channel name */
-
-		snprintf(pbx_chan->name, sizeof(pbx_chan->name),
-			"CAPI/%s/%s", cep->name, dest);
-	    }
+	    snprintf(pbx_chan->name, sizeof(pbx_chan->name),
+		     "CAPI/%s/%s", cep->name, dest);
 	}
 
 	cep_root_release();
