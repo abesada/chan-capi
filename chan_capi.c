@@ -77,6 +77,8 @@ extern const struct ast_channel_tech chan_capi_tech;
 static char *chan_capi_pbx_type = "CAPI";
 #endif
 
+static const char * const config_file = "capi.conf";
+
 STANDARD_LOCAL_USER;
 LOCAL_USER_DECL;
 
@@ -133,6 +135,8 @@ static struct cc_capi_controller capi_controller[CAPI_MAX_CONTROLLERS];
 static u_int8_t capi_controller_used_mask[(CAPI_MAX_CONTROLLERS+7)/8];
 
 static struct config_entry_iface *cep_root_ptr;
+
+static struct config_entry_iface *cep_free_ptr;
 
 static const char * const empty_string = "\0\0";
 
@@ -670,6 +674,12 @@ cd_send_pbx_frame(struct call_desc *cd, int frametype, int subclass,
 static u_int8_t
 capi_application_usleep(struct cc_capi_application *p_app, u_int32_t us);
 
+static int
+chan_capi_scan_config(struct ast_config *cfg);
+
+static u_int16_t
+chan_capi_post_init(struct cc_capi_application *p_app);
+
 #define CD_IS_UNUSED(cd)			\
         (((cd)->msg_num == 0x0000) &&		\
          ((cd)->msg_plci == 0x0000) &&		\
@@ -682,10 +692,15 @@ cep_init_convert_tables(struct config_entry_iface *cep)
 {
     const int dp = 256; /* decimal point */
     const int gain_max = ((dp*256)-1);
+    int capability;
     int rx_gain = (int)(cep->rx_gain * 256.0);
     int tx_gain = (int)(cep->tx_gain * 256.0);
     int n = 0;
     int x = 0;
+
+    cc_mutex_lock(&capi_global_lock);
+    capability = capi_global.capability;
+    cc_mutex_unlock(&capi_global_lock);
 
     if (rx_gain > gain_max) {
         rx_gain = gain_max;
@@ -707,7 +722,7 @@ cep_init_convert_tables(struct config_entry_iface *cep)
 
         for (n = 0; n < 256; n++) {
 
-	        if (capi_global.capability == AST_FORMAT_ULAW) {
+	        if (capability == AST_FORMAT_ULAW) {
 		    x = (capiULAW2INT[n] * rx_gain) / dp;
 		} else {
 		    x = (capiALAW2INT[n] * rx_gain) / dp;
@@ -718,7 +733,7 @@ cep_init_convert_tables(struct config_entry_iface *cep)
 		if (x < -32767)
 		    x = -32767;
 
-		if (capi_global.capability == AST_FORMAT_ULAW) {
+		if (capability == AST_FORMAT_ULAW) {
 		    cep->rx_convert[n] = reversebits[capi_int2ulaw(x)];
 		} else {
 		    cep->rx_convert[n] = reversebits[capi_int2alaw(x)];
@@ -736,7 +751,7 @@ cep_init_convert_tables(struct config_entry_iface *cep)
 
         for (n = 0; n < 256; n++) {
 
-	        if (capi_global.capability == AST_FORMAT_ULAW) {
+	        if (capability == AST_FORMAT_ULAW) {
 		    x = (capiULAW2INT[n] * tx_gain) / dp;
 		} else {
 		    x = (capiALAW2INT[n] * tx_gain) / dp;
@@ -747,7 +762,7 @@ cep_init_convert_tables(struct config_entry_iface *cep)
 		if (x < -32767)
 		    x = -32767;
 
-		if (capi_global.capability == AST_FORMAT_ULAW) {
+		if (capability == AST_FORMAT_ULAW) {
 		    cep->tx_convert[n] = reversebits[capi_int2ulaw(x)];
 		} else {
 		    cep->tx_convert[n] = reversebits[capi_int2alaw(x)];
@@ -769,6 +784,92 @@ cep_root_prepend(struct config_entry_iface *cep)
     cc_mutex_lock(&capi_global_lock);
     cep->next = cep_root_ptr;
     cep_root_ptr = cep;
+    cc_mutex_unlock(&capi_global_lock);
+    return;
+}
+
+static struct config_entry_iface *
+cep_alloc(const char *name)
+{
+    struct config_entry_iface *cep;
+    struct config_entry_iface **cep_p;
+
+    if (name == NULL) {
+        return NULL;
+    }
+
+    cc_mutex_lock(&capi_global_lock);
+    cep = cep_free_ptr;
+    cep_p = &cep_free_ptr;
+    while (cep) {
+
+        if (strcmp(cep->name, name) == 0) {
+	    /* remove entry from linked list */
+	    cep_p[0] = cep->next;
+	    cep->next = NULL;
+	    break;
+	}
+	cep_p = &cep->next;
+        cep = cep->next;
+    }
+    cc_mutex_unlock(&capi_global_lock);
+
+    if (cep == NULL) {
+	cep = malloc(sizeof(*cep));
+
+	if (cep) {
+	    bzero(cep, sizeof(*cep));
+	    strlcpy(cep->name, name, sizeof(cep->name));
+	}
+    } else {
+
+        bzero(&cep->dummy_zero_start[0],
+	      &cep->dummy_zero_end[0] -
+	      &cep->dummy_zero_start[0]);
+    }
+    return cep;
+}
+
+static void
+cep_unload()
+{
+    struct config_entry_iface **cep_p;
+    struct config_entry_iface *cep;
+
+    cc_mutex_lock(&capi_global_lock);
+
+    cep = cep_root_ptr;
+
+    while (cep) {
+
+      /* If there are active channels
+       * the counters won't reach zero,
+       * therefore max is subtracted instead:
+       */
+      cep->b_channels_curr -= cep->b_channels_max;
+      cep->b_channels_max = 0;
+
+      cep->d_channels_curr -= cep->b_channels_max;
+      cep->d_channels_max = 0;
+
+      cep = cep->next;
+    }
+
+    cep = cep_free_ptr;
+    cep_p = &cep_free_ptr;
+
+    while (cep) {
+      cep_p = &cep->next;
+      cep = cep->next;
+    }
+
+    /* move all configuration 
+     * entries over to free 
+     * list:
+     */
+    cep_p[0] = cep_root_ptr;
+    cep_root_ptr = NULL;
+
     cc_mutex_unlock(&capi_global_lock);
     return;
 }
@@ -1818,7 +1919,11 @@ cd_alloc(struct cc_capi_application *p_app, u_int16_t plci)
     pbx_chan->fds[0]              = fds[0];
     CC_CHANNEL_PVT(pbx_chan)      = cd;
 
+    cc_mutex_lock(&capi_global_lock);
     fmt = capi_global.capability;
+    cc_mutex_unlock(&capi_global_lock);
+
+    cd->pbx_capability            = fmt;
 
 #ifdef CC_OLD_CODEC_FORMATS
     pbx_chan->nativeformats       = fmt;
@@ -2068,7 +2173,7 @@ cd_send_pbx_voice(struct call_desc *cd, const void *data_ptr, u_int32_t data_len
     bzero(&temp_fr, sizeof(temp_fr));
 
     temp_fr.frametype = AST_FRAME_VOICE;
-    temp_fr.subclass = capi_global.capability;
+    temp_fr.subclass = cd->pbx_capability;
     temp_fr.data = (void *)data_ptr;
     temp_fr.datalen = data_len;
     temp_fr.samples = data_len;
@@ -3752,7 +3857,7 @@ __chan_capi_write(struct call_desc *cd, struct ast_frame *frame)
 		goto done;
 	}
 
-	if (frame->subclass != capi_global.capability) {
+	if (frame->subclass != cd->pbx_capability) {
 		cc_log(LOG_ERROR, "dont know how to write "
 		       "subclass %d\n", frame->subclass);
 		goto done;
@@ -4649,7 +4754,7 @@ capi_handle_data_b3_indication(_cmsg *CMSG, struct call_desc **pp_cd)
 	        int32_t temp;
 
 		for (j = 0; j < b3len; j++) {
-			if (capi_global.capability == AST_FORMAT_ULAW) {
+			if (cd->pbx_capability == AST_FORMAT_ULAW) {
 			    temp = capiULAW2INT[b3buf[j]] / 256;
 			} else {
 			    temp = capiALAW2INT[b3buf[j]] / 256;
@@ -4673,7 +4778,7 @@ capi_handle_data_b3_indication(_cmsg *CMSG, struct call_desc **pp_cd)
 
 		if (cd->rx_sample_avg < 0x100) {
 
-			if (capi_global.capability == AST_FORMAT_ULAW) {
+			if (cd->pbx_capability == AST_FORMAT_ULAW) {
 			    memset(b3buf, 255, b3len);
 			} else {
 			    memset(b3buf, reversebits[85], b3len);
@@ -5011,6 +5116,8 @@ cd_copy_telno_ext(struct call_desc *cd, const char *exten)
 
 	strlcpy(src_telno, cd->src_telno, sizeof(src_telno));
 
+	cc_mutex_lock(&capi_global_lock);
+
 	if ((cd->src_ton & 0x70) == CAPI_ETSI_NPLAN_NATIONAL) {
 
 	    snprintf(cd->src_telno, sizeof(cd->src_telno), "%s%s%s",
@@ -5028,6 +5135,8 @@ cd_copy_telno_ext(struct call_desc *cd, const char *exten)
 	    snprintf(cd->src_telno, sizeof(cd->src_telno), "%s%s",
 		     cep->prefix, src_telno);
 	}
+
+	cc_mutex_unlock(&capi_global_lock);
 
 #ifdef CC_AST_CHANNEL_HAS_CID
 	if (pbx_chan->cid.cid_num) {
@@ -6310,13 +6419,24 @@ static int
 chan_capi_reload(int fd, int argc, char *argv[])
 {
     u_int16_t error = 0;
-    struct cc_capi_application *p_app;
+    struct cc_capi_application *p_app = NULL;
+    struct ast_config * cfg = NULL;
 
     if (argc != 2) {
         return RESULT_SHOWUSAGE;
     }
 		
-    ast_cli(fd, "Will be implemented soon ...\n");
+    /* load configuration file */
+
+    cfg = ast_config_load((char *)config_file);
+
+    if (!cfg) {
+        ast_cli(fd, "Unable to "
+		"load %s!\n", config_file);
+	goto done;
+    }
+
+    /* do the re-load */
 
     p_app = capi_application[0];
 
@@ -6326,13 +6446,38 @@ chan_capi_reload(int fd, int argc, char *argv[])
 
 	error = chan_capi_fill_controller_info(p_app);
 
-	cc_mutex_unlock(&p_app->lock);
+	if (error) {
+	    goto done;
+	}
+
+	error = chan_capi_scan_config(cfg);
+
+	if (error) {
+	    goto done;
+	}
+
+	error = chan_capi_post_init(p_app);
+
+	if (error) {
+	    goto done;
+	}
+    }
+
+ done:
+
+    if (p_app) {
+        cc_mutex_unlock(&p_app->lock);
+    }
+
+    if (cfg) {
+        ast_config_destroy(cfg);
     }
 
     if(error) {
-        ast_cli(fd, "ERROR=0x%04x: Could not fill "
-		"controller info!\n", error);
+        ast_cli(fd, "chan_capi reload "
+		"error=0x%04x\n", error);
     }
+
     return RESULT_SUCCESS;
 }
 
@@ -6540,6 +6685,7 @@ chan_capi_fill_controller_info(struct cc_capi_application *p_app)
 {
 	struct cc_capi_profile profile;
 	struct cc_capi_controller *p_ctrl;
+	struct cc_capi_controller  ctrl_temp;
 	u_int16_t controller_max = 0; /* default */
 	u_int16_t n;
 	u_int16_t error;
@@ -6555,7 +6701,7 @@ chan_capi_fill_controller_info(struct cc_capi_application *p_app)
 
 	for (n = 0; n < CAPI_MAX_CONTROLLERS; n++) {
 
-		p_ctrl = &capi_controller[n];
+		p_ctrl = &ctrl_temp;
 
 		bzero(p_ctrl, sizeof(*p_ctrl));
 
@@ -6641,6 +6787,10 @@ chan_capi_fill_controller_info(struct cc_capi_application *p_app)
 			   p_ctrl->support.sservices ? "[supplementary]" : "",
 			   p_ctrl->support.lineinterconnect ? "[line interconnect]" : "");
 
+		cc_mutex_lock(&capi_global_lock);
+		bcopy(p_ctrl, &capi_controller[n], sizeof(capi_controller[0]));
+		cc_mutex_unlock(&capi_global_lock);
+
 	}
 	return 0; /* success */
 }
@@ -6671,7 +6821,8 @@ chan_capi_post_init(struct cc_capi_application *p_app)
 		}
 
 	    } else {
-	        cc_log(LOG_NOTICE, "Unused controller=%d\n", controller);
+	        cc_verbose(3, 1, VERBOSE_PREFIX_3 "Unused "
+			   "controller=%d\n", controller);
 	    }
 	}
 	return 0; /* success */
@@ -6731,8 +6882,10 @@ capi_parse_iface_config(struct ast_variable *v, const char *name)
 {
 	struct config_entry_iface *cep;
 	u_int16_t x;
+	int16_t b_channels_max = 0;
+	int16_t d_channels_max = 1;
 
-	cep = malloc(sizeof(*cep));
+	cep = cep_alloc(name);
 
 	if(cep == NULL) {
 	    goto done;
@@ -6740,28 +6893,23 @@ capi_parse_iface_config(struct ast_variable *v, const char *name)
 
 	/* initialize global config entry and set defaults */
 
-	bzero(cep, sizeof(*cep));
+	cc_mutex_lock(&capi_global_lock);
 
 	cep->rx_gain = capi_global.rx_gain;
 	cep->tx_gain = capi_global.tx_gain;
-
 	cep->options.digit_time_out = capi_global.digit_time_out;
+	strlcpy(cep->language, capi_global.default_language, sizeof(cep->language));
+
+	cc_mutex_unlock(&capi_global_lock);
+
 	cep->options.echo_cancel_option = EC_OPTION_DISABLE_G165;
 	cep->options.echo_cancel_tail = EC_DEFAULT_TAIL;
 	cep->options.echo_cancel_selector = FACILITYSELECTOR_ECHO_CANCEL;
-	cep->d_channels_curr = 1;
-	cep->d_channels_max = 1;
-
-	if(name) {
-	  strlcpy(cep->name, name, sizeof(cep->name));
-	}
-
-	strlcpy(cep->language, capi_global.default_language, sizeof(cep->language));
 
 	for (; v; v = v->next) {
-	    CONF_GET_INTEGER(v, cep->b_channels_max, "devices");
-	    CONF_GET_INTEGER(v, cep->b_channels_max, "b_channels");
-	    CONF_GET_INTEGER(v, cep->d_channels_max, "d_channels");
+	    CONF_GET_INTEGER(v, b_channels_max, "devices");
+	    CONF_GET_INTEGER(v, b_channels_max, "b_channels");
+	    CONF_GET_INTEGER(v, d_channels_max, "d_channels");
 
 	    CONF_GET_STRING(v, cep->context, "context");
 	    CONF_GET_STRING(v, cep->incomingmsn, "incomingmsn");
@@ -6881,11 +7029,15 @@ capi_parse_iface_config(struct ast_variable *v, const char *name)
 	    cep->options.dtmf_detect_in_software = 1;
 	}
 
-	cep->d_channels_curr = 
-	  cep->d_channels_max;
+	cc_mutex_lock(&capi_global_lock);
 
-	cep->b_channels_curr = 
-	  cep->b_channels_max;
+	cep->d_channels_curr += d_channels_max;
+	cep->b_channels_curr += b_channels_max;
+
+	cep->d_channels_max = d_channels_max;
+	cep->b_channels_max = b_channels_max;
+
+	cc_mutex_unlock(&capi_global_lock);
 
 	cep_init_convert_tables(cep);
 
@@ -6997,9 +7149,19 @@ static int
 chan_capi_scan_config(struct ast_config *cfg)
 {
 	struct config_entry_iface *cep = NULL;
+	struct config_entry_global capi_global_shadow;
 	char *cat = NULL;
 
-	chan_capi_parse_global_config(ast_variable_browse(cfg, "general"), &capi_global);
+	/* unload existing configuration */
+
+	cep_unload();
+
+	chan_capi_parse_global_config
+	  (ast_variable_browse(cfg, "general"), &capi_global_shadow);
+
+	cc_mutex_lock(&capi_global_lock);
+	capi_global = capi_global_shadow;
+	cc_mutex_unlock(&capi_global_lock);
 
 	/* go through the other sections, which are the interfaces */
 
@@ -7097,7 +7259,6 @@ static struct ast_custom_function vanitynumber_function = {
  */
 int load_module(void)
 {
-	static const char * const config_file = "capi.conf";
 	struct cc_capi_application *p_app = NULL;
 	struct ast_config * cfg = NULL;
 	u_int8_t app_locked = 0;

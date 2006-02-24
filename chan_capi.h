@@ -343,6 +343,21 @@ struct config_entry_iface {
 	/* interface name */
 	char name[AST_MAX_EXTENSION];
 
+	/* counters to keep track of 
+	 * available B- and D-channels:
+	 */
+	int16_t b_channels_max;
+	int16_t b_channels_curr;
+
+	int16_t d_channels_max;
+	int16_t d_channels_curr;
+
+  /* NOTE: all fields between the 
+   * dummies are zeroed by default
+   */
+
+        u_int8_t dummy_zero_start[1];
+
 	/* language */
 	char language[MAX_LANGUAGE];
 
@@ -361,15 +376,6 @@ struct config_entry_iface {
 	char accountcode[20];
 
 	struct cc_capi_options options;
-
-	/* counters to keep track of 
-	 * available B- and D-channels:
-	 */
-	int16_t b_channels_max;
-	int16_t b_channels_curr;
-
-	int16_t d_channels_max;
-	int16_t d_channels_curr;
 
 	u_int32_t call_group;
 	u_int32_t group;
@@ -393,6 +399,8 @@ struct config_entry_iface {
 	u_int8_t rx_convert[256];
 
 	struct config_entry_iface *next;
+
+	u_int8_t dummy_zero_end[1];
 };
 
 struct cc_capi_application;
@@ -419,6 +427,9 @@ struct call_desc {
 	 * all variables in this region!
 	 */
 	u_int8_t dummy_zero_start[1];
+
+	/*! PBX capability */
+	int pbx_capability;
 
 	/*! PBX temporary read frame */
 	struct ast_frame pbx_rd;
