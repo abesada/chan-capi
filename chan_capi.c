@@ -4776,7 +4776,7 @@ capi_handle_data_b3_indication(_cmsg *CMSG, struct call_desc **pp_cd)
 			}
 		}
 
-		if (cd->rx_sample_avg < 0x100) {
+		if (cd->rx_sample_avg < 0x80) {
 
 			if (cd->pbx_capability == AST_FORMAT_ULAW) {
 			    memset(b3buf, 255, b3len);
