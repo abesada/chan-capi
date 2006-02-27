@@ -6489,13 +6489,14 @@ static int
 chan_capi_get_info(int fd, int argc, char *argv[])
 {
     struct cc_capi_application *p_app;
+    struct config_entry_iface *cep;
     struct call_desc *cd;
     u_int16_t use_count_total[CAPI_MAX_CONTROLLERS] = { /* zero */ };
     u_int16_t use_count_on_hold[CAPI_MAX_CONTROLLERS] = { /* zero */ };
     u_int16_t n;
     u_int16_t x;
 
-    if (argc != 2) {
+    if ((argc != 2) && (argc != 3)) {
         return RESULT_SHOWUSAGE;
     }
 		
@@ -6577,6 +6578,22 @@ chan_capi_get_info(int fd, int argc, char *argv[])
 	}
     }
 
+    cep = cep_root_acquire();
+    while(cep) {
+
+        ast_cli(fd,
+		"Config entry '%s' {\n"
+		" b_channels_curr : %d call descriptor(s) free\n"
+		" b_channels_max  : %d call descriptor(s) total\n"
+		"}\n",
+		cep->name,
+		cep->b_channels_curr,
+		cep->b_channels_max);
+
+        cep = cep->next;
+    }
+    cep_root_release();
+
     ast_cli(fd, "\n");
 
     return RESULT_SUCCESS;
@@ -6627,6 +6644,12 @@ static struct ast_cli_entry  cli_info =
 	{ { "capi", "info", NULL }, chan_capi_get_info, 
 	  "Show CAPI info",
 	  "Usage: capi info\n"
+	  "       Show info about B channels.\n" };
+
+static struct ast_cli_entry  cli_show_channels =
+	{ { "capi", "show", "channels", NULL }, chan_capi_get_info, 
+	  "Show active CAPI channels",
+	  "Usage: capi show channels\n"
 	  "       Show info about B channels.\n" };
 
 static struct ast_cli_entry  cli_debug =
@@ -7358,6 +7381,14 @@ int load_module(void)
 	}
 	chan_capi_load_level = 9;
 
+	error = ast_cli_register(&cli_show_channels);
+
+	if (error) {
+	    cc_log(LOG_ERROR, "Unable to register cli_show_channels\n");
+	    goto done;
+	}
+	chan_capi_load_level = 10;
+
 	error = ast_cli_register(&cli_debug);
 
 	if (error) {
@@ -7448,6 +7479,8 @@ int unload_module()
 	    ast_cli_unregister(&cli_debug);
 	case 12:
 	    ast_cli_unregister(&cli_no_debug);
+	case 10:
+	    ast_cli_unregister(&cli_show_channels);
 	case 9:
 	    ast_cli_unregister(&cli_info);
 	case 8:
