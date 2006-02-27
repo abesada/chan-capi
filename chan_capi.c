@@ -2016,7 +2016,8 @@ static u_int8_t
 cd_set_cep(struct call_desc *cd, struct config_entry_iface *cep)
 {
     const struct cc_capi_options options_zero = { /* zero */ };
-    u_int8_t channel_type = (cd->bchannelinfo[0] != '0') ? 'D' : 'B';
+    u_int8_t channel_type = ((cd->bchannelinfo[0] != '0') && 
+			     (cd->bchannelinfo[0] != 0)) ? 'D' : 'B';
 
     struct ast_channel *pbx_chan = cd->pbx_chan;
     struct ast_dsp *pbx_dsp = cd->pbx_dsp;
