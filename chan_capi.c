@@ -1665,6 +1665,7 @@ cd_alloc_channel(struct call_desc *cd, u_int8_t channel_type)
  * they are finished.
  *
  * hangup_what: 1 (hangup PBX)
+ * hangup_what: 2 (free pbx_chan)
  *
  * NOTE: must be called with "p_app->lock" locked
  *---------------------------------------------------------------------------*/
@@ -1811,11 +1812,14 @@ cd_free(struct call_desc *cd, u_int8_t hangup_what)
 	    ast_hangup(pbx_chan);
 	}
 
+	if (hangup_what & 2) {
+	    ast_channel_free(pbx_chan);
+	}
+
 	/* else just wait for "ast_read()" to 
 	 * return NULL
 	 */
     }
-
     return;
 }
 
@@ -3255,7 +3259,7 @@ chan_capi_request(const char *type, const struct ast_codec_pref *formats,
 	    }
 
 	    if (cd_set_cep(cd, cep)) {
-	        cd_free(cd, 0);
+	        cd_free(cd, 2);
 		cep_root_release();
 		cc_mutex_unlock(&capi_application[0]->lock);
 		return NULL;
@@ -4984,8 +4988,6 @@ capi_handle_disconnect_indication(_cmsg *CMSG, struct call_desc **pp_cd)
 	cd->wCause_in = DISCONNECT_IND_REASON(CMSG);
 
 	capi_show_info(cd->wCause_in);
-
-#warning "fax_error is cleared by cd_free()"
 
 	cd->flags.fax_error = 
 	  (((cd->wCause_in == 0x3490) || 
