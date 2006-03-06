@@ -403,6 +403,21 @@ struct config_entry_iface {
 	u_int8_t dummy_zero_end[1];
 };
 
+/* software echo cancellation */
+
+#define EC_WINDOW_LEN    (1<<8) /* bytes, 32 millisecond */
+#define EC_WINDOW_COUNT     32  /* units */
+#define EC_POWER_OFFSET     16  /* windows */
+
+struct soft_echo_cancel {
+  u_int32_t power_acc; /* total accumulated power */
+  u_int32_t power_avg[EC_WINDOW_COUNT]; /* average power */
+  u_int16_t samples;   /* number of samples accumulated */
+  u_int16_t offset;    /* current power average offset */
+  u_int16_t active : 1;
+  u_int16_t unused : 15;
+};
+
 struct cc_capi_application;
 
 /* CAPI call descriptor structure */
@@ -504,9 +519,8 @@ struct call_desc {
 	u_int16_t rx_noise_count;
 
 	/*! CAPI software echo cancel */
-	u_int16_t rx_sample_count;
-	int32_t   rx_sample_avg;
-	int32_t   rx_sample_sum;
+	struct soft_echo_cancel soft_ec_rx;
+	struct soft_echo_cancel soft_ec_tx;
 
 	/*! CAPI hangup cause received */
 	u_int16_t wCause_in;

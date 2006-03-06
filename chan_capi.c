@@ -148,6 +148,109 @@ static const u_int8_t sending_not_complete_struct[] = { 2, 0, 0 };
 extern const char *capi_info_string(u_int16_t wInfo);
 
 /*===========================================================================*
+ * software echo cancelling
+ *===========================================================================*/
+
+static int32_t
+soft_echo_cancel_get_factor(struct soft_echo_cancel *rx,
+			    struct soft_echo_cancel *tx)
+{
+    u_int32_t rx_power = rx->power_avg[rx->offset];
+    u_int32_t tx_power = tx->power_avg[tx->offset];
+    int32_t factor = 0;
+
+    if (tx_power >= (rx_power / 2)) {
+
+        factor = (tx_power >> 14);
+
+	if (factor > (0xFF-8)) {
+	    factor = (0xFF-8);
+	}
+    }
+
+    if (factor == 0) {
+        rx->active = 0;
+    } else {
+        if(tx->active) {
+	  if(factor > 0x10) {
+	     factor = 0x10; /* just reduce the sound a little */
+	  }
+	} else {
+	  rx->active = 1;
+	}
+    }
+    return factor;
+}
+
+static void
+soft_echo_cancel_process(struct call_desc *cd, struct soft_echo_cancel *rx, 
+			 struct soft_echo_cancel *tx, u_int8_t *ptr, u_int16_t len)
+{
+    int32_t pbx_capability = cd->pbx_capability;
+    int32_t factor = soft_echo_cancel_get_factor(rx, tx);
+    int32_t temp;
+    u_int16_t x;
+    u_int16_t y;
+
+    while(len--) {
+        if (pbx_capability == AST_FORMAT_ULAW) {
+	  temp = capi_ulaw_to_signed[*ptr];
+	} else {
+	  temp = capi_alaw_to_signed[*ptr];
+	}
+
+	rx->power_acc += (temp * temp) / EC_WINDOW_LEN;
+
+	if (factor) {
+
+	    temp = (temp * (256-factor)) / 256;
+
+	    if (pbx_capability == AST_FORMAT_ULAW) {
+	        *ptr = capi_signed_to_ulaw(temp);
+	    } else {
+	        *ptr = capi_signed_to_alaw(temp);
+	    }
+	}
+
+	rx->samples++;
+	if (rx->samples >= EC_WINDOW_LEN) {
+
+	    /* clear current RX power */
+
+	    rx->power_avg[rx->offset] = 0;
+
+	    /* advance power average offset */
+
+	    rx->offset++;
+	    if(rx->offset >= EC_WINDOW_COUNT) {
+	        rx->offset = 0;
+	    }
+
+	    /* get next value */
+
+	    factor = soft_echo_cancel_get_factor(rx, tx);
+
+	    /* store RX power in peer */
+
+	    for(x = EC_POWER_OFFSET; x--; ) {
+
+	      y = (x + rx->offset) % EC_WINDOW_COUNT;
+
+	      if(rx->power_avg[y] < rx->power_acc) {
+		 rx->power_avg[y] = rx->power_acc;
+	      }
+	    }
+
+	    rx->power_acc = 0;
+	    rx->samples = 0;
+	}
+
+        ptr++;
+    }
+    return;
+}
+
+/*===========================================================================*
  * various CAPI helper functions
  *===========================================================================*/
 
@@ -723,20 +826,15 @@ cep_init_convert_tables(struct config_entry_iface *cep)
         for (n = 0; n < 256; n++) {
 
 	        if (capability == AST_FORMAT_ULAW) {
-		    x = (capiULAW2INT[n] * rx_gain) / dp;
+		    x = (capi_ulaw_to_signed[n] * rx_gain) / dp;
 		} else {
-		    x = (capiALAW2INT[n] * rx_gain) / dp;
+		    x = (capi_alaw_to_signed[n] * rx_gain) / dp;
 		}
 
-		if (x > 32767)
-		    x = 32767;
-		if (x < -32767)
-		    x = -32767;
-
 		if (capability == AST_FORMAT_ULAW) {
-		    cep->rx_convert[n] = reversebits[capi_int2ulaw(x)];
+		    cep->rx_convert[n] = reversebits[capi_signed_to_ulaw(x)];
 		} else {
-		    cep->rx_convert[n] = reversebits[capi_int2alaw(x)];
+		    cep->rx_convert[n] = reversebits[capi_signed_to_alaw(x)];
 		}
 	}
 
@@ -752,20 +850,15 @@ cep_init_convert_tables(struct config_entry_iface *cep)
         for (n = 0; n < 256; n++) {
 
 	        if (capability == AST_FORMAT_ULAW) {
-		    x = (capiULAW2INT[n] * tx_gain) / dp;
+		    x = (capi_ulaw_to_signed[reversebits[n]] * tx_gain) / dp;
 		} else {
-		    x = (capiALAW2INT[n] * tx_gain) / dp;
+		    x = (capi_alaw_to_signed[reversebits[n]] * tx_gain) / dp;
 		}
 
-		if (x > 32767)
-		    x = 32767;
-		if (x < -32767)
-		    x = -32767;
-
 		if (capability == AST_FORMAT_ULAW) {
-		    cep->tx_convert[n] = reversebits[capi_int2ulaw(x)];
+		    cep->tx_convert[n] = capi_signed_to_ulaw(x);
 		} else {
-		    cep->tx_convert[n] = reversebits[capi_int2alaw(x)];
+		    cep->tx_convert[n] = capi_signed_to_alaw(x);
 		}
 	}
 
@@ -3893,9 +3986,19 @@ __chan_capi_write(struct call_desc *cd, struct ast_frame *frame)
 	      capi_copy_sound(fsmooth->data, buf, fsmooth->datalen, 
 			      cd->cep ? cd->cep->tx_convert : NULL);
 
+	      /* software echo cancellation */
+
+	      if (cd->options.echo_cancel_in_software) {
+		  soft_echo_cancel_process(cd, 
+					   &cd->soft_ec_tx, 
+					   &cd->soft_ec_rx, 
+					   buf, fsmooth->datalen);
+	      }
+
 	      if (cd->rx_buffer_qlen > 0) {
 
 		  if (capi_send_data_b3_req(cd, cd->tx_buffer_handle, buf, fsmooth->datalen) == 0) {
+
 		      cd->tx_buffer_handle++;
 		      cd->rx_buffer_qlen -= fsmooth->datalen;
 		      if (cd->rx_buffer_qlen < 0)
@@ -4711,7 +4814,6 @@ capi_handle_data_b3_indication(_cmsg *CMSG, struct call_desc **pp_cd)
 	_cmsg CMSG2;
 	u_int8_t *b3buf = NULL;
 	int b3len = 0;
-	int j;
 
 	b3len = DATA_B3_IND_DATALENGTH(CMSG);
 	b3buf = &(cd->rx_buffer_data[AST_FRIENDLY_OFFSET +
@@ -4729,8 +4831,8 @@ capi_handle_data_b3_indication(_cmsg *CMSG, struct call_desc **pp_cd)
 	cd->rx_buffer_handle %= CAPI_MAX_B3_BLOCKS;
 	
 	/* send a DATA_B3_RESP very quickly to free the buffer in capi */
-	DATA_B3_RESP_HEADER(&CMSG2, cd->p_app->application_id, HEADER_MSGNUM(CMSG), 0);
-	DATA_B3_RESP_NCCI(&CMSG2) = cd->msg_ncci;
+	DATA_B3_RESP_HEADER(&CMSG2, cd->p_app->application_id, 
+			    HEADER_MSGNUM(CMSG), cd->msg_ncci);
 	DATA_B3_RESP_DATAHANDLE(&CMSG2) = DATA_B3_IND_DATAHANDLE(CMSG);
 	__capi_put_cmsg(cd->p_app, &CMSG2);
 
@@ -4755,41 +4857,13 @@ capi_handle_data_b3_indication(_cmsg *CMSG, struct call_desc **pp_cd)
 	/* software echo cancellation */
 
 	if (cd->options.echo_cancel_in_software) {
-
-	        int32_t temp;
-
-		for (j = 0; j < b3len; j++) {
-			if (cd->pbx_capability == AST_FORMAT_ULAW) {
-			    temp = capiULAW2INT[b3buf[j]] / 256;
-			} else {
-			    temp = capiALAW2INT[b3buf[j]] / 256;
-			}
-
-			cd->rx_sample_sum += temp * temp;
-
-			cd->rx_sample_count++;
-
-			if (cd->rx_sample_count >= 400) {
-
-			    /* compute average power 
-			     * every 50 milliseconds:
-			     */
-			    cd->rx_sample_avg /= 2;
-			    cd->rx_sample_avg += cd->rx_sample_sum;
-			    cd->rx_sample_sum = 0;
-			    cd->rx_sample_count = 0;
-			}
-		}
-
-		if (cd->rx_sample_avg < 0x80) {
-
-			if (cd->pbx_capability == AST_FORMAT_ULAW) {
-			    memset(b3buf, 255, b3len);
-			} else {
-			    memset(b3buf, reversebits[85], b3len);
-			}
-		}
+		soft_echo_cancel_process(cd,
+					 &cd->soft_ec_rx, 
+					 &cd->soft_ec_tx, 
+					 b3buf, b3len);
 	}
+
+	/* convert sound last */
 
 	capi_copy_sound(b3buf, b3buf, b3len, 
 			cd->cep ? cd->cep->rx_convert : NULL);
@@ -4855,8 +4929,8 @@ capi_handle_connect_b3_active_indication(_cmsg *CMSG, struct call_desc **pp_cd)
 	__capi_put_cmsg(cd->p_app, &CMSG2);
 
 	if (cd->state == CAPI_STATE_DISCONNECTING) {
-	    cd_verbose(cd, 3, 1, 3, "during B3 disconnect for NCCI 0x%04x\n",
-		       cd->msg_ncci);
+	    cd_verbose(cd, 3, 1, 3, "during B3 disconnect for "
+		       "NCCI 0x%04x\n", cd->msg_ncci);
 	    return;
 	}
 
@@ -4894,8 +4968,8 @@ capi_handle_disconnect_b3_indication(_cmsg *CMSG, struct call_desc **pp_cd)
 	char buffer[CAPI_MAX_STRING];
 	_cmsg CMSG2;
 
-	DISCONNECT_B3_RESP_HEADER(&CMSG2, cd->p_app->application_id, HEADER_MSGNUM(CMSG), 0);
-	DISCONNECT_B3_RESP_NCCI(&CMSG2) = cd->msg_ncci;
+	DISCONNECT_B3_RESP_HEADER(&CMSG2, cd->p_app->application_id, 
+				  HEADER_MSGNUM(CMSG), cd->msg_ncci);
 	__capi_put_cmsg(cd->p_app, &CMSG2);
 
 	cd->wCause_in_b3 = DISCONNECT_B3_IND_REASON_B3(CMSG);
@@ -4964,8 +5038,7 @@ static void capi_handle_connect_b3_indication(_cmsg *CMSG, struct call_desc **pp
 
 	/* then send a CONNECT_B3_RESP */
 	CONNECT_B3_RESP_HEADER(&CMSG2, cd->p_app->application_id, 
-			       HEADER_MSGNUM(CMSG), 0);
-	CONNECT_B3_RESP_NCCI(&CMSG2) = cd->msg_ncci;
+			       HEADER_MSGNUM(CMSG), cd->msg_ncci);
 	CONNECT_B3_RESP_REJECT(&CMSG2) = 0;
 	__capi_put_cmsg(cd->p_app, &CMSG2);
 
@@ -5532,6 +5605,7 @@ capi_handle_cmsg(struct cc_capi_application *p_app, _cmsg *CMSG)
 		capi_handle_connect_b3_indication(CMSG, &cd);
 		break;
 	case CAPI_P_IND(CONNECT_B3_ACTIVE):
+		cd->msg_ncci = NCCI;
 		capi_handle_connect_b3_active_indication(CMSG, &cd);
 		break;
 	case CAPI_P_IND(DISCONNECT_B3):
