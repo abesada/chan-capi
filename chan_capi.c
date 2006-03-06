@@ -161,7 +161,7 @@ soft_echo_cancel_get_factor(struct soft_echo_cancel *rx,
 
     if (tx_power >= (rx_power / 2)) {
 
-        factor = (tx_power >> 14);
+        factor = (tx_power >> 13);
 
 	if (factor > (0xFF-8)) {
 	    factor = (0xFF-8);
@@ -232,7 +232,7 @@ soft_echo_cancel_process(struct call_desc *cd, struct soft_echo_cancel *rx,
 
 	    /* store RX power in peer */
 
-	    for(x = EC_POWER_OFFSET; x--; ) {
+	    for(x = cd->options.echo_cancel_offset; x--; ) {
 
 	      y = (x + rx->offset) % EC_WINDOW_COUNT;
 
@@ -7005,6 +7005,7 @@ capi_parse_iface_config(struct ast_variable *v, const char *name)
 	cep->options.echo_cancel_option = EC_OPTION_DISABLE_G165;
 	cep->options.echo_cancel_tail = EC_DEFAULT_TAIL;
 	cep->options.echo_cancel_selector = FACILITYSELECTOR_ECHO_CANCEL;
+	cep->options.echo_cancel_offset = EC_POWER_OFFSET;
 
 	for (; v; v = v->next) {
 	    CONF_GET_INTEGER(v, b_channels_max, "devices");
@@ -7114,6 +7115,7 @@ capi_parse_iface_config(struct ast_variable *v, const char *name)
 		}
 		continue;
 	    }
+
 	    if (!strcasecmp(v->name, "echotail")) {
 	        cep->options.echo_cancel_tail = atoi(v->value);
 		if (cep->options.echo_cancel_tail > 255) {
@@ -7121,6 +7123,18 @@ capi_parse_iface_config(struct ast_variable *v, const char *name)
 		} 
 		continue;
 	    }
+
+	    if (!strcasecmp(v->name, "echo_offset")) {
+	        cep->options.echo_cancel_offset = atoi(v->value);
+		if (cep->options.echo_cancel_offset < 1) {
+		    cep->options.echo_cancel_offset = 1;
+		}
+		if (cep->options.echo_cancel_offset > EC_WINDOW_COUNT) {
+		    cep->options.echo_cancel_offset = EC_WINDOW_COUNT;
+		} 
+		continue;
+	    }
+
 	}
 
 	/* some parameters have implications */

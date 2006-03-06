@@ -315,6 +315,7 @@ struct cc_capi_options {
 	u_int16_t echo_cancel_option;
 	u_int16_t echo_cancel_tail;
 	u_int16_t echo_cancel_selector;
+	u_int16_t echo_cancel_offset; /* in units of EC_WINDOW_LEN */
 
 	/* CAPI digit timeout, in seconds */
 	u_int16_t digit_time_out;
@@ -407,7 +408,7 @@ struct config_entry_iface {
 
 #define EC_WINDOW_LEN    (1<<8) /* bytes, 32 millisecond */
 #define EC_WINDOW_COUNT     32  /* units */
-#define EC_POWER_OFFSET     16  /* windows */
+#define EC_POWER_OFFSET      8  /* windows */
 
 struct soft_echo_cancel {
   u_int32_t power_acc; /* total accumulated power */
