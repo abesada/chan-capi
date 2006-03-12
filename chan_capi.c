@@ -159,7 +159,8 @@ soft_echo_cancel_get_factor(struct soft_echo_cancel *rx,
     u_int32_t tx_power = tx->power_avg[tx->offset];
     int32_t factor = 0;
 
-    if (tx_power >= (rx_power / 2)) {
+    if ((tx_power >= (rx_power / 2)) && 
+	(tx->stuck < EC_STUCK_OFFSET)) {
 
         factor = (tx_power >> 13);
 
@@ -192,6 +193,9 @@ soft_echo_cancel_process(struct call_desc *cd, struct soft_echo_cancel *rx,
     u_int16_t x;
     u_int16_t y;
 
+    /* clear the stuck variable */
+    rx->stuck = 0;
+
     while(len--) {
         if (pbx_capability == AST_FORMAT_ULAW) {
 	  temp = capi_ulaw_to_signed[*ptr];
@@ -214,6 +218,12 @@ soft_echo_cancel_process(struct call_desc *cd, struct soft_echo_cancel *rx,
 
 	rx->samples++;
 	if (rx->samples >= EC_WINDOW_LEN) {
+
+	    /* increase stuck variable of peer */
+
+	    if(tx->stuck != 0xFF) {
+	       tx->stuck++;
+	    }
 
 	    /* clear current RX power */
 

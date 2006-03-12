@@ -124,10 +124,6 @@
 #define CAPI_NATIONAL_PREF               "0"
 #define CAPI_INTERNAT_PREF              "00"
 
-#define ECHO_TX_COUNT                   5 /* 5 x 20ms = 100ms */
-#define ECHO_EFFECTIVE_TX_COUNT         3 /* 2 x 20ms = 40ms == 40-100ms  ... ignore first 40ms */
-#define ECHO_TXRX_RATIO                 2.3 /* if( rx < (txavg/ECHO_TXRX_RATIO) ) rx=0; */
-
 #define FACILITYSELECTOR_DTMF              1
 #define FACILITYSELECTOR_SUPPLEMENTARY     3
 #define FACILITYSELECTOR_LINE_INTERCONNECT 5
@@ -406,17 +402,19 @@ struct config_entry_iface {
 
 /* software echo cancellation */
 
-#define EC_WINDOW_LEN    (1<<8) /* bytes, 32 millisecond */
+#define EC_WINDOW_LEN    (1<<8) /* bytes, 32 millisecond (one window) */
 #define EC_WINDOW_COUNT     32  /* units */
 #define EC_POWER_OFFSET      8  /* windows */
+#define EC_STUCK_OFFSET     24  /* windows */
 
 struct soft_echo_cancel {
   u_int32_t power_acc; /* total accumulated power */
   u_int32_t power_avg[EC_WINDOW_COUNT]; /* average power */
   u_int16_t samples;   /* number of samples accumulated */
   u_int16_t offset;    /* current power average offset */
-  u_int16_t active : 1;
-  u_int16_t unused : 15;
+  u_int8_t  active : 1;
+  u_int8_t  unused : 7;
+  u_int8_t  stuck;     /* number of windows without data */
 };
 
 struct cc_capi_application;
