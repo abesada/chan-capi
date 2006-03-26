@@ -130,6 +130,14 @@ else
 	echo " * no 'devicestate.h'"
 fi
 
+if [ -f "$INCLUDEDIR/strings.h" ]; then
+	echo "#undef CC_AST_NO_STRINGS" >>$CONFIGFILE
+	echo " * found 'strings.h'"
+else
+	echo "#define CC_AST_NO_STRINGS" >>$CONFIGFILE
+	echo " * no 'strings.h'"
+fi
+
 if grep -q " Type of channel " $INCLUDEDIR/channel.h; then
 	echo "#define CC_AST_HAS_TYPE_IN_CHANNEL" >>$CONFIGFILE
 	echo " * found 'type' in ast_channel"

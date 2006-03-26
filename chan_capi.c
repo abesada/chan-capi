@@ -33,7 +33,9 @@
 #include <asterisk/utils.h>
 #include <asterisk/cli.h>
 #include <asterisk/causes.h>
+#ifndef CC_AST_NO_STRINGS
 #include <asterisk/strings.h>
+#endif
 #ifndef CC_AST_NO_DEVICESTATE
 #include <asterisk/devicestate.h>
 #endif

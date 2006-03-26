@@ -82,7 +82,6 @@ static inline unsigned int read_capi_dword(void *m)
 #define cc_mutex_lock(x) ast_mutex_lock(x)
 #define cc_mutex_unlock(x) ast_mutex_unlock(x)
 #define cc_log(x...) ast_log(x)
-#define cc_copy_string(dst, src, size) ast_copy_string(dst, src, size)
 
 /*
  * definitions for compatibility with older versions of ast*
@@ -97,6 +96,12 @@ static inline unsigned int read_capi_dword(void *m)
 #define CC_AST_BRIDGED_CHANNEL(x) ast_bridged_channel(x)
 #else
 #define CC_AST_BRIDGED_CHANNEL(x) (x)->bridge
+#endif
+
+#ifdef CC_AST_NO_STRINGS
+#define cc_copy_string(dst, src, size)  strncpy(dst, src, size -1)
+#else
+#define cc_copy_string(dst, src, size)  ast_copy_string(dst, src, size)
 #endif
 
 #ifdef CC_AST_HAS_BRIDGE_RESULT
