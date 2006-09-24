@@ -433,8 +433,8 @@ static MESSAGE_EXCHANGE_ERROR capi_wait_conf(struct capi_pvt *i, unsigned short 
 	i->waitevent = (unsigned int)wCmd;
 	abstime.tv_sec = time(NULL) + 2;
 	abstime.tv_nsec = 0;
-	cc_verbose(4, 1, "%s: wait for %s\n",
-		i->vname, capi_cmd2str(command, subcommand));
+	cc_verbose(4, 1, "%s: wait for %s (0x%x)\n",
+		i->vname, capi_cmd2str(command, subcommand), i->waitevent);
 	if (ast_cond_timedwait(&i->event_trigger, &i->lock, &abstime) != 0) {
 		error = -1;
 		cc_log(LOG_WARNING, "%s: timed out waiting for %s\n",
@@ -641,7 +641,7 @@ static int tcap2cip(unsigned short tcap)
 		if (translate_tcap2cip[x].tcap == tcap)
 			return (int)translate_tcap2cip[x].cip;
 	}
-	return 0;
+	return CAPI_CIPI_SPEECH;
 }
 
 static unsigned char tcap_is_digital(unsigned short tcap)
@@ -1982,6 +1982,11 @@ static CC_BRIDGE_RETURN pbx_capi_bridge(struct ast_channel *c0,
 	if ((!capi_controllers[i0->controller]->lineinterconnect) ||
 	    (!capi_controllers[i1->controller]->lineinterconnect)) {
 		return AST_BRIDGE_FAILED_NOWARN;
+	}
+
+	if ((i0->isdnstate & CAPI_ISDN_STATE_ECT) ||
+	    (i0->isdnstate & CAPI_ISDN_STATE_ECT)) {
+		return AST_BRIDGE_FAILED;
 	}
 	
 	capi_wait_for_b3_up(i0);
@@ -3387,7 +3392,9 @@ static void capidev_handle_connect_active_indication(_cmsg *CMSG, unsigned int P
 	}
 
 	if ((i->owner) && (i->FaxState & CAPI_FAX_STATE_ACTIVE)) {
-		capi_signal_answer(i);
+		ast_setstate(i->owner, AST_STATE_UP);
+		if (i->owner->cdr)
+			ast_cdr_answer(i->owner->cdr);
 		return;
 	}
 	
@@ -3498,7 +3505,9 @@ static void capidev_handle_disconnect_b3_indication(_cmsg *CMSG, unsigned int PL
 		/* if we have fax infos, set them as variables */
 		snprintf(buffer, CAPI_MAX_STRING-1, "%d", i->reasonb3);
 		pbx_builtin_setvar_helper(i->owner, "FAXREASON", buffer);
-		if ((infostring = capi_info_string(i->reasonb3)) != NULL) {
+		if (i->reasonb3 == 0) {
+			pbx_builtin_setvar_helper(i->owner, "FAXREASONTEXT", "OK");
+		} else if ((infostring = capi_info_string(i->reasonb3)) != NULL) {
 			pbx_builtin_setvar_helper(i->owner, "FAXREASONTEXT", infostring);
 		} else {
 			pbx_builtin_setvar_helper(i->owner, "FAXREASONTEXT", "");
@@ -3585,6 +3594,7 @@ static void capidev_handle_disconnect_indication(_cmsg *CMSG, unsigned int PLCI,
 	if (i->FaxState & CAPI_FAX_STATE_ACTIVE) {
 		/* in capiFax */
 		switch (i->reason) {
+		case 0x3400:
 		case 0x3490:
 		case 0x349f:
 			if (i->reasonb3 != 0)
@@ -4312,12 +4322,9 @@ static int pbx_capi_ect(struct ast_channel *c, char *param)
 
 	cc_disconnect_b3(i, 1);
 
-	cc_mutex_lock(&i->lock);
-
 	if (i->state != CAPI_STATE_CONNECTED) {
 		cc_log(LOG_WARNING, "%s: destination not connected for ECT\n",
 			i->vname);
-		cc_mutex_unlock(&i->lock);
 		return -1;
 	}
 
@@ -4333,13 +4340,14 @@ static int pbx_capi_ect(struct ast_channel *c, char *param)
 	FACILITY_REQ_FACILITYSELECTOR(&CMSG) = FACILITYSELECTOR_SUPPLEMENTARY;
 	FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)&fac;
 
-	_capi_put_cmsg_wait_conf(i, &CMSG);
+	cc_mutex_lock(&ii->lock);
+	_capi_put_cmsg_wait_conf(ii, &CMSG);
 	
 	ii->isdnstate &= ~CAPI_ISDN_STATE_HOLD;
 	ii->isdnstate |= CAPI_ISDN_STATE_ECT;
 	i->isdnstate |= CAPI_ISDN_STATE_ECT;
 	
-	cc_mutex_unlock(&i->lock);
+	cc_mutex_unlock(&ii->lock);
 
 	cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: sent ECT for PLCI=%#x to PLCI=%#x\n",
 		i->vname, plci, i->PLCI);
