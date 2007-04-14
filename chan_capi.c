@@ -97,8 +97,8 @@ OPENPBX_FILE_VERSION("$HeadURL$", "$Revision$")
 #ifdef PBX_IS_OPBX
 #define CC_VERSION "cm-opbx-1.0"
 #else
-/* #define CC_VERSION "x.y.z" */
-#define CC_VERSION "$Revision$"
+#define CC_VERSION "1.0.1"
+/* #define CC_VERSION "$Revision$" */
 #endif
 
 /*
