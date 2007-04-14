@@ -39,7 +39,7 @@ echo "#ifndef CHAN_CAPI_CONFIG_H" >>$CONFIGFILE
 echo "#define CHAN_CAPI_CONFIG_H" >>$CONFIGFILE
 echo >>$CONFIGFILE
 
-if grep -q "ASTERISK_VERSION_NUM 0104" $INCLUDEDIR/version.h; then
+if grep -q "ASTERISK_VERSION_NUM .*104" $INCLUDEDIR/version.h; then
 	echo "#define CC_AST_HAS_VERSION_1_4" >>$CONFIGFILE
 	echo " * found Asterisk version 1.4"
 	VER=1_4
@@ -51,6 +51,12 @@ else
 	else
 		echo "#undef CC_AST_HAS_VERSION_1_4" >>$CONFIGFILE
 	fi
+fi
+
+if [ "$VER" = "1_2" ]; then
+	echo "Using Asterisk 1.2 API"
+else
+	echo "Using Asterisk 1.4 API"
 fi
 
 if grep -q "AST_STRING_FIELD(name)" $INCLUDEDIR/channel.h; then
@@ -112,5 +118,6 @@ echo "#endif /* CHAN_CAPI_CONFIG_H */" >>$CONFIGFILE
 echo "" >>$CONFIGFILE
 
 echo "config.h complete."
+echo
 exit 0
 

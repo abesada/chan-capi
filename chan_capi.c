@@ -89,12 +89,15 @@ OPENPBX_FILE_VERSION("$HeadURL$", "$Revision$")
 #include "chan_capi20.h"
 #include "chan_capi.h"
 #include "chan_capi_rtp.h"
+#include "chan_capi_qsig.h"
+#include "chan_capi_qsig_asn197ade.h"
+#include "chan_capi_qsig_asn197no.h"
 #endif
 
 #ifdef PBX_IS_OPBX
-#define CC_VERSION "cm-opbx-0.7"
+#define CC_VERSION "cm-opbx-1.0"
 #else
-/* #define CC_VERSION "cm-x.y.z" */
+/* #define CC_VERSION "x.y.z" */
 #define CC_VERSION "$Revision$"
 #endif
 
@@ -127,6 +130,7 @@ static char *commandtdesc = "CAPI command interface.\n"
 "\"params\" can be:\n"
 "early B3:\"b\"=always, \"B\"=on successful calls only\n"
 "\"d\":use callerID from capi.conf, \"o\":overlap sending number\n"
+"\n\"q\":disable QSIG functions on outgoing call\n"
 "\n"
 "capicommand() where () can be:\n"
 "\"progress\" send progress (for NT mode)\n"
@@ -141,6 +145,7 @@ static char *commandtdesc = "CAPI command interface.\n"
 "\"3pty_begin|${MYHOLDVAR})\" Three-Party-Conference (3PTY) with active and held call\n"
 "\"receivefax|filename|stationID|headline\" receive a CAPIfax\n"
 "\"sendfax|filename.sff|stationID|headline\" send a CAPIfax\n"
+"\"qsig_ct|cidsrc|ciddst\" QSIG call transfer\n"
 "Variables set after fax receive:\n"
 "FAXSTATUS     :0=OK, 1=Error\n"
 "FAXREASON     :B3 disconnect reason\n"
@@ -217,6 +222,7 @@ static int channel_task;
 #define CAPI_CHANNEL_TASK_HANGUP           1
 #define CAPI_CHANNEL_TASK_SOFTHANGUP       2
 #define CAPI_CHANNEL_TASK_PICKUP           3
+#define CAPI_CHANNEL_TASK_GOTOFAX          4
 
 static char capi_national_prefix[AST_MAX_EXTENSION];
 static char capi_international_prefix[AST_MAX_EXTENSION];
@@ -600,13 +606,51 @@ static MESSAGE_EXCHANGE_ERROR capidev_check_wait_get_cmsg(_cmsg *CMSG)
 }
 
 /*
+ * send Listen for supplementary to specified controller
+ */
+static void ListenOnSupplementary(unsigned controller)
+{
+	_cmsg	CMSG;
+	char	fac[8];
+	MESSAGE_EXCHANGE_ERROR error;
+	int waitcount = 50;
+
+	fac[0] = 7;	/* len */
+	fac[1] = 0x01;	/* listen */
+	fac[2] = 0x00;
+	fac[3] = 4;	/* len / sservice specific parameter , cstruct */
+	write_capi_dword(&(fac[4]), 0x0000079f);
+
+	FACILITY_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
+	FACILITY_REQ_CONTROLLER(&CMSG) = controller;
+	FACILITY_REQ_FACILITYSELECTOR(&CMSG) = FACILITYSELECTOR_SUPPLEMENTARY;
+	FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)&fac;
+
+	error = _capi_put_cmsg(&CMSG);
+
+	while (waitcount) {
+		error = capidev_check_wait_get_cmsg(&CMSG);
+
+		if (IS_FACILITY_CONF(&CMSG)) {
+			break;
+		}
+		usleep(30000);
+		waitcount--;
+	}
+	if (!waitcount) {
+		cc_log(LOG_ERROR,"Unable to supplementary-listen on contr%d (error=0x%x)\n",
+			controller, error);
+	}
+}
+
+/*
  * send Listen to specified controller
  */
 static unsigned ListenOnController(unsigned long CIPmask, unsigned controller)
 {
 	MESSAGE_EXCHANGE_ERROR error;
 	_cmsg CMSG;
-	int waitcount = 100;
+	int waitcount = 50;
 
 	LISTEN_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), controller);
 
@@ -624,9 +668,10 @@ static unsigned ListenOnController(unsigned long CIPmask, unsigned controller)
 
 		if (IS_LISTEN_CONF(&CMSG)) {
 			error = LISTEN_CONF_INFO(&CMSG);
+			ListenOnSupplementary(controller);
 			break;
 		}
-		usleep(20000);
+		usleep(30000);
 		waitcount--;
 	}
 	if (!waitcount)
@@ -958,7 +1003,7 @@ static void update_channel_name(struct capi_pvt *i)
 	char name[AST_CHANNEL_NAME];
 
 	snprintf(name, sizeof(name) - 1, "CAPI/%s/%s-%x",
-		i->name, i->dnid, capi_counter++);
+		i->vname, i->dnid, capi_counter++);
 	ast_change_name(i->owner, name);
 	cc_verbose(3, 0, VERBOSE_PREFIX_3 "%s: Updated channel name: %s\n",
 			i->vname, name);
@@ -1454,6 +1499,7 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 	char *dsa = NULL;
 	char callingsubaddress[AST_MAX_EXTENSION];
 	char calledsubaddress[AST_MAX_EXTENSION];
+	int doqsig;
 	
 	_cmsg CMSG;
 	MESSAGE_EXCHANGE_ERROR  error;
@@ -1465,6 +1511,7 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 	i->doB3 = CAPI_B3_DONT;
 	i->doOverlap = 0;
 	memset(i->overlapdigits, 0, sizeof(i->overlapdigits));
+	doqsig = i->qsigfeat;
 
 	/* parse the parameters */
 	while ((param) && (*param)) {
@@ -1488,6 +1535,11 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 			if (use_defaultcid)
 				cc_log(LOG_WARNING, "Default CID already set in '%s'\n", idest);
 			use_defaultcid = 1;
+			break;
+		case 'q':	/* disable QSIG */
+			cc_verbose(4, 0, VERBOSE_PREFIX_4 "%s: QSIG extensions for this call disabled\n",
+				i->vname);
+			doqsig = 0;
 			break;
 		default:
 			cc_log(LOG_WARNING, "Unknown parameter '%c' in '%s', ignoring.\n",
@@ -1576,6 +1628,12 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 	bchaninfo[1] = 0x0;
 	bchaninfo[2] = 0x0;
 	CONNECT_REQ_BCHANNELINFORMATION(&CMSG) = (_cstruct)bchaninfo; /* 0 */
+
+	if (doqsig) {
+		unsigned char *facilityarray = alloca(CAPI_MAX_FACILITYDATAARRAY_SIZE);
+		cc_qsig_add_call_setup_data(facilityarray, i, c);
+		CONNECT_REQ_FACILITYDATAARRAY(&CMSG) = facilityarray;
+	}
 
 	cc_mutex_lock(&i->lock);
 
@@ -1782,6 +1840,11 @@ static int pbx_capi_write(struct ast_channel *c, struct ast_frame *f)
 		}
 		return capi_write_rtp(c, f);
 	}
+	if (i->B3count >= CAPI_MAX_B3_BLOCKS) {
+		cc_verbose(3, 1, VERBOSE_PREFIX_4 "%s: B3count is full, dropping packet.\n",
+			i->vname);
+		return 0;
+	}
 
 	if ((!i->smoother) || (ast_smoother_feed(i->smoother, f) != 0)) {
 		cc_log(LOG_ERROR, "%s: failed to fill smoother\n", i->vname);
@@ -1838,6 +1901,7 @@ static int pbx_capi_write(struct ast_channel *c, struct ast_frame *f)
 
 		if (!error) {
 			cc_mutex_lock(&i->lock);
+			i->B3count++;
 			i->B3q -= fsmooth->datalen;
 			if (i->B3q < 0)
 				i->B3q = 0;
@@ -2115,7 +2179,7 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 
 #ifdef CC_AST_HAS_EXT_CHAN_ALLOC
 	tmp = ast_channel_alloc(0, state, i->cid, NULL,
-		"CAPI/%s/%s-%x", i->name, i->dnid, capi_counter++);
+		"CAPI/%s/%s-%x", i->vname, i->dnid, capi_counter++);
 #else
 	tmp = ast_channel_alloc(0);
 #endif
@@ -2128,10 +2192,10 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 #ifndef CC_AST_HAS_EXT_CHAN_ALLOC
 #ifdef CC_AST_HAS_STRINGFIELD_IN_CHANNEL
 	ast_string_field_build(tmp, name, "CAPI/%s/%s-%x",
-		i->name, i->dnid, capi_counter++);
+		i->vname, i->dnid, capi_counter++);
 #else
 	snprintf(tmp->name, sizeof(tmp->name) - 1, "CAPI/%s/%s-%x",
-		i->name, i->dnid, capi_counter++);
+		i->vname, i->dnid, capi_counter++);
 #endif
 #endif
 #ifndef CC_AST_HAS_VERSION_1_4
@@ -2165,6 +2229,7 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 	i->onholdPLCI = 0;
 	i->doholdtype = i->holdtype;
 	i->B3q = 0;
+	i->B3count = 0;
 	memset(i->txavg, 0, ECHO_TX_COUNT);
 
 	if (i->doDTMF > 0) {
@@ -2375,7 +2440,8 @@ static int pbx_capi_receive_fax(struct ast_channel *c, char *data)
 {
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
 	int res = 0;
-	char *filename, *stationid, *headline;
+	int keepbadfax = 0;
+	char *filename, *stationid, *headline, *options;
 	B3_PROTO_FAXG3 b3conf;
 	char buffer[CAPI_MAX_STRING];
 
@@ -2386,12 +2452,34 @@ static int pbx_capi_receive_fax(struct ast_channel *c, char *data)
 
 	filename = strsep(&data, "|");
 	stationid = strsep(&data, "|");
-	headline = data;
+	headline = strsep(&data, "|");
+	options = data;
 
 	if (!stationid)
 		stationid = emptyid;
 	if (!headline)
 		headline = emptyid;
+	if (!options)
+		options = emptyid;
+
+	cc_verbose(3, 1, VERBOSE_PREFIX_3 "capi receivefax: '%s' '%s' '%s' '%s'\n",
+		filename, stationid, headline, options);
+
+	/* parse the options */
+	while ((options) && (*options)) {
+		switch (*options) {
+		case 'k':	/* keepbadfax */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 "capi receivefax: if fax is bad, "
+				"file won't be deleted.\n");
+			keepbadfax = 1;
+			break;
+		default:
+			cc_log(LOG_WARNING, "Unknown option '%c' for receivefax.\n",
+				*options);
+		}
+		options++;
+	}
 
 	capi_wait_for_answered(i);
 
@@ -2451,7 +2539,11 @@ static int pbx_capi_receive_fax(struct ast_channel *c, char *data)
 		cc_verbose(2, 0,
 			VERBOSE_PREFIX_1 "capi receivefax: fax receive failed reason=0x%04x reasonB3=0x%04x\n",
 				i->reason, i->reasonb3);
-		unlink(filename);
+		if (!keepbadfax) {
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 "capi receivefax: removing fax file.\n");
+			unlink(filename);
+		}
 	} else {
 		cc_verbose(2, 0,
 			VERBOSE_PREFIX_1 "capi receivefax: fax receive successful.\n");
@@ -2486,6 +2578,9 @@ static int pbx_capi_send_fax(struct ast_channel *c, char *data)
 		stationid = emptyid;
 	if (!headline)
 		headline = emptyid;
+
+	cc_verbose(3, 1, VERBOSE_PREFIX_3 "capi sendfax: '%s' '%s' '%s'\n",
+		filename, stationid, headline);
 
 	capi_wait_for_answered(i);
 
@@ -2586,11 +2681,8 @@ static void capi_handle_dtmf_fax(struct capi_pvt *i)
 	cc_verbose(2, 0, VERBOSE_PREFIX_3 "%s: Redirecting %s to fax extension\n",
 		i->vname, c->name);
 			
-	/* Save the DID/DNIS when we transfer the fax call to a "fax" extension */
-	pbx_builtin_setvar_helper(c, "FAXEXTEN", c->exten);
-	
-	if (ast_async_goto(c, c->context, "fax", 1))
-		cc_log(LOG_WARNING, "Failed to async goto '%s' into fax of '%s'\n", c->name, c->context);
+	capi_channel_task(c, CAPI_CHANNEL_TASK_GOTOFAX);
+
 	return;
 }
 
@@ -2971,6 +3063,7 @@ static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 	_cmsg CMSG2;
 	struct ast_frame fr = { AST_FRAME_NULL, };
 	char *p = NULL;
+	char *p2 = NULL;
 	int val = 0;
 
 	INFO_RESP_HEADER(&CMSG2, capi_ApplID, HEADER_MSGNUM(CMSG), PLCI);
@@ -3060,6 +3153,25 @@ static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 				free(i->owner->cid.cid_rdnis);
 			}
 			i->owner->cid.cid_rdnis = strdup(p);
+		}
+		break;
+	case 0x0076:	/* Redirection Number */
+		p = capi_number(INFO_IND_INFOELEMENT(CMSG), 2);
+		p2 = emptyid;
+		if (INFO_IND_INFOELEMENT(CMSG)[0] > 1) {
+			val = INFO_IND_INFOELEMENT(CMSG)[1] & 0x70;
+			if (val == CAPI_ETSI_NPLAN_NATIONAL) {
+				p2 = capi_national_prefix;
+			} else if (val == CAPI_ETSI_NPLAN_INTERNAT) {
+				p2 = capi_international_prefix;
+			}
+		}
+		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: info element REDIRECTION NUMBER '(%s)%s'\n",
+			i->vname, p2, p);
+		if (i->owner) {
+			char numberbuf[64];
+			snprintf(numberbuf, sizeof(numberbuf) - 1, "%s%s", p2, p);
+			pbx_builtin_setvar_helper(i->owner, "REDIRECTIONNUMBER", numberbuf);
 		}
 		break;
 	case 0x00a1:	/* Sending Complete */
@@ -3446,6 +3558,12 @@ static void capidev_send_faxdata(struct capi_pvt *i)
 	size_t len;
 	_cmsg CMSG;
 
+	if (i->NCCI == 0) {
+		cc_verbose(3, 0, VERBOSE_PREFIX_3 "%s: send_faxdata on NCCI = 0.\n",
+			i->vname);
+		return;
+	}
+
 	if (i->state == CAPI_STATE_DISCONNECTING) {
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: send_faxdata in DISCONNECTING.\n",
 			i->vname);
@@ -3578,8 +3696,9 @@ static void capidev_handle_connect_b3_active_indication(_cmsg *CMSG, unsigned in
 		i->isdnstate |= CAPI_ISDN_STATE_RTP;
 	} else {
 		i->isdnstate &= ~CAPI_ISDN_STATE_RTP;
-		i->B3q = (CAPI_MAX_B3_BLOCK_SIZE * 3);
 	}
+
+	i->B3q = (CAPI_MAX_B3_BLOCK_SIZE * 3);
 
 	if ((i->FaxState & CAPI_FAX_STATE_SENDMODE)) {
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: Start sending fax.\n",
@@ -3691,6 +3810,7 @@ static void capidev_handle_connect_b3_indication(_cmsg *CMSG, unsigned int PLCI,
 	return_on_no_interface("CONNECT_B3_IND");
 
 	i->NCCI = NCCI;
+	i->B3count = 0;
 
 	return;
 }
@@ -3914,6 +4034,11 @@ static void capidev_handle_connect_indication(_cmsg *CMSG, unsigned int PLCI, un
 			pbx_builtin_setvar_helper(i->owner, "ANI2", buffer);
 			pbx_builtin_setvar_helper(i->owner, "SECONDCALLERID", buffer);
 			*/
+
+			if (i->qsigfeat != QSIG_DISABLED) {
+				cc_qsig_handle_capiind(CONNECT_IND_FACILITYDATAARRAY(CMSG), i);
+			}
+			
 			if ((i->isdnmode == CAPI_ISDNMODE_MSN) && (i->immediate)) {
 				/* if we don't want to wait for SETUP/SENDING-COMPLETE in MSN mode */
 				start_pbx_on_match(i, PLCI, HEADER_MSGNUM(CMSG));
@@ -4192,12 +4317,14 @@ static void capidev_handle_msg(_cmsg *CMSG)
 				capi_echo_canceller(i->owner, EC_FUNCTION_DISABLE);
 				capi_detect_dtmf(i->owner, 0);
 			}
+		} else {
+			i->isdnstate &= ~CAPI_ISDN_STATE_B3_PEND;
 		}
 		break;
 	case CAPI_P_CONF(DATA_B3):
 		wInfo = DATA_B3_CONF_INFO(CMSG);
-		if ((i) && (i->B3q > 0) && (i->isdnstate & CAPI_ISDN_STATE_RTP)) {
-			i->B3q--;
+		if ((i) && (i->B3count > 0)) {
+			i->B3count--;
 		}
 		if ((i) && (i->FaxState & CAPI_FAX_STATE_SENDMODE)) {
 			capidev_send_faxdata(i);
@@ -4674,6 +4801,12 @@ static int pbx_capi_signal_progress(struct ast_channel *c, char *param)
 			i->vname);
 		return 0;
 	}
+	if ((i->isdnstate & CAPI_ISDN_STATE_B3_PEND)) {
+		cc_verbose(4, 1, VERBOSE_PREFIX_4 "%s: signal_progress in NT: B-channel already pending\n",
+			i->vname);
+		return 0;
+	}
+	i->isdnstate |= CAPI_ISDN_STATE_B3_PEND;
 
 	cc_select_b(i, NULL);
 
@@ -4766,6 +4899,33 @@ static int pbx_capi_3pty_begin(struct ast_channel *c, char *param)
 }
 
 /*
+ * Initiate a QSIG Call Transfer
+ */
+static int pbx_capi_qsig_ct(struct ast_channel *c, char *param)
+{
+	unsigned char fac[CAPI_MAX_FACILITYDATAARRAY_SIZE];
+	_cmsg		CMSG;
+	struct capi_pvt *i = CC_CHANNEL_PVT(c);
+
+	if (!param) { /* no data implies no Calling Number and Destination Number */
+		cc_log(LOG_WARNING, "capi qsig_ct requires source number and destination number\n");
+		return -1;
+	}
+
+	cc_qsig_do_facility(fac, c, param, 99);
+	
+	INFO_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(),0);
+	INFO_REQ_PLCI(&CMSG) = i->PLCI;
+	//		/ *INFO_REQ_FACILITYSELECTOR(&CMSG) = 0;* /
+	INFO_REQ_FACILITYDATAARRAY(&CMSG) = fac;
+		
+	_capi_put_cmsg(&CMSG);
+
+
+	return 0;
+}
+
+/*
  * struct of capi commands
  */
 static struct capicommands_s {
@@ -4784,7 +4944,8 @@ static struct capicommands_s {
 	{ "holdtype",     pbx_capi_holdtype,        1 },
 	{ "retrieve",     pbx_capi_retrieve,        0 },
 	{ "ect",          pbx_capi_ect,             1 },
-	{ "3pty_begin",	  pbx_capi_3pty_begin,	    1 },
+	{ "3pty_begin",   pbx_capi_3pty_begin,      1 },
+	{ "qsig_ct",      pbx_capi_qsig_ct,         1 },
 	{ NULL, NULL, 0 }
 };
 
@@ -5012,6 +5173,16 @@ static void capi_do_channel_task(void)
 		}
 		ast_hangup(chan_for_task);
 		break;
+	case CAPI_CHANNEL_TASK_GOTOFAX:
+		/* deferred (out of lock) async goto fax extension */
+		/* Save the DID/DNIS when we transfer the fax call to a "fax" extension */
+		pbx_builtin_setvar_helper(chan_for_task, "FAXEXTEN", chan_for_task->exten);
+	
+		if (ast_async_goto(chan_for_task, chan_for_task->context, "fax", 1)) {
+			cc_log(LOG_WARNING, "Failed to async goto '%s' into fax of '%s'\n",
+				chan_for_task->name, chan_for_task->context);
+		}
+		break;
 	default:
 		/* nothing to do */
 		break;
@@ -5197,6 +5368,8 @@ int mkif(struct cc_capi_conf *conf)
 		tmp->doDTMF = conf->softdtmf;
 		tmp->capability = conf->capability;
 
+		tmp->qsigfeat = conf->qsigfeat;
+
 		tmp->next = iflist; /* prepend */
 		iflist = tmp;
 		cc_verbose(2, 0, VERBOSE_PREFIX_3 "capi %c %s (%s:%s) contr=%d devs=%d EC=%d,opt=%d,tail=%d\n",
@@ -5380,7 +5553,7 @@ static int pbxcli_capi_show_channels(int fd, int argc, char *argv[])
 	struct capi_pvt *i;
 	char iochar;
 	char i_state[80];
-	char b3q[16];
+	char b3q[32];
 	
 	if (argc != 3)
 		return RESULT_SHOWUSAGE;
@@ -5402,10 +5575,12 @@ static int pbxcli_capi_show_channels(int fd, int argc, char *argv[])
 		else
 			iochar = 'I';
 
-		if (capidebug)
-			snprintf(b3q, sizeof(b3q), "  B3q=%d", i->B3q);
-		else
+		if (capidebug) {
+			snprintf(b3q, sizeof(b3q), "  B3q=%d B3count=%d",
+				i->B3q, i->B3count);
+		} else {
 			b3q[0] = '\0';
+		}
 
 		ast_cli(fd,
 			"%-16s %s   %s  %c  %s  %-10s  0x%02x '%s'->'%s'%s\n",
@@ -5534,24 +5709,25 @@ static const struct ast_channel_tech capi_tech = {
 /*
  * register at CAPI interface
  */
-static int cc_register_capi(unsigned blocksize)
+static int cc_register_capi(unsigned blocksize, unsigned connections)
 {
 	u_int16_t error = 0;
+	unsigned capi_ApplID_old = capi_ApplID;
 
-	if (capi_ApplID != CAPI_APPLID_UNUSED) {
-		if (capi20_release(capi_ApplID) != 0)
-			cc_log(LOG_WARNING,"Unable to unregister from CAPI!\n");
-	}
 	cc_verbose(3, 0, VERBOSE_PREFIX_3 "Registering at CAPI "
-		   "(blocksize=%d)\n", blocksize);
+		   "(blocksize=%d maxlogicalchannels=%d)\n", blocksize, connections);
 
 #if (CAPI_OS_HINT == 2)
-	error = capi20_register(CAPI_BCHANS, CAPI_MAX_B3_BLOCKS, 
+	error = capi20_register(connections, CAPI_MAX_B3_BLOCKS, 
 				blocksize, &capi_ApplID, CAPI_STACK_VERSION);
 #else
-	error = capi20_register(CAPI_BCHANS, CAPI_MAX_B3_BLOCKS, 
+	error = capi20_register(connections, CAPI_MAX_B3_BLOCKS, 
 				blocksize, &capi_ApplID);
 #endif
+	if (capi_ApplID_old != CAPI_APPLID_UNUSED) {
+		if (capi20_release(capi_ApplID_old) != 0)
+			cc_log(LOG_WARNING,"Unable to unregister from CAPI!\n");
+	}
 	if (error != 0) {
 		capi_ApplID = CAPI_APPLID_UNUSED;
 		cc_log(LOG_NOTICE,"unable to register application at CAPI!\n");
@@ -5579,7 +5755,7 @@ static int cc_init_capi(void)
 		return -1;
 	}
 
-	if (cc_register_capi(CAPI_MAX_B3_BLOCK_SIZE))
+	if (cc_register_capi(CAPI_MAX_B3_BLOCK_SIZE, 2))
 		return -1;
 
 #if (CAPI_OS_HINT == 1)
@@ -5703,20 +5879,24 @@ static int cc_post_init_capi(void)
 	struct capi_pvt *i;
 	int controller;
 	unsigned error;
-	int use_rtp = 0;
+	int rtp_ext_size = 0;
+	unsigned needchannels = 0;
 
-	for (i = iflist; i && !use_rtp; i = i->next) {
+	for (i = iflist; i && !rtp_ext_size; i = i->next) {
 		/* if at least one line wants RTP, we need to re-register with
 		   bigger block size for RTP-header */
 		if (capi_controllers[i->controller]->rtpcodec & i->capability) {
 			cc_verbose(3, 0, VERBOSE_PREFIX_4 "at least one CAPI controller wants RTP.\n");
-			use_rtp = 1;
+			rtp_ext_size = RTP_HEADER_SIZE;
 		}
 	}
-	if (use_rtp) {
-		if (cc_register_capi(CAPI_MAX_B3_BLOCK_SIZE + RTP_HEADER_SIZE))
-			return -1;
+	for (controller = 1; controller <= capi_num_controllers; controller++) {
+		if (capi_controllers[controller] != NULL) {
+			needchannels += (capi_controllers[controller]->nbchannels + 1);
+		}
 	}
+	if (cc_register_capi(CAPI_MAX_B3_BLOCK_SIZE + rtp_ext_size, needchannels))
+		return -1;
 
 	for (controller = 1; controller <= capi_num_controllers; controller++) {
 		if (capi_used_controllers & (1 << controller)) {
@@ -5797,6 +5977,7 @@ static int conf_interface(struct cc_capi_conf *conf, struct ast_variable *v)
 		CONF_TRUE(conf->es, "echosquelch", 1)
 		CONF_TRUE(conf->bridge, "bridge", 1)
 		CONF_TRUE(conf->ntmode, "ntmode", 1)
+		CONF_INTEGER(conf->qsigfeat, "qsig")
 		if (!strcasecmp(v->name, "callgroup")) {
 			conf->callgroup = ast_get_group(v->value);
 			continue;

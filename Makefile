@@ -25,6 +25,8 @@ OSNAME=${shell uname}
 
 .PHONY: openpbx
 
+V=0
+
 INSTALL_PREFIX=
 
 ASTERISK_HEADER_DIR=$(INSTALL_PREFIX)/usr/include
@@ -91,7 +93,7 @@ INSTALL=install
 
 SHAREDOS=chan_capi.so
 
-OBJECTS=chan_capi.o c20msg.o chan_capi_rtp.o
+OBJECTS=chan_capi.o c20msg.o chan_capi_rtp.o chan_capi_qsig_core.o chan_capi_qsig_ecma.o chan_capi_qsig_asn197ade.o chan_capi_qsig_asn197no.o
 
 CFLAGS+=-Wno-missing-prototypes -Wno-missing-declarations
 
@@ -100,6 +102,8 @@ CFLAGS+=-DCRYPTO
 ifneq (${AVERSION},V1_4)
 CFLAGS+=`if grep -q AST_JB config.h; then echo -DAST_JB; fi`
 endif
+
+.SUFFIXES: .c .o
 
 all: config.h $(SHAREDOS)
 
@@ -111,8 +115,21 @@ clean:
 config.h:
 	./create_config.sh "$(ASTERISK_HEADER_DIR)"
 
+.c.o: config.h
+	@if [ "$(V)" = "0" ]; then \
+		echo " [CC] $*.c -> $*.o";	\
+	else	\
+		echo "$(CC) $(CFLAGS) -c $*.c -o $*.o";	\
+	fi
+	@$(CC) $(CFLAGS) -c $*.c -o $*.o;
+
 chan_capi.so: $(OBJECTS)
-	$(CC) -shared -Xlinker -x -o $@ $^ $(LIBLINUX) -lcapi20
+	@if [ "$(V)" = "0" ]; then \
+		echo " [LD] $@ ($^)";	\
+	else	\
+		echo "$(CC) -shared -Xlinker -x -o $@ $^ $(LIBLINUX) -lcapi20";	\
+	fi
+	@$(CC) -shared -Xlinker -x -o $@ $^ $(LIBLINUX) -lcapi20
 
 install: all
 	$(INSTALL) -d -m 755 $(MODULES_DIR)
