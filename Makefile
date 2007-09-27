@@ -1,8 +1,7 @@
 #
 # (CAPI*)
 #
-# An implementation of Common ISDN API 2.0 for
-# Asterisk/OpenPBX.org
+# An implementation of Common ISDN API 2.0 for Asterisk
 #
 # Makefile, based on the Asterisk Makefile, Coypright (C) 1999, Mark Spencer
 #
@@ -22,8 +21,6 @@
 OSNAME=${shell uname}
 
 .EXPORT_ALL_VARIABLES:
-
-.PHONY: openpbx
 
 V=0
 
@@ -93,7 +90,9 @@ INSTALL=install
 
 SHAREDOS=chan_capi.so
 
-OBJECTS=chan_capi.o c20msg.o chan_capi_rtp.o chan_capi_qsig_core.o chan_capi_qsig_ecma.o chan_capi_qsig_asn197ade.o chan_capi_qsig_asn197no.o
+OBJECTS=chan_capi.o chan_capi_utils.o chan_capi_rtp.o xlaw.o	\
+	chan_capi_qsig_core.o chan_capi_qsig_ecma.o chan_capi_qsig_asn197ade.o	\
+	chan_capi_qsig_asn197no.o chan_capi_supplementary.o chan_capi_chat.o
 
 CFLAGS+=-Wno-missing-prototypes -Wno-missing-declarations
 
@@ -110,7 +109,6 @@ all: config.h $(SHAREDOS)
 clean:
 	rm -f config.h
 	rm -f *.so *.o
-	rm -rf openpbx
 
 config.h:
 	./create_config.sh "$(ASTERISK_HEADER_DIR)"
@@ -140,24 +138,4 @@ install_config: capi.conf
 	$(INSTALL) -m 644 capi.conf ${CONFIG_DIR}
 
 samples: install_config
-
-openpbx:
-	@rm -rf openpbx
-	@mkdir -p openpbx/channels
-	@mkdir -p openpbx/include/openpbx
-	@mkdir -p openpbx/doc
-	@mkdir -p openpbx/configs
-	@(	\
-	 ./preparser -c openpbx.ctrl chan_capi.c openpbx/channels/chan_capi.c;	\
-	 ./preparser -c openpbx.ctrl chan_capi_rtp.c openpbx/channels/chan_capi_rtp.c;	\
-	 ./preparser -c openpbx.ctrl c20msg.c openpbx/channels/c20msg.c;	\
-	 ./preparser -c openpbx.ctrl chan_capi.h openpbx/include/openpbx/chan_capi.h;	\
-	 ./preparser -c openpbx.ctrl chan_capi_rtp.h openpbx/include/openpbx/chan_capi_rtp.h;	\
-	 ./preparser -c openpbx.ctrl chan_capi20.h openpbx/include/openpbx/chan_capi20.h;	\
-	 ./preparser -c openpbx.ctrl xlaw.h openpbx/include/openpbx/xlaw.h;	\
-	 ./preparser -c openpbx.ctrl README openpbx/doc/README.chan_capi;	\
-	 ./preparser -c openpbx.ctrl capi.conf openpbx/configs/capi.conf.sample;	\
-	 true;	\
-	)
-
 

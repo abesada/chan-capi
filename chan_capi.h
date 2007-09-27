@@ -1,8 +1,7 @@
 /*
  * (CAPI*)
  *
- * An implementation of Common ISDN API 2.0 for
- * Asterisk / OpenPBX.org
+ * An implementation of Common ISDN API 2.0 for Asterisk
  *
  * Copyright (C) 2005-2007 Cytronics & Melware
  *
@@ -16,6 +15,33 @@
  * This program is free software and may be modified and 
  * distributed under the terms of the GNU Public License.
  */
+
+#include "config.h"
+
+#ifdef CC_AST_HAS_VERSION_1_4
+#include <asterisk.h>
+#endif
+
+#include <asterisk/lock.h>
+#include <asterisk/frame.h>
+#include <asterisk/channel.h>
+#include <asterisk/logger.h>
+#include <asterisk/module.h>
+#include <asterisk/pbx.h>
+#include <asterisk/config.h>
+#include <asterisk/options.h>
+#include <asterisk/features.h>
+#include <asterisk/utils.h>
+#include <asterisk/cli.h>
+#include <asterisk/rtp.h>
+#include <asterisk/causes.h>
+#include <asterisk/strings.h>
+#include <asterisk/dsp.h>
+#include <asterisk/devicestate.h>
+#ifdef CC_AST_HAS_VERSION_1_4
+#include "asterisk/abstract_jb.h"
+#include "asterisk/musiconhold.h"
+#endif
  
 #ifndef _PBX_CAPI_H
 #define _PBX_CAPI_H
@@ -36,11 +62,6 @@
 #define RTP_HEADER_SIZE                  12
 
 #define CAPI_MAX_FACILITYDATAARRAY_SIZE 300
-
-#ifndef CONNECT_RESP_GLOBALCONFIGURATION
-#define CC_HAVE_NO_GLOBALCONFIGURATION
-#warning If you dont update your libcapi20, some fax features are not available
-#endif
 
 /* some helper functions */
 static inline void write_capi_word(void *m, unsigned short val)
@@ -83,11 +104,6 @@ static inline unsigned int read_capi_dword(void *m)
 #define cc_pbx_verbose(x...)      ast_verbose(x)
 #define cc_copy_string(dst, src, size)  ast_copy_string(dst, src, size)
 
-#ifdef PBX_IS_OPBX
-#define CC_CHANNEL_PVT(c) (c)->tech_pvt
-
-#else /* PBX_IS_OPBX */
-
 #ifndef AST_MUTEX_DEFINE_STATIC
 #define AST_MUTEX_DEFINE_STATIC(mutex)		\
 	static cc_mutex_t mutex = AST_MUTEX_INITIALIZER
@@ -99,15 +115,12 @@ static inline unsigned int read_capi_dword(void *m)
 #define CC_CHANNEL_PVT(c) (c)->tech_pvt
 #define CC_BRIDGE_RETURN enum ast_bridge_result
 
-#endif /* PBX_IS_OPBX */
-
-/*
- * prototypes
- */
-extern unsigned capi_ApplID;
-extern MESSAGE_EXCHANGE_ERROR _capi_put_cmsg(_cmsg *CMSG);
-extern _cword get_capi_MessageNumber(void);
-extern void cc_verbose(int o_v, int c_d, char *text, ...);
+/* */
+#define return_on_no_interface(x)                                       \
+	if (!i) {                                                       \
+		cc_verbose(4, 1, "CAPI: %s no interface for PLCI=%#x\n", x, PLCI);   \
+		return;                                                 \
+	}
 
 /*
  * B protocol settings
@@ -156,6 +169,16 @@ typedef struct fax3proto3 B3_PROTO_FAXG3;
 #define FACILITYSELECTOR_ECHO_CANCEL       0x0008
 #define FACILITYSELECTOR_FAX_OVER_IP       0x00fd
 #define FACILITYSELECTOR_VOICE_OVER_IP     0x00fe
+
+#define EC_FUNCTION_ENABLE              1   
+#define EC_FUNCTION_DISABLE             2
+#define EC_FUNCTION_FREEZE              3   
+#define EC_FUNCTION_RESUME              4
+#define EC_FUNCTION_RESET               5   
+#define EC_OPTION_DISABLE_NEVER         0   
+#define EC_OPTION_DISABLE_G165          (1<<2)
+#define EC_OPTION_DISABLE_G164_OR_G165  (1<<1 | 1<<2)
+#define EC_DEFAULT_TAIL                 0 /* maximum */
 
 #define CC_HOLDTYPE_LOCAL               0
 #define CC_HOLDTYPE_HOLD                1
@@ -218,18 +241,46 @@ struct cc_capi_gains {
 #define CAPI_ISDN_STATE_EC            0x00002000
 #define CAPI_ISDN_STATE_DTMF          0x00004000
 #define CAPI_ISDN_STATE_B3_SELECT     0x00008000
-#define CAPI_ISDN_STATE_3PTY	      0x10000000
+#define CAPI_ISDN_STATE_STAYONLINE    0x00010000
+#define CAPI_ISDN_STATE_ISDNPROGRESS  0x00020000
+#define CAPI_ISDN_STATE_3PTY          0x10000000
 #define CAPI_ISDN_STATE_PBX_DONT      0x40000000
 #define CAPI_ISDN_STATE_PBX           0x80000000
 
 #define CAPI_CHANNELTYPE_B            0
 #define CAPI_CHANNELTYPE_D            1
-#define CAPI_CHANNELTYPE_NONE         2
+#define CAPI_CHANNELTYPE_NULL         2
 
 /* the lower word is reserved for capi commands */
 #define CAPI_WAITEVENT_B3_UP          0x00010000
 #define CAPI_WAITEVENT_B3_DOWN        0x00020000
 #define CAPI_WAITEVENT_ANSWER_FINISH  0x00030000
+
+/* Private qsig data for capi device */
+struct cc_qsig_data {
+	int calltransfer_active;
+	int calltransfer;
+	int calltransfer_onring;
+	unsigned int callmark;
+	
+	char *dnameid;
+
+	/* Path Replacement */
+	int pr_propose_sendback; /* send back an prior received PR PROPOSE on Connect */
+	int pr_propose_sentback; /* set to 1 after sending an PR PROPOSE */
+	int pr_propose_active;
+	int pr_propose_doinboundbridge; /* We have to to bridge a call back to asterisk */
+	char *pr_propose_cid;	/* Call identity */
+	char *pr_propose_pn;	/* Party Number */
+	
+	char if_pr_propose_pn[AST_MAX_EXTENSION];	/* configured interface Party Number */
+	
+	/* Partner Channel - needed for many features */
+	struct capi_pvt *partner_ch;
+	unsigned int partner_plci;
+	ast_cond_t event_trigger;
+	unsigned int waitevent;
+};
 
 /* ! Private data for a capi device */
 struct capi_pvt {
@@ -247,8 +298,12 @@ struct capi_pvt {
 	char vname[CAPI_MAX_STRING];
 	unsigned char tmpbuf[CAPI_MAX_STRING];
 
+	/*! Channel who used us, possibly NULL */
+	struct ast_channel *used;		
 	/*! Channel we belong to, possibly NULL */
 	struct ast_channel *owner;		
+	/*! Channel who called us, possibly NULL */
+	struct ast_channel *peer;		
 	
 	/* capi message number */
 	_cword MessageNumber;	
@@ -274,7 +329,7 @@ struct capi_pvt {
 
 	/* which b-protocol is active */
 	int bproto;
-	
+
 	char context[AST_MAX_EXTENSION];
 	/*! Multiple Subscriber Number we listen to (, seperated list) */
 	char incomingmsn[CAPI_MAX_STRING];	
@@ -335,11 +390,15 @@ struct capi_pvt {
 
 	/* Common ISDN Profile (CIP) */
 	int cip;
+	unsigned short transfercapability;
 	
 	/* if not null, receiving a fax */
 	FILE *fFax;
 	/* Fax status */
 	unsigned int FaxState;
+
+	/* handle for CCBS/CCNR callback */
+	unsigned int ccbsnrhandle;
 
 	/* not all codecs supply frames in nice 160 byte chunks */
 	struct ast_smoother *smoother;
@@ -369,6 +428,10 @@ struct capi_pvt {
 	unsigned int reason;
 	unsigned int reasonb3;
 
+	/* deferred tasks */
+	time_t whentohangup;
+	time_t whentoqueuehangup;
+
 	/* RTP */
 	struct ast_rtp *rtp;
 	int capability;
@@ -378,7 +441,8 @@ struct capi_pvt {
 
 	/* Q.SIG features */
 	int qsigfeat;
-
+	struct cc_qsig_data qsig_data;
+	
 	/*! Next channel in list */
 	struct capi_pvt *next;
 };
@@ -396,6 +460,10 @@ struct cc_capi_profile {
 	unsigned int reserved3[6];
 	unsigned int manufacturer[5];
 } __attribute__((__packed__));
+
+struct cc_capi_qsig_conf {
+	char if_pr_propose_pn[AST_MAX_EXTENSION];
+};
 
 struct cc_capi_conf {
 	char name[CAPI_MAX_STRING];	
@@ -421,6 +489,7 @@ struct cc_capi_conf {
 	int bridge;
 	int amaflags;
 	int qsigfeat;
+	struct cc_capi_qsig_conf qsigconf;
 	unsigned int faxsetting;
 	ast_group_t callgroup;
 	ast_group_t pickupgroup;
@@ -511,5 +580,22 @@ struct cc_capi_controller {
 #define PRI_TRANS_CAP_3K1AUDIO                  0x10
 #define PRI_TRANS_CAP_DIGITAL_W_TONES           0x11
 #define PRI_TRANS_CAP_VIDEO                     0x18
+
+/*
+ * prototypes
+ */
+extern const struct ast_channel_tech capi_tech;
+extern int capi_capability;
+extern unsigned capi_ApplID;
+extern struct capi_pvt *capi_iflist;
+extern void cc_start_b3(struct capi_pvt *i);
+extern unsigned char capi_tcap_is_digital(unsigned short tcap);
+extern void capi_queue_cause_control(struct capi_pvt *i, int control);
+extern void capidev_handle_connection_conf(struct capi_pvt **i, unsigned int PLCI,
+    unsigned short wInfo, unsigned short wMsgNum);
+extern void capi_wait_for_answered(struct capi_pvt *i);
+extern int capi_wait_for_b3_up(struct capi_pvt *i);
+extern void capi_activehangup(struct capi_pvt *i, int state);
+extern void capi_gains(struct cc_capi_gains *g, float rxgain, float txgain);
 
 #endif

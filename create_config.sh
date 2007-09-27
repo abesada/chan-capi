@@ -5,7 +5,7 @@
 # Script to create config.h for compatibility with
 # different asterisk versions.
 #
-# (C) 2005 Cytronics & Melware
+# (C) 2005-2007 Cytronics & Melware
 # Armin Schindler <armin@melware.de>
 #
 
@@ -82,6 +82,15 @@ else
 	echo "#undef CC_AST_HAS_EXT_CHAN_ALLOC" >>$CONFIGFILE
 	echo " * no extended ast_channel_alloc"
 fi
+
+if grep -q "ast_channel_alloc.*amaflag" $INCLUDEDIR/channel.h; then
+	echo "#define CC_AST_HAS_EXT2_CHAN_ALLOC" >>$CONFIGFILE
+	echo " * found second extended ast_channel_alloc"
+else
+	echo "#undef CC_AST_HAS_EXT2_CHAN_ALLOC" >>$CONFIGFILE
+	echo " * no second extended ast_channel_alloc"
+fi
+
 
 if grep -q "send_digit_end.*duration" $INCLUDEDIR/channel.h; then
 	echo "#define CC_AST_HAS_SEND_DIGIT_END_DURATION" >>$CONFIGFILE

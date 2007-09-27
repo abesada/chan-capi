@@ -1,8 +1,7 @@
 /*
  * (CAPI*)
  *
- * An implementation of Common ISDN API 2.0 for
- * Asterisk / OpenPBX.org
+ * An implementation of Common ISDN API 2.0 for Asterisk
  *
  * Copyright (C) 2006-2007 Cytronics & Melware
  *
@@ -11,11 +10,6 @@
  * This program is free software and may be modified and 
  * distributed under the terms of the GNU Public License.
  */
-#ifdef PBX_IS_OPBX
-#ifdef HAVE_CONFIG_H
-#include "confdefs.h"
-#endif
-#endif
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -27,41 +21,10 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 
-#ifdef PBX_IS_OPBX
-#include "openpbx/lock.h"
-#include "openpbx/frame.h"
-#include "openpbx/channel.h"
-#include "openpbx/logger.h"
-#include "openpbx/module.h"
-#include "openpbx/pbx.h"
-#include "openpbx/config.h"
-#include "openpbx/options.h"
-#include "openpbx/features.h"
-#include "openpbx/utils.h"
-#include "openpbx/rtp.h"
-#include "openpbx/strings.h"
-#include "openpbx/chan_capi20.h"
-#include "openpbx/chan_capi.h"
-#include "openpbx/chan_capi_rtp.h"
-#else
-#include "config.h"
-
-#include <asterisk/lock.h>
-#include <asterisk/frame.h>
-#include <asterisk/channel.h>
-#include <asterisk/logger.h>
-#include <asterisk/module.h>
-#include <asterisk/pbx.h>
-#include <asterisk/config.h>
-#include <asterisk/options.h>
-#include <asterisk/features.h>
-#include <asterisk/utils.h>
-#include <asterisk/rtp.h>
-#include <asterisk/strings.h>
 #include "chan_capi20.h"
 #include "chan_capi.h"
 #include "chan_capi_rtp.h"
-#endif
+#include "chan_capi_utils.h"
 
 /* RTP settings / NCPI RTP struct */
 
@@ -225,10 +188,8 @@ int capi_alloc_rtp(struct capi_pvt *i)
 /*
  * write rtp for a channel
  */
-int capi_write_rtp(struct ast_channel *c, struct ast_frame *f)
+int capi_write_rtp(struct capi_pvt *i, struct ast_frame *f)
 {
-	struct capi_pvt *i = CC_CHANNEL_PVT(c);
-	_cmsg CMSG;
 	struct sockaddr_in us;
 	int len;
 	socklen_t uslen;
@@ -281,14 +242,13 @@ int capi_write_rtp(struct ast_channel *c, struct ast_frame *f)
 			i->vname, i->NCCI, len, f->datalen, ast_getformatname(f->subclass),
 			i->timestamp);
 
-		DATA_B3_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-		DATA_B3_REQ_NCCI(&CMSG) = i->NCCI;
-		DATA_B3_REQ_FLAGS(&CMSG) = 0;
-		DATA_B3_REQ_DATAHANDLE(&CMSG) = i->send_buffer_handle;
-		DATA_B3_REQ_DATALENGTH(&CMSG) = len;
-		DATA_B3_REQ_DATA(&CMSG) = (buf);
-
-		_capi_put_cmsg(&CMSG);
+		capi_sendf(NULL, 0, CAPI_DATA_B3_REQ, i->NCCI, get_capi_MessageNumber(),
+			"dwww",
+			buf,
+			len,
+			i->send_buffer_handle,
+			0
+		);
 	}
 
 	return 0;
@@ -352,11 +312,11 @@ void voice_over_ip_profile(struct cc_capi_controller *cp)
 	unsigned short info = 0;
 	unsigned int payload1, payload2;
 
-	FACILITY_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-	FACILITY_REQ_CONTROLLER(&CMSG) = cp->controller;
-	FACILITY_REQ_FACILITYSELECTOR(&CMSG) = FACILITYSELECTOR_VOICE_OVER_IP;
-	FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)&fac;
-	_capi_put_cmsg(&CMSG);
+	capi_sendf(NULL, 0, CAPI_FACILITY_REQ, cp->controller, get_capi_MessageNumber(),
+		"ws",
+		FACILITYSELECTOR_VOICE_OVER_IP,
+		&fac
+	);
 
 	tv.tv_sec = 1;
 	tv.tv_usec = 0;

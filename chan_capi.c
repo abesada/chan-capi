@@ -1,8 +1,7 @@
 /*
  * (CAPI*)
  *
- * An implementation of Common ISDN API 2.0 for
- * Asterisk / OpenPBX.org
+ * An implementation of Common ISDN API 2.0 for Asterisk
  *
  * Copyright (C) 2005-2007 Cytronics & Melware
  *
@@ -16,11 +15,6 @@
  * This program is free software and may be modified and 
  * distributed under the terms of the GNU Public License.
  */
-#ifdef PBX_IS_OPBX
-#ifdef HAVE_CONFIG_H
-#include "confdefs.h"
-#endif
-#endif
 
 #include <sys/time.h>
 #include <sys/signal.h>
@@ -33,73 +27,20 @@
 #include <fcntl.h>
 #include <sys/types.h>
 
-#ifdef PBX_IS_OPBX
-#include "openpbx.h"
-
-OPENPBX_FILE_VERSION("$HeadURL$", "$Revision$")
-
-#include "openpbx/lock.h"
-#include "openpbx/frame.h" 
-#include "openpbx/channel.h"
-#include "openpbx/logger.h"
-#include "openpbx/module.h"
-#include "openpbx/pbx.h"
-#include "openpbx/config.h"
-#include "openpbx/options.h"
-#include "openpbx/features.h"
-#include "openpbx/utils.h"
-#include "openpbx/cli.h"
-#include "openpbx/rtp.h"
-#include "openpbx/causes.h"
-#include "openpbx/strings.h"
-#include "openpbx/devicestate.h"
-#include "openpbx/dsp.h"
-#include "openpbx/xlaw.h"
-#include "openpbx/chan_capi20.h"
-#include "openpbx/chan_capi.h"
-#include "openpbx/chan_capi_rtp.h"
-#else
-#include "config.h"
-
-#ifdef CC_AST_HAS_VERSION_1_4
-#include <asterisk.h>
-#endif
-
-#include <asterisk/lock.h>
-#include <asterisk/frame.h> 
-#include <asterisk/channel.h>
-#include <asterisk/logger.h>
-#include <asterisk/module.h>
-#include <asterisk/pbx.h>
-#include <asterisk/config.h>
-#include <asterisk/options.h>
-#include <asterisk/features.h>
-#include <asterisk/utils.h>
-#include <asterisk/cli.h>
-#include <asterisk/rtp.h>
-#include <asterisk/causes.h>
-#include <asterisk/strings.h>
-#include <asterisk/dsp.h>
-#include <asterisk/devicestate.h>
-#ifdef CC_AST_HAS_VERSION_1_4
-#include "asterisk/abstract_jb.h"
-#include "asterisk/musiconhold.h"
-#endif
 #include "xlaw.h"
 #include "chan_capi20.h"
 #include "chan_capi.h"
 #include "chan_capi_rtp.h"
 #include "chan_capi_qsig.h"
+#include "chan_capi_qsig_ecma.h"
 #include "chan_capi_qsig_asn197ade.h"
 #include "chan_capi_qsig_asn197no.h"
-#endif
+#include "chan_capi_utils.h"
+#include "chan_capi_supplementary.h"
+#include "chan_capi_chat.h"
 
-#ifdef PBX_IS_OPBX
-#define CC_VERSION "cm-opbx-1.0"
-#else
 /* #define CC_VERSION "x.y.z" */
 #define CC_VERSION "$Revision$"
-#endif
 
 /*
  * personal stuff
@@ -108,18 +49,12 @@ OPENPBX_FILE_VERSION("$HeadURL$", "$Revision$")
 #define  CAPI_APPLID_UNUSED 0xffffffff
 unsigned capi_ApplID = CAPI_APPLID_UNUSED;
 
-static _cword capi_MessageNumber;
 static const char tdesc[] = "Common ISDN API Driver (" CC_VERSION ")";
 static const char channeltype[] = "CAPI";
-static const struct ast_channel_tech capi_tech;
 #ifdef CC_AST_HAS_VERSION_1_4
 #define AST_MODULE "chan_capi"
 #else
-#ifdef PBX_IS_OPBX
-static char *ccdesc = "Common ISDN API for OpenPBX";
-#else
 static char *ccdesc = "Common ISDN API for Asterisk";
-#endif
 #endif
 
 static char *commandtdesc = "CAPI command interface.\n"
@@ -145,7 +80,9 @@ static char *commandtdesc = "CAPI command interface.\n"
 "\"3pty_begin|${MYHOLDVAR})\" Three-Party-Conference (3PTY) with active and held call\n"
 "\"receivefax|filename|stationID|headline\" receive a CAPIfax\n"
 "\"sendfax|filename.sff|stationID|headline\" send a CAPIfax\n"
-"\"qsig_ct|cidsrc|ciddst\" QSIG call transfer\n"
+"\"qsig_ssct|cidsrc|ciddst\" QSIG single step call transfer\n"
+"\"qsig_ct|cidsrc|ciddst|marker|waitconnect\" QSIG call transfer\n"
+"\"qsig_callmark|marker\" marks a QSIG call for later identification\n"
 "Variables set after fax receive:\n"
 "FAXSTATUS     :0=OK, 1=Error\n"
 "FAXREASON     :B3 disconnect reason\n"
@@ -197,24 +134,19 @@ static int usecnt;
  *     this lock!
  */
 
-AST_MUTEX_DEFINE_STATIC(messagenumber_lock);
 #ifndef CC_AST_HAS_VERSION_1_4
 AST_MUTEX_DEFINE_STATIC(usecnt_lock);
 #endif
 AST_MUTEX_DEFINE_STATIC(iflock);
-AST_MUTEX_DEFINE_STATIC(capi_put_lock);
-AST_MUTEX_DEFINE_STATIC(verbose_lock);
-
-static int capi_capability = AST_FORMAT_ALAW;
 
 static pthread_t monitor_thread = (pthread_t)(0-1);
 
-static struct capi_pvt *iflist = NULL;
+struct capi_pvt *capi_iflist = NULL;
+
 static struct cc_capi_controller *capi_controllers[CAPI_MAX_CONTROLLERS + 1];
 static int capi_num_controllers = 0;
 static unsigned int capi_counter = 0;
 static unsigned long capi_used_controllers = 0;
-static char *emptyid = "\0";
 
 static struct ast_channel *chan_for_task;
 static int channel_task;
@@ -224,12 +156,17 @@ static int channel_task;
 #define CAPI_CHANNEL_TASK_PICKUP           3
 #define CAPI_CHANNEL_TASK_GOTOFAX          4
 
+static struct capi_pvt *interface_for_task;
+static int interface_task;
+#define CAPI_INTERFACE_TASK_NONE           0
+#define CAPI_INTERFACE_TASK_NULLIFREMOVE   1
+
 static char capi_national_prefix[AST_MAX_EXTENSION];
 static char capi_international_prefix[AST_MAX_EXTENSION];
 
 static char default_language[MAX_LANGUAGE] = "";
 
-static int capidebug = 0;
+int capi_capability = AST_FORMAT_ALAW;
 
 #ifdef CC_AST_HAS_VERSION_1_4
 /* Global jitterbuffer configuration - by default, jb is disabled */
@@ -250,37 +187,6 @@ static int pbx_capi_indicate(struct ast_channel *c, int condition, const void *d
 #else
 static int pbx_capi_indicate(struct ast_channel *c, int condition);
 #endif
-
-/* external prototypes */
-extern char *capi_info_string(unsigned int info);
-
-/* */
-#define return_on_no_interface(x)                                       \
-	if (!i) {                                                       \
-		cc_verbose(4, 1, "CAPI: %s no interface for PLCI=%#x\n", x, PLCI);   \
-		return;                                                 \
-	}
-
-/*
- * helper for <pbx>_verbose with different verbose settings
- */
-void cc_verbose(int o_v, int c_d, char *text, ...)
-{
-	char line[4096];
-	va_list ap;
-
-	va_start(ap, text);
-	vsnprintf(line, sizeof(line), text, ap);
-	va_end(ap);
-
-	if ((o_v == 0) || (option_verbose > o_v)) {
-		if ((!c_d) || ((c_d) && (capidebug))) {	
-			cc_mutex_lock(&verbose_lock);
-			cc_pbx_verbose(line);
-			cc_mutex_unlock(&verbose_lock);	
-		}
-	}
-}
 
 /*
  * B protocol settings
@@ -312,7 +218,6 @@ static struct {
 	}
 };
 
-#ifndef CC_HAVE_NO_GLOBALCONFIGURATION
 /*
  * set the global-configuration (b-channel operation)
  */
@@ -334,7 +239,6 @@ static _cstruct capi_set_global_configuration(struct capi_pvt *i)
 		buf = NULL;
 	return (_cstruct)buf;
 }
-#endif
 
 /*
  * command to string function
@@ -373,139 +277,12 @@ static const char * capi_command_to_string(unsigned short wCmd)
 }
 
 /*
- * show the text for a CAPI message info value
- */
-static void show_capi_info(struct capi_pvt *i, _cword info)
-{
-	char *p;
-	char *name = "?";
-	
-	if (info == 0x0000) {
-		/* no error, do nothing */
-		return;
-	}
-
-	if (!(p = capi_info_string((unsigned int)info))) {
-		/* message not available */
-		return;
-	}
-
-	if (i)
-		name = i->vname;
-	
-	cc_verbose(3, 0, VERBOSE_PREFIX_4 "%s: CAPI INFO 0x%04x: %s\n",
-		name, info, p);
-	return;
-}
-
-/*
- * get a new capi message number automically
- */
-_cword get_capi_MessageNumber(void)
-{
-	_cword mn;
-
-	cc_mutex_lock(&messagenumber_lock);
-
-	capi_MessageNumber++;
-	if (capi_MessageNumber == 0) {
-	    /* avoid zero */
-	    capi_MessageNumber = 1;
-	}
-
-	mn = capi_MessageNumber;
-
-	cc_mutex_unlock(&messagenumber_lock);
-
-	return(mn);
-}
-
-/*
- * write a capi message to capi device
- */
-MESSAGE_EXCHANGE_ERROR _capi_put_cmsg(_cmsg *CMSG)
-{
-	MESSAGE_EXCHANGE_ERROR error;
-	
-	if (cc_mutex_lock(&capi_put_lock)) {
-		cc_log(LOG_WARNING, "Unable to lock capi put!\n");
-		return -1;
-	} 
-	
-	error = capi20_put_cmsg(CMSG);
-	
-	if (cc_mutex_unlock(&capi_put_lock)) {
-		cc_log(LOG_WARNING, "Unable to unlock capi put!\n");
-		return -1;
-	}
-
-	if (error) {
-		cc_log(LOG_ERROR, "CAPI error sending %s (NCCI=%#x) (error=%#x %s)\n",
-			capi_cmsg2str(CMSG), (unsigned int)HEADER_CID(CMSG),
-			error, capi_info_string((unsigned int)error));
-	} else {
-		unsigned short wCmd = HEADER_CMD(CMSG);
-		if ((wCmd == CAPI_P_REQ(DATA_B3)) ||
-		    (wCmd == CAPI_P_RESP(DATA_B3))) {
-			cc_verbose(7, 1, "%s\n", capi_cmsg2str(CMSG));
-		} else {
-			cc_verbose(4, 1, "%s\n", capi_cmsg2str(CMSG));
-		}
-	}
-
-	return error;
-}
-
-/*
- * wait for a specific message
- */
-static MESSAGE_EXCHANGE_ERROR capi_wait_conf(struct capi_pvt *i, unsigned short wCmd)
-{
-	MESSAGE_EXCHANGE_ERROR error = 0;
-	struct timespec abstime;
-	unsigned char command, subcommand;
-
-	subcommand = wCmd & 0xff;
-	command = (wCmd & 0xff00) >> 8;
-	i->waitevent = (unsigned int)wCmd;
-	abstime.tv_sec = time(NULL) + 2;
-	abstime.tv_nsec = 0;
-	cc_verbose(4, 1, "%s: wait for %s (0x%x)\n",
-		i->vname, capi_cmd2str(command, subcommand), i->waitevent);
-	if (ast_cond_timedwait(&i->event_trigger, &i->lock, &abstime) != 0) {
-		error = -1;
-		cc_log(LOG_WARNING, "%s: timed out waiting for %s\n",
-			i->vname, capi_cmd2str(command, subcommand));
-	} else {
-		cc_verbose(4, 1, "%s: cond signal received for %s\n",
-			i->vname, capi_cmd2str(command, subcommand));
-	}
-	return error;
-}
-
-/*
- * write a capi message and wait for CONF
- * i->lock must be held
- */
-MESSAGE_EXCHANGE_ERROR _capi_put_cmsg_wait_conf(struct capi_pvt *i, _cmsg *CMSG)
-{
-	MESSAGE_EXCHANGE_ERROR error;
-
-	error = _capi_put_cmsg(CMSG);
-
-	if (!(error)) {
-		unsigned short wCmd = CAPICMD(CMSG->Command, CAPI_CONF);
-		error = capi_wait_conf(i, wCmd);
-	}
-	return error;
-}
-
-/*
  * wait for B3 up
  */
-static void capi_wait_for_b3_up(struct capi_pvt *i)
+int capi_wait_for_b3_up(struct capi_pvt *i)
 {
 	struct timespec abstime;
+	int ret = 1;
 
 	cc_mutex_lock(&i->lock);
 	if (!(i->isdnstate & CAPI_ISDN_STATE_B3_UP)) {
@@ -517,18 +294,21 @@ static void capi_wait_for_b3_up(struct capi_pvt *i)
 		if (ast_cond_timedwait(&i->event_trigger, &i->lock, &abstime) != 0) {
 			cc_log(LOG_WARNING, "%s: timed out waiting for b3 up.\n",
 				i->vname);
+			ret = 0;
 		} else {
 			cc_verbose(4, 1, "%s: cond signal received for b3 up.\n",
 				i->vname);
 		}
 	}
 	cc_mutex_unlock(&i->lock);
+
+	return ret;
 }
 
 /*
  * wait for finishing answering state
  */
-static void capi_wait_for_answered(struct capi_pvt *i)
+void capi_wait_for_answered(struct capi_pvt *i)
 {
 	struct timespec abstime;
 
@@ -565,123 +345,6 @@ static int capi_tell_fax_finish(void *data)
 }
 
 /*
- * wait some time for a new capi message
- */
-static MESSAGE_EXCHANGE_ERROR capidev_check_wait_get_cmsg(_cmsg *CMSG)
-{
-	MESSAGE_EXCHANGE_ERROR Info;
-	struct timeval tv;
-
- repeat:
-	Info = capi_get_cmsg(CMSG, capi_ApplID);
-
-#if (CAPI_OS_HINT == 1) || (CAPI_OS_HINT == 2)
-	/*
-	 * For BSD allow controller 0:
-	 */
-	if ((HEADER_CID(CMSG) & 0xFF) == 0) {
-		HEADER_CID(CMSG) += capi_num_controllers;
- 	}
-#endif
-
-	/* if queue is empty */
-	if (Info == 0x1104) {
-		/* try waiting a maximum of 0.100 seconds for a message */
-		tv.tv_sec = 0;
-		tv.tv_usec = 10000;
-		
-		Info = capi20_waitformessage(capi_ApplID, &tv);
-
-		if (Info == 0x0000)
-			goto repeat;
-	}
-	
-	if ((Info != 0x0000) && (Info != 0x1104)) {
-		if (capidebug) {
-			cc_log(LOG_DEBUG, "Error waiting for cmsg... INFO = %#x\n", Info);
-		}
-	}
-    
-	return Info;
-}
-
-/*
- * send Listen for supplementary to specified controller
- */
-static void ListenOnSupplementary(unsigned controller)
-{
-	_cmsg	CMSG;
-	char	fac[8];
-	MESSAGE_EXCHANGE_ERROR error;
-	int waitcount = 50;
-
-	fac[0] = 7;	/* len */
-	fac[1] = 0x01;	/* listen */
-	fac[2] = 0x00;
-	fac[3] = 4;	/* len / sservice specific parameter , cstruct */
-	write_capi_dword(&(fac[4]), 0x0000079f);
-
-	FACILITY_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-	FACILITY_REQ_CONTROLLER(&CMSG) = controller;
-	FACILITY_REQ_FACILITYSELECTOR(&CMSG) = FACILITYSELECTOR_SUPPLEMENTARY;
-	FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)&fac;
-
-	error = _capi_put_cmsg(&CMSG);
-
-	while (waitcount) {
-		error = capidev_check_wait_get_cmsg(&CMSG);
-
-		if (IS_FACILITY_CONF(&CMSG)) {
-			break;
-		}
-		usleep(30000);
-		waitcount--;
-	}
-	if (!waitcount) {
-		cc_log(LOG_ERROR,"Unable to supplementary-listen on contr%d (error=0x%x)\n",
-			controller, error);
-	}
-}
-
-/*
- * send Listen to specified controller
- */
-static unsigned ListenOnController(unsigned long CIPmask, unsigned controller)
-{
-	MESSAGE_EXCHANGE_ERROR error;
-	_cmsg CMSG;
-	int waitcount = 50;
-
-	LISTEN_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), controller);
-
-	LISTEN_REQ_INFOMASK(&CMSG) = 0xffff; /* lots of info ;) + early B3 connect */
-		/* 0x00ff if no early B3 should be done */
-		
-	LISTEN_REQ_CIPMASK(&CMSG) = CIPmask;
-	error = _capi_put_cmsg(&CMSG);
-
-	if (error)
-		goto done;
-
-	while (waitcount) {
-		error = capidev_check_wait_get_cmsg(&CMSG);
-
-		if (IS_LISTEN_CONF(&CMSG)) {
-			error = LISTEN_CONF_INFO(&CMSG);
-			ListenOnSupplementary(controller);
-			break;
-		}
-		usleep(30000);
-		waitcount--;
-	}
-	if (!waitcount)
-		error = 0x100F;
-
- done:
-	return error;
-}
-
-/*
  *  TCAP -> CIP Translation Table (TransferCapability->CommonIsdnProfile)
  */
 static struct {
@@ -708,7 +371,7 @@ static int tcap2cip(unsigned short tcap)
 	return CAPI_CIPI_SPEECH;
 }
 
-static unsigned char tcap_is_digital(unsigned short tcap)
+unsigned char capi_tcap_is_digital(unsigned short tcap)
 {
 	int x;
 	
@@ -785,6 +448,19 @@ static char *transfercapability2str(int transfercapability)
 }
 
 /*
+ * set task for an interface which need to be done out of lock
+ * ( after the capi thread loop )
+ */
+static void capi_interface_task(struct capi_pvt *i, int task)
+{
+	interface_for_task = i;
+	interface_task = task;
+
+	cc_verbose(4, 1, VERBOSE_PREFIX_4 "%s: set interface task to %d\n",
+		i->name, task);
+}
+
+/*
  * set task for a channel which need to be done out of lock
  * ( after the capi thread loop )
  */
@@ -801,25 +477,16 @@ static void capi_channel_task(struct ast_channel *c, int task)
  * Echo cancellation is for cards w/ integrated echo cancellation only
  * (i.e. Eicon active cards support it)
  */
-#define EC_FUNCTION_ENABLE              1
-#define EC_FUNCTION_DISABLE             2
-#define EC_FUNCTION_FREEZE              3
-#define EC_FUNCTION_RESUME              4
-#define EC_FUNCTION_RESET               5
-#define EC_OPTION_DISABLE_NEVER         0
-#define EC_OPTION_DISABLE_G165          (1<<2)
-#define EC_OPTION_DISABLE_G164_OR_G165  (1<<1 | 1<<2)
-#define EC_DEFAULT_TAIL                 0 /* maximum */
-
-static void capi_echo_canceller(struct ast_channel *c, int function)
+static void capi_echo_canceller(struct capi_pvt *i, int function)
 {
-	struct capi_pvt *i = CC_CHANNEL_PVT(c);
-	_cmsg CMSG;
-	char buf[10];
 	int ecAvail = 0;
 
 	if ((i->isdnstate & CAPI_ISDN_STATE_DISCONNECT))
 		return;
+
+	if (i->channeltype == CAPI_CHANNELTYPE_NULL) {
+		return;
+	}
 
 	if (((function == EC_FUNCTION_ENABLE) && (i->isdnstate & CAPI_ISDN_STATE_EC)) ||
 	    ((function != EC_FUNCTION_ENABLE) && (!(i->isdnstate & CAPI_ISDN_STATE_EC)))) {
@@ -844,7 +511,7 @@ static void capi_echo_canceller(struct ast_channel *c, int function)
 		return;
 	}
 
-	if (tcap_is_digital(c->transfercapability)) {
+	if (capi_tcap_is_digital(i->transfercapability)) {
 		cc_verbose(3, 1, VERBOSE_PREFIX_2 "%s: No echo canceller in digital mode (PLCI=%#x)\n",
 			i->vname, i->PLCI);
 		return;
@@ -853,28 +520,20 @@ static void capi_echo_canceller(struct ast_channel *c, int function)
 	cc_verbose(3, 0, VERBOSE_PREFIX_2 "%s: Setting up echo canceller (PLCI=%#x, function=%d, options=%d, tail=%d)\n",
 			i->vname, i->PLCI, function, i->ecOption, i->ecTail);
 
-	FACILITY_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-	FACILITY_REQ_PLCI(&CMSG) = i->PLCI;
-	FACILITY_REQ_FACILITYSELECTOR(&CMSG) = i->ecSelector;
-
-	memset(buf, 0, sizeof(buf));
-        buf[0] = 9; /* msg size */
-        write_capi_word(&buf[1], function);
 	if (function == EC_FUNCTION_ENABLE) {
-		buf[3] = 6; /* echo cancel param struct size */
-	        write_capi_word(&buf[4], i->ecOption); /* bit field - ignore echo canceller disable tone */
-		write_capi_word(&buf[6], i->ecTail);   /* Tail length, ms */
-		/* buf 8 and 9 are "pre-delay lenght ms" */
 		i->isdnstate |= CAPI_ISDN_STATE_EC;
 	} else {
 		i->isdnstate &= ~CAPI_ISDN_STATE_EC;
 	}
 
-	FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)buf;
-        
-	if (_capi_put_cmsg(&CMSG) != 0) {
-		return;
-	}
+	capi_sendf(i, 0, CAPI_FACILITY_REQ, i->PLCI, get_capi_MessageNumber(),
+		"w(w(www))",
+		i->ecSelector,
+		function,
+		i->ecOption,  /* bit field - ignore echo canceller disable tone */
+		i->ecTail,    /* Tail length, ms */
+		0
+	);
 
 	return;
 }
@@ -882,17 +541,18 @@ static void capi_echo_canceller(struct ast_channel *c, int function)
 /*
  * turn on/off DTMF detection
  */
-static int capi_detect_dtmf(struct ast_channel *c, int flag)
+static int capi_detect_dtmf(struct capi_pvt *i, int flag)
 {
-	struct capi_pvt *i = CC_CHANNEL_PVT(c);
 	MESSAGE_EXCHANGE_ERROR error;
-	_cmsg CMSG;
-	char buf[9];
 
 	if ((i->isdnstate & CAPI_ISDN_STATE_DISCONNECT))
 		return 0;
 
-	if (tcap_is_digital(c->transfercapability)) {
+	if (i->channeltype == CAPI_CHANNELTYPE_NULL) {
+		return 0;
+	}
+
+	if (capi_tcap_is_digital(i->transfercapability)) {
 		cc_verbose(3, 1, VERBOSE_PREFIX_2 "%s: No dtmf-detect in digital mode (PLCI=%#x)\n",
 			i->vname, i->PLCI);
 		return 0;
@@ -910,23 +570,18 @@ static int capi_detect_dtmf(struct ast_channel *c, int flag)
 	if ((capi_controllers[i->controller]->dtmf != 1) || (i->doDTMF != 0))
 		return 0;
 	
-	memset(buf, 0, sizeof(buf));
 	cc_verbose(3, 0, VERBOSE_PREFIX_2 "%s: Setting up DTMF detector (PLCI=%#x, flag=%d)\n",
 		i->vname, i->PLCI, flag);
-	FACILITY_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-	FACILITY_REQ_PLCI(&CMSG) = i->PLCI;
-	FACILITY_REQ_FACILITYSELECTOR(&CMSG) = FACILITYSELECTOR_DTMF;
-	buf[0] = 8; /* msg length */
-	if (flag == 1) {
-		write_capi_word(&buf[1], 1); /* start DTMF listen */
-	} else {
-		write_capi_word(&buf[1], 2); /* stop DTMF listen */
-	}
-	write_capi_word(&buf[3], CAPI_DTMF_DURATION);
-	write_capi_word(&buf[5], CAPI_DTMF_DURATION);
-	FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)buf;
-        
-	if ((error = _capi_put_cmsg(&CMSG)) != 0) {
+
+	error = capi_sendf(i, 0, CAPI_FACILITY_REQ, i->PLCI, get_capi_MessageNumber(),
+		"w(www()())",
+		FACILITYSELECTOR_DTMF,
+		(flag == 1) ? 1:2,  /* start/stop DTMF listen */
+		CAPI_DTMF_DURATION,
+		CAPI_DTMF_DURATION
+	);
+
+	if (error != 0) {
 		return error;
 	}
 	if (flag == 1) {
@@ -942,15 +597,8 @@ static int capi_detect_dtmf(struct ast_channel *c, int flag)
  */
 static int local_queue_frame(struct capi_pvt *i, struct ast_frame *f)
 {
-	struct ast_channel *chan = i->owner;
 	unsigned char *wbuf;
 	int wbuflen;
-
-	if (chan == NULL) {
-		cc_log(LOG_ERROR, "No owner in local_queue_frame for %s\n",
-			i->vname);
-		return -1;
-	}
 
 	if (!(i->isdnstate & CAPI_ISDN_STATE_PBX)) {
 		/* if there is no PBX running yet,
@@ -1004,7 +652,9 @@ static void update_channel_name(struct capi_pvt *i)
 
 	snprintf(name, sizeof(name) - 1, "CAPI/%s/%s-%x",
 		i->vname, i->dnid, capi_counter++);
-	ast_change_name(i->owner, name);
+	if (i->owner) {
+		ast_change_name(i->owner, name);
+	}
 	cc_verbose(3, 0, VERBOSE_PREFIX_3 "%s: Updated channel name: %s\n",
 			i->vname, name);
 }
@@ -1015,14 +665,10 @@ static void update_channel_name(struct capi_pvt *i)
 static int capi_send_info_digits(struct capi_pvt *i, char *digits, int len)
 {
 	MESSAGE_EXCHANGE_ERROR error;
-	_cmsg CMSG;
 	char buf[64];
 	int a;
     
 	memset(buf, 0, sizeof(buf));
-
-	INFO_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-	INFO_REQ_PLCI(&CMSG) = i->PLCI;
 
 	if (len > (sizeof(buf) - 2))
 		len = sizeof(buf) - 2;
@@ -1032,9 +678,12 @@ static int capi_send_info_digits(struct capi_pvt *i, char *digits, int len)
 	for (a = 0; a < len; a++) {
 		buf[a + 2] = digits[a];
 	}
-	INFO_REQ_CALLEDPARTYNUMBER(&CMSG) = (_cstruct)buf;
 
-	if ((error = _capi_put_cmsg(&CMSG)) != 0) {
+	error = capi_sendf(NULL, 0, CAPI_INFO_REQ, i->PLCI, get_capi_MessageNumber(),
+		"s()",
+		buf
+	);
+	if (error != 0) {
 		return error;
 	}
 	cc_verbose(3, 1, VERBOSE_PREFIX_4 "%s: sent CALLEDPARTYNUMBER INFO digits = '%s' (PLCI=%#x)\n",
@@ -1048,12 +697,60 @@ static int capi_send_info_digits(struct capi_pvt *i, char *digits, int len)
  */
 static int pbx_capi_send_digit_begin(struct ast_channel *c, char digit)
 {
-	/* Not needed */
+	struct capi_pvt *i = CC_CHANNEL_PVT(c);
+	
+	if ((i->state == CAPI_STATE_CONNECTED) && (i->isdnstate & CAPI_ISDN_STATE_B3_UP)) {
+		/* we have a real connection, so send real DTMF */
+		if ((capi_controllers[i->controller]->dtmf == 0) || (i->doDTMF > 0)) {
+			/* let * fake it */
+			return -1;
+		}
+	}
+	
 	return 0;
 }
 #endif
+
 /*
- * send a DTMF digit
+ * send DTMF digit
+ */
+static int capi_send_dtmf_digits(struct capi_pvt *i, char digit)
+{
+	int ret;
+
+	if (!(i->isdnstate & CAPI_ISDN_STATE_B3_UP)) {
+		cc_verbose(2, 1, VERBOSE_PREFIX_3 "%s: send DTMF: B-channel not connected.\n",
+			i->vname);
+		return -1;
+	}
+
+	cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: send DTMF '%c'.\n",
+		i->vname, digit);
+
+	if ((capi_controllers[i->controller]->dtmf == 0) || (i->doDTMF > 0)) {
+		/* let * fake it */
+		cc_mutex_unlock(&i->lock);
+		return -1;
+	}
+
+	ret = capi_sendf(i, 0, CAPI_FACILITY_REQ, i->NCCI, get_capi_MessageNumber(),
+		"w(www(b)())",
+		FACILITYSELECTOR_DTMF,
+		3,	/* send DTMF digit */
+		CAPI_DTMF_DURATION,	/* XXX: duration comes from asterisk in 1.4 */
+		CAPI_DTMF_DURATION,
+		digit
+	);
+		
+	if (ret == 0) {
+		cc_verbose(3, 0, VERBOSE_PREFIX_4 "%s: sent dtmf '%c'\n",
+			i->vname, digit);
+	}
+	return ret;
+}
+
+/*
+ * send a digit
  */
 #if defined(CC_AST_HAS_VERSION_1_4) && defined(CC_AST_HAS_SEND_DIGIT_END_DURATION)
 static int pbx_capi_send_digit(struct ast_channel *c, char digit, unsigned int duration)
@@ -1062,8 +759,6 @@ static int pbx_capi_send_digit(struct ast_channel *c, char digit)
 #endif
 {
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
-	_cmsg CMSG;
-	char buf[10];
 	char did[2];
 	int ret = 0;
     
@@ -1072,52 +767,39 @@ static int pbx_capi_send_digit(struct ast_channel *c, char digit)
 		return -1;
 	}
 
-	memset(buf, 0, sizeof(buf));
+	cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: send_digit '%c' in state %d(%d)\n",
+		i->vname, digit, i->state, c->_state);
 
 	cc_mutex_lock(&i->lock);
 
 	if ((c->_state == AST_STATE_DIALING) &&
 	    (i->state != CAPI_STATE_DISCONNECTING)) {
-		did[0] = digit;
-		did[1] = 0;
-		strncat(i->dnid, did, sizeof(i->dnid) - 1);
-		update_channel_name(i);	
-		if ((i->isdnstate & CAPI_ISDN_STATE_SETUP_ACK) &&
-		    (i->doOverlap == 0)) {
-			ret = capi_send_info_digits(i, &digit, 1);
+		if (!(i->isdnstate & CAPI_ISDN_STATE_ISDNPROGRESS)) {
+			did[0] = digit;
+			did[1] = 0;
+			strncat(i->dnid, did, sizeof(i->dnid) - 1);
+			update_channel_name(i);	
+			if ((i->isdnstate & CAPI_ISDN_STATE_SETUP_ACK) &&
+			    (i->doOverlap == 0)) {
+				ret = capi_send_info_digits(i, &digit, 1);
+			} else {
+				/* if no SETUP-ACK yet, add it to the overlap list */
+				strncat(i->overlapdigits, &digit, 1);
+				i->doOverlap = 1;
+			}
+			cc_mutex_unlock(&i->lock);
+			return ret;
 		} else {
-			/* if no SETUP-ACK yet, add it to the overlap list */
-			strncat(i->overlapdigits, &digit, 1);
-			i->doOverlap = 1;
+			/* if PROGRESS arrived, we sent as DTMF */
+			ret = capi_send_dtmf_digits(i, digit);
+			cc_mutex_unlock(&i->lock);
+			return ret;
 		}
-		cc_mutex_unlock(&i->lock);
-		return ret;
 	}
 
-	if ((i->state == CAPI_STATE_CONNECTED) && (i->isdnstate & CAPI_ISDN_STATE_B3_UP)) {
+	if (i->state == CAPI_STATE_CONNECTED) {
 		/* we have a real connection, so send real DTMF */
-		if ((capi_controllers[i->controller]->dtmf == 0) || (i->doDTMF > 0)) {
-			/* let * fake it */
-			cc_mutex_unlock(&i->lock);
-			return -1;
-		}
-		
-		FACILITY_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-		FACILITY_REQ_PLCI(&CMSG) = i->NCCI;
-	        FACILITY_REQ_FACILITYSELECTOR(&CMSG) = FACILITYSELECTOR_DTMF;
-        	buf[0] = 8;
-	        write_capi_word(&buf[1], 3); /* send DTMF digit */
-		/* XXX: duration comes from asterisk in 1.4 */
-	        write_capi_word(&buf[3], CAPI_DTMF_DURATION);
-	        write_capi_word(&buf[5], CAPI_DTMF_DURATION);
-	        buf[7] = 1;
-		buf[8] = digit;
-		FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)buf;
-        
-		if ((ret = _capi_put_cmsg(&CMSG)) == 0) {
-			cc_verbose(3, 0, VERBOSE_PREFIX_4 "%s: sent dtmf '%c'\n",
-				i->vname, digit);
-		}
+		ret = capi_send_dtmf_digits(i, digit);
 	}
 	cc_mutex_unlock(&i->lock);
 	return ret;
@@ -1129,7 +811,7 @@ static int pbx_capi_send_digit(struct ast_channel *c, char digit)
 static int pbx_capi_alert(struct ast_channel *c)
 {
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
-	_cmsg CMSG;
+	unsigned char *facilityarray = NULL;
 
 	if ((i->state != CAPI_STATE_INCALL) &&
 	    (i->state != CAPI_STATE_DID)) {
@@ -1137,11 +819,12 @@ static int pbx_capi_alert(struct ast_channel *c)
 			i->vname, i->state);
 		return -1;
 	}
-	
-	ALERT_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-	ALERT_REQ_PLCI(&CMSG) = i->PLCI;
 
-	if (_capi_put_cmsg(&CMSG) != 0) {
+	facilityarray = alloca(CAPI_MAX_FACILITYDATAARRAY_SIZE);
+	cc_qsig_add_call_alert_data(facilityarray, i, c);
+
+	if (capi_sendf(NULL, 0, CAPI_ALERT_REQ, i->PLCI, get_capi_MessageNumber(),
+	    "(()()()s())", facilityarray) != 0) {
 		return -1;
 	}
 
@@ -1174,6 +857,9 @@ static void interface_cleanup(struct capi_pvt *i)
 	i->isdnstate = 0;
 	i->cause = 0;
 
+	i->whentohangup = 0;
+	i->whentoqueuehangup = 0;
+
 	i->FaxState &= ~CAPI_FAX_STATE_MASK;
 
 	i->PLCI = 0;
@@ -1181,6 +867,7 @@ static void interface_cleanup(struct capi_pvt *i)
 	i->NCCI = 0;
 	i->onholdPLCI = 0;
 	i->doEC = i->doEC_global;
+	i->ccbsnrhandle = 0;
 
 	memset(i->cid, 0, sizeof(i->cid));
 	memset(i->dnid, 0, sizeof(i->dnid));
@@ -1192,7 +879,16 @@ static void interface_cleanup(struct capi_pvt *i)
 		i->rtp = NULL;
 	}
 
+	interface_cleanup_qsig(i);
+
+	i->peer = NULL;	
 	i->owner = NULL;
+	i->used = NULL;
+
+	if (i->channeltype == CAPI_CHANNELTYPE_NULL) {
+		capi_interface_task(i, CAPI_INTERFACE_TASK_NULLIFREMOVE);
+	}
+
 	return;
 }
 
@@ -1201,20 +897,16 @@ static void interface_cleanup(struct capi_pvt *i)
  */
 static void cc_disconnect_b3(struct capi_pvt *i, int wait) 
 {
-	_cmsg CMSG;
 	struct timespec abstime;
 
 	if (!(i->isdnstate & (CAPI_ISDN_STATE_B3_UP | CAPI_ISDN_STATE_B3_PEND)))
 		return;
 
-	DISCONNECT_B3_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-	DISCONNECT_B3_REQ_NCCI(&CMSG) = i->NCCI;
-
 	if (wait) {
 		cc_mutex_lock(&i->lock);
-		_capi_put_cmsg_wait_conf(i, &CMSG);
+		capi_sendf(i, 1, CAPI_DISCONNECT_B3_REQ, i->NCCI, get_capi_MessageNumber(), "()");
 	} else {
-		_capi_put_cmsg(&CMSG);
+		capi_sendf(NULL, 0, CAPI_DISCONNECT_B3_REQ, i->NCCI, get_capi_MessageNumber(), "()");
 		return;
 	}
 
@@ -1244,16 +936,12 @@ static void cc_disconnect_b3(struct capi_pvt *i, int wait)
 /*
  * send CONNECT_B3_REQ
  */
-static void cc_start_b3(struct capi_pvt *i)
+void cc_start_b3(struct capi_pvt *i)
 {
-	_cmsg CMSG;
-
 	if (!(i->isdnstate & (CAPI_ISDN_STATE_B3_UP | CAPI_ISDN_STATE_B3_PEND))) {
 		i->isdnstate |= CAPI_ISDN_STATE_B3_PEND;
-		CONNECT_B3_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-		CONNECT_B3_REQ_PLCI(&CMSG) = i->PLCI;
-		CONNECT_B3_REQ_NCPI(&CMSG) = capi_rtp_ncpi(i);
-		_capi_put_cmsg(&CMSG);
+		capi_sendf(NULL, 0, CAPI_CONNECT_B3_REQ, i->PLCI, get_capi_MessageNumber(),
+			"s", capi_rtp_ncpi(i));
 		cc_verbose(4, 1, VERBOSE_PREFIX_3 "%s: sent CONNECT_B3_REQ PLCI=%#x\n",
 			i->vname, i->PLCI);
 	}
@@ -1288,25 +976,39 @@ static void send_progress(struct capi_pvt *i)
 }
 
 /*
+ * send disconnect_req
+ */
+static void capi_send_disconnect(unsigned int PLCI, struct capi_pvt *i)
+{
+	if (PLCI == 0) {
+		return;
+	}
+	if (i) {
+		capi_sendf(i, 1, CAPI_DISCONNECT_REQ, PLCI, get_capi_MessageNumber(), "()");
+	} else {
+		capi_sendf(NULL, 0, CAPI_DISCONNECT_REQ, PLCI, get_capi_MessageNumber(), "()");
+	}
+}
+
+/*
  * hangup a line (CAPI messages)
  * (this must be called with i->lock held)
  */
-static void capi_activehangup(struct ast_channel *c, int state)
+void capi_activehangup(struct capi_pvt *i, int state)
 {
-	struct capi_pvt *i = CC_CHANNEL_PVT(c);
-	_cmsg CMSG;
+	struct ast_channel *c = i->owner;
 	const char *cause;
 
-	i->cause = c->hangupcause;
-	if ((cause = pbx_builtin_getvar_helper(c, "PRI_CAUSE"))) {
-		i->cause = atoi(cause);
-	}
+	if (c) {
+		i->cause = c->hangupcause;
+		if ((cause = pbx_builtin_getvar_helper(c, "PRI_CAUSE"))) {
+			i->cause = atoi(cause);
+		}
 	
-	if ((i->isdnstate & CAPI_ISDN_STATE_ECT)) {
-		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: activehangup ECT call\n",
-			i->vname);
-		/* we do nothing, just wait for DISCONNECT_IND */
-		return;
+		if ((i->isdnstate & CAPI_ISDN_STATE_ECT)) {
+			cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: activehangup ECT call\n",
+				i->vname);
+		}
 	}
 
 	cc_verbose(2, 1, VERBOSE_PREFIX_3 "%s: activehangingup (cause=%d) for PLCI=%#x\n",
@@ -1315,10 +1017,18 @@ static void capi_activehangup(struct ast_channel *c, int state)
 
 	if ((state == CAPI_STATE_ALERTING) ||
 	    (state == CAPI_STATE_DID) || (state == CAPI_STATE_INCALL)) {
-		CONNECT_RESP_HEADER(&CMSG, capi_ApplID, i->MessageNumber, 0);
-		CONNECT_RESP_PLCI(&CMSG) = i->PLCI;
-		CONNECT_RESP_REJECT(&CMSG) = (i->cause) ? (0x3480 | (i->cause & 0x7f)) : 2;
-		_capi_put_cmsg(&CMSG);
+		capi_sendf(NULL, 0, CAPI_CONNECT_RESP, i->PLCI, i->MessageNumber,
+			"w()()()()()",
+			(i->cause) ? (0x3480 | (i->cause & 0x7f)) : 2);
+		return;
+	}
+	
+	if ((i->isdnstate & CAPI_ISDN_STATE_STAYONLINE)) {
+		/* user has requested to leave channel online for further actions
+		   like CCBS */
+		cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: disconnect deferred, stay-online mode PLCI=%#x\n",
+			i->vname, i->PLCI);
+		i->whentohangup = time(NULL) + 18; /* timeout 18 seconds */
 		return;
 	}
 
@@ -1327,6 +1037,13 @@ static void capi_activehangup(struct ast_channel *c, int state)
 		cc_disconnect_b3(i, 0);
 		return;
 	}
+
+	if (i->channeltype == CAPI_CHANNELTYPE_NULL) {
+		if (i->PLCI == 0) {
+			interface_cleanup(i);
+			return;
+		}
+	}
 	
 	if ((state == CAPI_STATE_CONNECTED) || (state == CAPI_STATE_CONNECTPENDING) ||
 	    (state == CAPI_STATE_ANSWERING) || (state == CAPI_STATE_ONHOLD)) {
@@ -1334,9 +1051,7 @@ static void capi_activehangup(struct ast_channel *c, int state)
 			/* CONNECT_CONF not received yet? */
 			capi_wait_conf(i, CAPI_CONNECT_CONF);
 		}
-		DISCONNECT_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-		DISCONNECT_REQ_PLCI(&CMSG) = i->PLCI;
-		_capi_put_cmsg_wait_conf(i, &CMSG);
+		capi_send_disconnect(i->PLCI, i);
 	}
 	return;
 }
@@ -1385,11 +1100,14 @@ static int pbx_capi_hangup(struct ast_channel *c)
 		interface_cleanup(i);
 	} else {
 		/* not disconnected yet, we must actively do it */
-		capi_activehangup(c, state);
+		capi_activehangup(i, state);
 	}
+
+	i->owner = NULL;
+	CC_CHANNEL_PVT(c) = NULL;
+
 	cc_mutex_unlock(&i->lock);
 
-	CC_CHANNEL_PVT(c) = NULL;
 	ast_setstate(c, AST_STATE_DOWN);
 
 #ifdef CC_AST_HAS_VERSION_1_4
@@ -1405,82 +1123,6 @@ static int pbx_capi_hangup(struct ast_channel *c)
 }
 
 /*
- * convert a number
- */
-static char *capi_number_func(unsigned char *data, unsigned int strip, char *buf)
-{
-	unsigned int len;
-
-	if (data[0] == 0xff) {
-		len = read_capi_word(&data[1]);
-		data += 2;
-	} else {
-		len = data[0];
-		data += 1;
-	}
-	if (len > (AST_MAX_EXTENSION - 1))
-		len = (AST_MAX_EXTENSION - 1);
-	
-	/* convert a capi struct to a \0 terminated string */
-	if ((!len) || (len < strip))
-		return NULL;
-		
-	len = len - strip;
-	data += strip;
-
-	memcpy(buf, data, len);
-	buf[len] = '\0';
-	
-	return buf;
-}
-#define capi_number(data, strip) \
-  capi_number_func(data, strip, alloca(AST_MAX_EXTENSION))
-
-/*
- * parse the dialstring
- */
-static void parse_dialstring(char *buffer, char **interface, char **dest, char **param, char **ocid)
-{
-	int cp = 0;
-	char *buffer_p = buffer;
-	char *oc;
-
-	/* interface is the first part of the string */
-	*interface = buffer;
-
-	*dest = emptyid;
-	*param = emptyid;
-	*ocid = NULL;
-
-	while (*buffer_p) {
-		if (*buffer_p == '/') {
-			*buffer_p = 0;
-			buffer_p++;
-			if (cp == 0) {
-				*dest = buffer_p;
-				cp++;
-			} else if (cp == 1) {
-				*param = buffer_p;
-				cp++;
-			} else {
-				cc_log(LOG_WARNING, "Too many parts in dialstring '%s'\n",
-					buffer);
-			}
-			continue;
-		}
-		buffer_p++;
-	}
-	if ((oc = strchr(*dest, ':')) != NULL) {
-		*ocid = *dest;
-		*oc = '\0';
-		*dest = oc + 1;
-	}
-	cc_verbose(3, 1, VERBOSE_PREFIX_4 "parsed dialstring: '%s' '%s' '%s' '%s'\n",
-		*interface, (*ocid) ? *ocid : "NULL", *dest, *param);
-	return;
-}
-
-/*
  * PBX tells us to make a call
  */
 static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
@@ -1490,7 +1132,6 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 	char buffer[AST_MAX_EXTENSION];
 	char called[AST_MAX_EXTENSION], calling[AST_MAX_EXTENSION];
 	char callerid[AST_MAX_EXTENSION];
-	char bchaninfo[3];
 	int CLIR;
 	int callernplan = 0;
 	int use_defaultcid = 0;
@@ -1500,12 +1141,12 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 	char callingsubaddress[AST_MAX_EXTENSION];
 	char calledsubaddress[AST_MAX_EXTENSION];
 	int doqsig;
+	unsigned char *facilityarray = NULL;
 	
-	_cmsg CMSG;
 	MESSAGE_EXCHANGE_ERROR  error;
 
 	cc_copy_string(buffer, idest, sizeof(buffer));
-	parse_dialstring(buffer, &interface, &dest, &param, &ocid);
+	capi_parse_dialstring(buffer, &interface, &dest, &param, &ocid);
 
 	/* init param settings */
 	i->doB3 = CAPI_B3_DONT;
@@ -1536,6 +1177,11 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 				cc_log(LOG_WARNING, "Default CID already set in '%s'\n", idest);
 			use_defaultcid = 1;
 			break;
+		case 's':	/* stay online */
+			if ((i->isdnstate & CAPI_ISDN_STATE_STAYONLINE))
+				cc_log(LOG_WARNING, "'stay-online' already set in '%s'\n", idest);
+			i->isdnstate |= CAPI_ISDN_STATE_STAYONLINE;
+			break;
 		case 'q':	/* disable QSIG */
 			cc_verbose(4, 0, VERBOSE_PREFIX_4 "%s: QSIG extensions for this call disabled\n",
 				i->vname);
@@ -1552,12 +1198,57 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 		return -1;
 	}
 
+	i->peer = cc_get_peer_link_id(pbx_builtin_getvar_helper(c, "CAPIPEERLINKID"));
+	i->outgoing = 1;
+	i->transfercapability = c->transfercapability;
+	i->isdnstate |= CAPI_ISDN_STATE_PBX;
+	i->state = CAPI_STATE_CONNECTPENDING;
+	ast_setstate(c, AST_STATE_DIALING);
+	i->MessageNumber = get_capi_MessageNumber();
+
+	/* if this is a CCBS/CCNR callback call */
+	if (i->ccbsnrhandle) {
+		_cword cip = (_cword)tcap2cip(i->transfercapability);
+		_cword rbref;
+
+		i->doOverlap = 0;
+		rbref = capi_ccbsnr_take_ref(i->ccbsnrhandle);
+
+		if ((rbref == 0xdead) ||
+		    ((capi_sendf(NULL, 0, CAPI_FACILITY_REQ, i->controller, i->MessageNumber,
+			"w(w(www(wwwsss())()()()()))",
+			FACILITYSELECTOR_SUPPLEMENTARY,
+			0x0012,  /* CCBS call */
+			rbref,   /* reference */
+			cip,     /* CIP */
+			0, /* reserved */
+			 /* B protocol */
+			b_protocol_table[i->bproto].b1protocol,
+			b_protocol_table[i->bproto].b2protocol,
+			b_protocol_table[i->bproto].b3protocol,
+			b_protocol_table[i->bproto].b1configuration,
+			b_protocol_table[i->bproto].b2configuration,
+			b_protocol_table[i->bproto].b3configuration
+			/* */ /* BC */
+			/* */ /* LLC */
+			/* */  /* HLC */
+			/* */  /* Additional Info */
+			)))) {
+			i->state = CAPI_STATE_DISCONNECTED;
+			ast_setstate(c, AST_STATE_RESERVED);
+			return 1;
+		}
+		return 0;
+	}
+
 	CLIR = c->cid.cid_pres;
 	callernplan = c->cid.cid_ton & 0x7f;
 
 	if ((ton = pbx_builtin_getvar_helper(c, "CALLERTON"))) {
 		callernplan = atoi(ton) & 0x7f;
 	}
+	i->cid_ton = callernplan;
+
 	cc_verbose(1, 1, VERBOSE_PREFIX_2 "%s: Call %s %s%s (pres=0x%02x, ton=0x%02x)\n",
 		i->vname, c->name, i->doB3 ? "with B3 ":" ",
 		i->doOverlap ? "overlap":"", CLIR, callernplan);
@@ -1575,11 +1266,7 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 		dsa = calledsubaddress;
 	}
 
-	i->MessageNumber = get_capi_MessageNumber();
-	CONNECT_REQ_HEADER(&CMSG, capi_ApplID, i->MessageNumber, i->controller);
-	CONNECT_REQ_CONTROLLER(&CMSG) = i->controller;
-	CONNECT_REQ_CIPVALUE(&CMSG) = tcap2cip(c->transfercapability);
-	if (tcap_is_digital(c->transfercapability)) {
+	if (capi_tcap_is_digital(i->transfercapability)) {
 		i->bproto = CC_BPROTO_TRANSPARENT;
 		cc_verbose(4, 0, VERBOSE_PREFIX_2 "%s: is digital call, set proto to TRANSPARENT\n",
 			i->vname);
@@ -1593,8 +1280,6 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 	}
 	called[1] = 0x80;
 	strncpy(&called[2], dest, sizeof(called) - 3);
-	CONNECT_REQ_CALLEDPARTYNUMBER(&CMSG) = (_cstruct)called;
-	CONNECT_REQ_CALLEDPARTYSUBADDRESS(&CMSG) = (_cstruct)dsa;
 
 	if (c->cid.cid_num) {
 		cc_copy_string(callerid, c->cid.cid_num, sizeof(callerid));
@@ -1614,41 +1299,40 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 	calling[2] = 0x80 | (CLIR & 0x63);
 	strncpy(&calling[3], callerid, sizeof(calling) - 4);
 
-	CONNECT_REQ_CALLINGPARTYNUMBER(&CMSG) = (_cstruct)calling;
-	CONNECT_REQ_CALLINGPARTYSUBADDRESS(&CMSG) = (_cstruct)osa;
-
-	CONNECT_REQ_B1PROTOCOL(&CMSG) = b_protocol_table[i->bproto].b1protocol;
-	CONNECT_REQ_B2PROTOCOL(&CMSG) = b_protocol_table[i->bproto].b2protocol;
-	CONNECT_REQ_B3PROTOCOL(&CMSG) = b_protocol_table[i->bproto].b3protocol;
-	CONNECT_REQ_B1CONFIGURATION(&CMSG) = b_protocol_table[i->bproto].b1configuration;
-	CONNECT_REQ_B2CONFIGURATION(&CMSG) = b_protocol_table[i->bproto].b2configuration;
-	CONNECT_REQ_B3CONFIGURATION(&CMSG) = b_protocol_table[i->bproto].b3configuration;
-
-	bchaninfo[0] = 2;
-	bchaninfo[1] = 0x0;
-	bchaninfo[2] = 0x0;
-	CONNECT_REQ_BCHANNELINFORMATION(&CMSG) = (_cstruct)bchaninfo; /* 0 */
-
 	if (doqsig) {
-		unsigned char *facilityarray = alloca(CAPI_MAX_FACILITYDATAARRAY_SIZE);
+		facilityarray = alloca(CAPI_MAX_FACILITYDATAARRAY_SIZE);
 		cc_qsig_add_call_setup_data(facilityarray, i, c);
-		CONNECT_REQ_FACILITYDATAARRAY(&CMSG) = facilityarray;
 	}
 
-	cc_mutex_lock(&i->lock);
+	error = capi_sendf(NULL, 0, CAPI_CONNECT_REQ, i->controller, i->MessageNumber,
+		"wssss(wwwsss())()()()((w)()()s())",
+		tcap2cip(i->transfercapability), /* CIP value */
+		called, /* called party number */
+		calling, /* calling party number */
+		dsa, /* called party subaddress */
+		osa, /* calling party subaddress */
+		 /* B protocol */
+		b_protocol_table[i->bproto].b1protocol,
+		b_protocol_table[i->bproto].b2protocol,
+		b_protocol_table[i->bproto].b3protocol,
+		b_protocol_table[i->bproto].b1configuration,
+		b_protocol_table[i->bproto].b2configuration,
+		b_protocol_table[i->bproto].b3configuration,
+		 /* BC */
+		 /* LLC */
+		 /* HLC */
+		 /* Additional Info */
+		  0x0000, /* B channel info */
+		   /* Keypad facility */
+		   /* User-User data */
+		  facilityarray /* Facility data array */
+	);
 
-	i->outgoing = 1;
-	i->isdnstate |= CAPI_ISDN_STATE_PBX;
-	i->state = CAPI_STATE_CONNECTPENDING;
-	ast_setstate(c, AST_STATE_DIALING);
-
-	if ((error = _capi_put_cmsg(&CMSG))) {
+	if (error) {
 		i->state = CAPI_STATE_DISCONNECTED;
 		ast_setstate(c, AST_STATE_RESERVED);
-		cc_mutex_unlock(&i->lock);
 		return error;
 	}
-	cc_mutex_unlock(&i->lock);
 
 	/* now we shall return .... the rest has to be done by handle_msg */
 	return 0;
@@ -1660,11 +1344,17 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 static int capi_send_answer(struct ast_channel *c, _cstruct b3conf)
 {
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
-	_cmsg CMSG;
 	char buf[CAPI_MAX_STRING];
 	const char *dnid;
 	const char *connectednumber;
+	unsigned char *facilityarray = NULL;
     
+	if (i->state == CAPI_STATE_DISCONNECTED) {
+		cc_verbose(3, 0, VERBOSE_PREFIX_2 "%s: Not answering disconnected call.\n",
+			i->vname);
+		return -1;	
+	}
+
 	if ((i->isdnmode == CAPI_ISDNMODE_DID) &&
 	    ((strlen(i->incomingmsn) < strlen(i->dnid)) && 
 	    (strcmp(i->incomingmsn, "*")))) {
@@ -1676,32 +1366,41 @@ static int capi_send_answer(struct ast_channel *c, _cstruct b3conf)
 		dnid = connectednumber;
 	}
 
-	CONNECT_RESP_HEADER(&CMSG, capi_ApplID, i->MessageNumber, 0);
-	CONNECT_RESP_PLCI(&CMSG) = i->PLCI;
-	CONNECT_RESP_REJECT(&CMSG) = 0;
 	if (strlen(dnid)) {
 		buf[0] = strlen(dnid) + 2;
 		buf[1] = 0x00;
 		buf[2] = 0x80;
 		strncpy(&buf[3], dnid, sizeof(buf) - 4);
-		CONNECT_RESP_CONNECTEDNUMBER(&CMSG) = (_cstruct)buf;
+	} else {
+		buf[0] = 0x00;
 	}
-	CONNECT_RESP_B1PROTOCOL(&CMSG) = b_protocol_table[i->bproto].b1protocol;
-	CONNECT_RESP_B2PROTOCOL(&CMSG) = b_protocol_table[i->bproto].b2protocol;
-	CONNECT_RESP_B3PROTOCOL(&CMSG) = b_protocol_table[i->bproto].b3protocol;
-	CONNECT_RESP_B1CONFIGURATION(&CMSG) = b_protocol_table[i->bproto].b1configuration;
-	CONNECT_RESP_B2CONFIGURATION(&CMSG) = b_protocol_table[i->bproto].b2configuration;
-	if (!b3conf)
+	if (!b3conf) {
 		b3conf = b_protocol_table[i->bproto].b3configuration;
-	CONNECT_RESP_B3CONFIGURATION(&CMSG) = b3conf;
-#ifndef CC_HAVE_NO_GLOBALCONFIGURATION
-	CONNECT_RESP_GLOBALCONFIGURATION(&CMSG) = capi_set_global_configuration(i);
-#endif
+	}
 
 	cc_verbose(3, 0, VERBOSE_PREFIX_2 "%s: Answering for %s\n",
 		i->vname, dnid);
 		
-	if (_capi_put_cmsg(&CMSG) != 0) {
+	facilityarray = alloca(CAPI_MAX_FACILITYDATAARRAY_SIZE);
+	cc_qsig_add_call_answer_data(facilityarray, i, c);
+
+	if (capi_sendf(NULL, 0, CAPI_CONNECT_RESP, i->PLCI, i->MessageNumber,
+	    "w(wwwssss)s()()(()()()s())",
+		0, /* accept call */
+		/* B protocol */
+		b_protocol_table[i->bproto].b1protocol,
+		b_protocol_table[i->bproto].b2protocol,
+		b_protocol_table[i->bproto].b3protocol,
+		b_protocol_table[i->bproto].b1configuration,
+		b_protocol_table[i->bproto].b2configuration,
+		b3conf,
+		capi_set_global_configuration(i),
+		buf, /* connected number */
+		/* connected subaddress */
+		/* LLC */
+		/* Additional info */
+		facilityarray		
+		) != 0) {
 		return -1;	
 	}
     
@@ -1723,7 +1422,7 @@ static int pbx_capi_answer(struct ast_channel *c)
 	i->bproto = CC_BPROTO_TRANSPARENT;
 
 	if (i->rtp) {
-		if (!tcap_is_digital(c->transfercapability))
+		if (!capi_tcap_is_digital(i->transfercapability))
 			i->bproto = CC_BPROTO_RTP;
 	}
 
@@ -1736,46 +1435,12 @@ static int pbx_capi_answer(struct ast_channel *c)
  */
 static struct ast_frame *pbx_capi_read(struct ast_channel *c) 
 {
-        struct capi_pvt *i = CC_CHANNEL_PVT(c);
+	struct capi_pvt *i = CC_CHANNEL_PVT(c);
 	struct ast_frame *f;
-	int readsize;
 
-	if (i == NULL) {
-		cc_log(LOG_ERROR, "channel has no interface\n");
-		return NULL;
-	}
-	if (i->readerfd == -1) {
-		cc_log(LOG_ERROR, "no readerfd\n");
-		return NULL;
-	}
+	f = capi_read_pipeframe(i);
 
-	f = &i->f;
-	f->frametype = AST_FRAME_NULL;
-	f->subclass = 0;
-
-	readsize = read(i->readerfd, f, sizeof(struct ast_frame));
-	if (readsize != sizeof(struct ast_frame)) {
-		cc_log(LOG_ERROR, "did not read a whole frame\n");
-	}
-	
-	f->mallocd = 0;
-	f->data = NULL;
-
-	if ((f->frametype == AST_FRAME_CONTROL) && (f->subclass == AST_CONTROL_HANGUP)) {
-		return NULL;
-	}
-
-	if ((f->frametype == AST_FRAME_VOICE) && (f->datalen > 0)) {
-		if (f->datalen > sizeof(i->frame_data)) {
-			cc_log(LOG_ERROR, "f.datalen(%d) greater than space of frame_data(%d)\n",
-				f->datalen, sizeof(i->frame_data));
-			f->datalen = sizeof(i->frame_data);
-		}
-		readsize = read(i->readerfd, i->frame_data + AST_FRIENDLY_OFFSET, f->datalen);
-		if (readsize != f->datalen) {
-			cc_log(LOG_ERROR, "did not read whole frame data\n");
-		}
-		f->data = i->frame_data + AST_FRIENDLY_OFFSET;
+	if ((f) && (f->frametype == AST_FRAME_VOICE) && (f->datalen > 0)) {
 		if ((i->doDTMF > 0) && (i->vad != NULL) ) {
 			f = ast_dsp_process(c, i->vad, f);
 		}
@@ -1789,125 +1454,10 @@ static struct ast_frame *pbx_capi_read(struct ast_channel *c)
 static int pbx_capi_write(struct ast_channel *c, struct ast_frame *f)
 {
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
-	MESSAGE_EXCHANGE_ERROR error;
-	_cmsg CMSG;
-	int j = 0;
-	unsigned char *buf;
-	struct ast_frame *fsmooth;
-	int txavg=0;
 	int ret = 0;
 
-	if (!i) {
-		cc_log(LOG_ERROR, "channel has no interface\n");
-		return -1;
-	}
-	 
-	if ((!(i->isdnstate & CAPI_ISDN_STATE_B3_UP)) || (!i->NCCI) ||
-	    ((i->isdnstate & (CAPI_ISDN_STATE_B3_CHANGE | CAPI_ISDN_STATE_LI)))) {
-		return 0;
-	}
+	ret = capi_write_frame(i, f);
 
-	if ((!(i->ntmode)) && (i->state != CAPI_STATE_CONNECTED)) {
-		return 0;
-	}
-
-	if (f->frametype == AST_FRAME_NULL) {
-		return 0;
-	}
-	if (f->frametype == AST_FRAME_DTMF) {
-		cc_log(LOG_ERROR, "dtmf frame should be written\n");
-		return 0;
-	}
-	if (f->frametype != AST_FRAME_VOICE) {
-		cc_log(LOG_ERROR,"not a voice frame\n");
-		return 0;
-	}
-	if (i->FaxState & CAPI_FAX_STATE_ACTIVE) {
-		cc_verbose(3, 1, VERBOSE_PREFIX_2 "%s: write on fax activity?\n",
-			i->vname);
-		return 0;
-	}
-	if ((!f->data) || (!f->datalen)) {
-		cc_log(LOG_DEBUG, "No data for FRAME_VOICE %s\n", c->name);
-		return 0;
-	}
-	if (i->isdnstate & CAPI_ISDN_STATE_RTP) {
-		if ((!(f->subclass & i->codec)) &&
-		    (f->subclass != capi_capability)) {
-			cc_log(LOG_ERROR, "don't know how to write subclass %s(%d)\n",
-				ast_getformatname(f->subclass), f->subclass);
-			return 0;
-		}
-		return capi_write_rtp(c, f);
-	}
-	if (i->B3count >= CAPI_MAX_B3_BLOCKS) {
-		cc_verbose(3, 1, VERBOSE_PREFIX_4 "%s: B3count is full, dropping packet.\n",
-			i->vname);
-		return 0;
-	}
-
-	if ((!i->smoother) || (ast_smoother_feed(i->smoother, f) != 0)) {
-		cc_log(LOG_ERROR, "%s: failed to fill smoother\n", i->vname);
-		return 0;
-	}
-
-	for (fsmooth = ast_smoother_read(i->smoother);
-	     fsmooth != NULL;
-	     fsmooth = ast_smoother_read(i->smoother)) {
-		DATA_B3_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-		DATA_B3_REQ_NCCI(&CMSG) = i->NCCI;
-		DATA_B3_REQ_DATALENGTH(&CMSG) = fsmooth->datalen;
-		DATA_B3_REQ_FLAGS(&CMSG) = 0; 
-
-		DATA_B3_REQ_DATAHANDLE(&CMSG) = i->send_buffer_handle;
-		buf = &(i->send_buffer[(i->send_buffer_handle % CAPI_MAX_B3_BLOCKS) *
-			(CAPI_MAX_B3_BLOCK_SIZE + AST_FRIENDLY_OFFSET)]);
-		DATA_B3_REQ_DATA(&CMSG) = buf;
-		i->send_buffer_handle++;
-
-		if ((i->doES == 1) && (!tcap_is_digital(c->transfercapability))) {
-			for (j = 0; j < fsmooth->datalen; j++) {
-				buf[j] = reversebits[ ((unsigned char *)fsmooth->data)[j] ]; 
-				if (capi_capability == AST_FORMAT_ULAW) {
-					txavg += abs( capiULAW2INT[reversebits[ ((unsigned char*)fsmooth->data)[j]]] );
-				} else {
-					txavg += abs( capiALAW2INT[reversebits[ ((unsigned char*)fsmooth->data)[j]]] );
-				}
-			}
-			txavg = txavg / j;
-			for(j = 0; j < ECHO_TX_COUNT - 1; j++) {
-				i->txavg[j] = i->txavg[j+1];
-			}
-			i->txavg[ECHO_TX_COUNT - 1] = txavg;
-		} else {
-			if ((i->txgain == 1.0) || (tcap_is_digital(c->transfercapability))) {
-				for (j = 0; j < fsmooth->datalen; j++) {
-					buf[j] = reversebits[((unsigned char *)fsmooth->data)[j]];
-				}
-			} else {
-				for (j = 0; j < fsmooth->datalen; j++) {
-					buf[j] = i->g.txgains[reversebits[((unsigned char *)fsmooth->data)[j]]];
-				}
-			}
-		}
-   
-   		error = 1; 
-		if (i->B3q > 0) {
-			error = _capi_put_cmsg(&CMSG);
-		} else {
-			cc_verbose(3, 1, VERBOSE_PREFIX_4 "%s: too much voice to send for NCCI=%#x\n",
-				i->vname, i->NCCI);
-		}
-
-		if (!error) {
-			cc_mutex_lock(&i->lock);
-			i->B3count++;
-			i->B3q -= fsmooth->datalen;
-			if (i->B3q < 0)
-				i->B3q = 0;
-			cc_mutex_unlock(&i->lock);
-		}
-	}
 	return ret;
 }
 
@@ -1932,23 +1482,20 @@ static int pbx_capi_fixup(struct ast_channel *oldchan, struct ast_channel *newch
  */
 static void cc_select_b(struct capi_pvt *i, _cstruct b3conf)
 {
-	_cmsg CMSG;
-
-	SELECT_B_PROTOCOL_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-	SELECT_B_PROTOCOL_REQ_PLCI(&CMSG) = i->PLCI;
-	SELECT_B_PROTOCOL_REQ_B1PROTOCOL(&CMSG) = b_protocol_table[i->bproto].b1protocol;
-	SELECT_B_PROTOCOL_REQ_B2PROTOCOL(&CMSG) = b_protocol_table[i->bproto].b2protocol;
-	SELECT_B_PROTOCOL_REQ_B3PROTOCOL(&CMSG) = b_protocol_table[i->bproto].b3protocol;
-	SELECT_B_PROTOCOL_REQ_B1CONFIGURATION(&CMSG) = b_protocol_table[i->bproto].b1configuration;
-	SELECT_B_PROTOCOL_REQ_B2CONFIGURATION(&CMSG) = b_protocol_table[i->bproto].b2configuration;
-	if (!b3conf)
+	if (!b3conf) {
 		b3conf = b_protocol_table[i->bproto].b3configuration;
-	SELECT_B_PROTOCOL_REQ_B3CONFIGURATION(&CMSG) = b3conf;
-#ifndef CC_HAVE_NO_GLOBALCONFIGURATION
-	SELECT_B_PROTOCOL_REQ_GLOBALCONFIGURATION(&CMSG) = capi_set_global_configuration(i);
-#endif
+	}
 
-	_capi_put_cmsg(&CMSG);
+	capi_sendf(NULL, 0, CAPI_SELECT_B_PROTOCOL_REQ, i->PLCI, get_capi_MessageNumber(),
+		"(wwwssss)",
+		b_protocol_table[i->bproto].b1protocol,
+		b_protocol_table[i->bproto].b2protocol,
+		b_protocol_table[i->bproto].b3protocol,
+		b_protocol_table[i->bproto].b1configuration,
+		b_protocol_table[i->bproto].b2configuration,
+		b3conf,
+		capi_set_global_configuration(i)
+	);
 }
 
 /*
@@ -1956,9 +1503,6 @@ static void cc_select_b(struct capi_pvt *i, _cstruct b3conf)
  */
 static int line_interconnect(struct capi_pvt *i0, struct capi_pvt *i1, int start)
 {
-	_cmsg CMSG;
-	char buf[20];
-
 	if ((i0->isdnstate & CAPI_ISDN_STATE_DISCONNECT) ||
 	    (i1->isdnstate & CAPI_ISDN_STATE_DISCONNECT))
 		return -1;
@@ -1972,41 +1516,33 @@ static int line_interconnect(struct capi_pvt *i0, struct capi_pvt *i1, int start
 		return -1;
 	}
 
-	FACILITY_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-	FACILITY_REQ_PLCI(&CMSG) = i0->PLCI;
-	FACILITY_REQ_FACILITYSELECTOR(&CMSG) = FACILITYSELECTOR_LINE_INTERCONNECT;
-
-	memset(buf, 0, sizeof(buf));
-
 	if (start) {
 		/* connect */
-		buf[0] = 17; /* msg size */
-		write_capi_word(&buf[1], 0x0001);
-		buf[3] = 14; /* struct size LI Request Parameter */
-		write_capi_dword(&buf[4], 0x00000000); /* Data Path */
-		buf[8] = 9; /* struct size */
-		buf[9] = 8; /* struct size LI Request Connect Participant */
-		write_capi_dword(&buf[10], i1->PLCI);
-		write_capi_dword(&buf[14], 0x00000003); /* Data Path Participant */
-	} else {
-		/* disconnect */
-		buf[0] = 7; /* msg size */
-		write_capi_word(&buf[1], 0x0002);
-		buf[3] = 4; /* struct size */
-		write_capi_dword(&buf[4], i1->PLCI);
-	}
-
-	FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)buf;
-        
-	_capi_put_cmsg(&CMSG);
-
-	if (start) {
+		capi_sendf(i1, 0, CAPI_FACILITY_REQ, i0->PLCI, get_capi_MessageNumber(),
+			"w(w(d((dd))))",
+			FACILITYSELECTOR_LINE_INTERCONNECT,
+			0x0001,
+			/* struct LI Request Parameter */
+			0x00000000, /* Data Path */
+			/* struct */
+			/* struct LI Request Connect Participant */
+			i1->PLCI,
+			0x00000003 /* Data Path Participant */
+		);
 		i0->isdnstate |= CAPI_ISDN_STATE_LI;
 		i1->isdnstate |= CAPI_ISDN_STATE_LI;
 	} else {
+		/* disconnect */
+		capi_sendf(i1, 0, CAPI_FACILITY_REQ, i0->PLCI, get_capi_MessageNumber(),
+			"w(w(d))",
+			FACILITYSELECTOR_LINE_INTERCONNECT,
+			0x0002,
+			i1->PLCI
+		);
 		i0->isdnstate &= ~CAPI_ISDN_STATE_LI;
 		i1->isdnstate &= ~CAPI_ISDN_STATE_LI;
 	}
+
 	return 0;
 }
 
@@ -2096,21 +1632,36 @@ static CC_BRIDGE_RETURN pbx_capi_bridge(struct ast_channel *c0,
 	}
 
 	if ((i0->isdnstate & CAPI_ISDN_STATE_ECT) ||
-	    (i0->isdnstate & CAPI_ISDN_STATE_ECT)) {
+	    (i1->isdnstate & CAPI_ISDN_STATE_ECT)) {
 		return AST_BRIDGE_FAILED;
+	}
+
+	if ((i0->qsigfeat) && (i1->qsigfeat)) {
+		int br_status = pbx_capi_qsig_bridge(i0, i1);
+		
+		switch (br_status) {
+			case 1: /* successfull established Call Transfer with PR */
+				return ret;
+			case 2: /* don't do bridge - call transfer is active */
+				cc_verbose(3, 1, VERBOSE_PREFIX_2 "%s:%s cancelled bridge (path replacement was sent) for %s and %s\n",
+					   i0->vname, i1->vname, c0->name, c1->name);
+				return AST_BRIDGE_FAILED_NOWARN;
+			default: /* let's do line interconnect */
+				break;
+		}
 	}
 	
 	capi_wait_for_b3_up(i0);
 	capi_wait_for_b3_up(i1);
-
+	
 	if (!(flags & AST_BRIDGE_DTMF_CHANNEL_0))
-		capi_detect_dtmf(i0->owner, 0);
+		capi_detect_dtmf(i0, 0);
 
 	if (!(flags & AST_BRIDGE_DTMF_CHANNEL_1))
-		capi_detect_dtmf(i1->owner, 0);
+		capi_detect_dtmf(i1, 0);
 
-	capi_echo_canceller(i0->owner, EC_FUNCTION_DISABLE);
-	capi_echo_canceller(i1->owner, EC_FUNCTION_DISABLE);
+	capi_echo_canceller(i0, EC_FUNCTION_DISABLE);
+	capi_echo_canceller(i1, EC_FUNCTION_DISABLE);
 
 	if (line_interconnect(i0, i1, 1)) {
 		ret = AST_BRIDGE_FAILED;
@@ -2156,13 +1707,13 @@ static CC_BRIDGE_RETURN pbx_capi_bridge(struct ast_channel *c0,
 return_from_bridge:
 
 	if (!(flags & AST_BRIDGE_DTMF_CHANNEL_0))
-		capi_detect_dtmf(i0->owner, 1);
+		capi_detect_dtmf(i0, 1);
 
 	if (!(flags & AST_BRIDGE_DTMF_CHANNEL_1))
-		capi_detect_dtmf(i1->owner, 1);
+		capi_detect_dtmf(i1, 1);
 
-	capi_echo_canceller(i0->owner, EC_FUNCTION_ENABLE);
-	capi_echo_canceller(i1->owner, EC_FUNCTION_ENABLE);
+	capi_echo_canceller(i0, EC_FUNCTION_ENABLE);
+	capi_echo_canceller(i1, EC_FUNCTION_ENABLE);
 
 	return ret;
 }
@@ -2174,19 +1725,20 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 {
 	struct ast_channel *tmp;
 	int fmt;
-	int fds[2];
-	int flags;
 
 #ifdef CC_AST_HAS_EXT_CHAN_ALLOC
 	tmp = ast_channel_alloc(0, state, i->cid, NULL,
+#ifdef CC_AST_HAS_EXT2_CHAN_ALLOC
+		i->accountcode, i->dnid, i->context, i->amaflags,
+#endif
 		"CAPI/%s/%s-%x", i->vname, i->dnid, capi_counter++);
 #else
 	tmp = ast_channel_alloc(0);
 #endif
 	
 	if (tmp == NULL) {
-		cc_log(LOG_ERROR,"Unable to allocate channel!\n");
-		return(NULL);
+		cc_log(LOG_ERROR, "Unable to allocate channel!\n");
+		return NULL;
 	}
 
 #ifndef CC_AST_HAS_EXT_CHAN_ALLOC
@@ -2202,19 +1754,10 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 	tmp->type = channeltype;
 #endif
 
-	if (pipe(fds) != 0) {
-		cc_log(LOG_ERROR, "%s: unable to create pipe.\n",
-			i->vname);
+	if (!(capi_create_reader_writer_pipe(i))) {
 		ast_channel_free(tmp);
 		return NULL;
 	}
-	i->readerfd = fds[0];
-	i->writerfd = fds[1];
-	flags = fcntl(i->readerfd, F_GETFL);
-	fcntl(i->readerfd, F_SETFL, flags | O_NONBLOCK);
-	flags = fcntl(i->writerfd, F_GETFL);
-	fcntl(i->writerfd, F_SETFL, flags | O_NONBLOCK);
-
 	tmp->fds[0] = i->readerfd;
 
 	if (i->smoother != NULL) {
@@ -2270,7 +1813,6 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 		ast_getformatname_multiple(alloca(80), 80,
 		tmp->nativeformats),
 		(i->rtp) ? " (RTP)" : "");
-	cc_copy_string(tmp->context, i->context, sizeof(tmp->context));
 
 	if (!ast_strlen_zero(i->cid)) {
 		if (tmp->cid.cid_num) {
@@ -2285,9 +1827,12 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 		tmp->cid.cid_dnid = strdup(i->dnid);
 	}
 	tmp->cid.cid_ton = i->cid_ton;
+
+#ifndef CC_AST_HAS_EXT2_CHAN_ALLOC
 	if (i->amaflags)
 		tmp->amaflags = i->amaflags;
 	
+	cc_copy_string(tmp->context, i->context, sizeof(tmp->context));
 	cc_copy_string(tmp->exten, i->dnid, sizeof(tmp->exten));
 #ifdef CC_AST_HAS_STRINGFIELD_IN_CHANNEL
 	ast_string_field_set(tmp, accountcode, i->accountcode);
@@ -2296,7 +1841,16 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 	cc_copy_string(tmp->accountcode, i->accountcode, sizeof(tmp->accountcode));
 	cc_copy_string(tmp->language, i->language, sizeof(tmp->language));
 #endif
+#endif
+
+#ifdef CC_AST_HAS_STRINGFIELD_IN_CHANNEL
+	ast_string_field_set(tmp, language, i->language);
+#else
+	cc_copy_string(tmp->language, i->language, sizeof(tmp->language));
+#endif
+
 	i->owner = tmp;
+	i->used = tmp;
 
 #ifdef CC_AST_HAS_VERSION_1_4
 	ast_atomic_fetchadd_int(&usecnt, 1);
@@ -2327,12 +1881,12 @@ pbx_capi_request(const char *type, int format, void *data, int *cause)
 	char buffer[CAPI_MAX_STRING];
 	ast_group_t capigroup = 0;
 	unsigned int controller = 0;
-	int notfound = 1;
+	unsigned int ccbsnrhandle = 0;
 
 	cc_verbose(1, 1, VERBOSE_PREFIX_4 "data = %s format=%d\n", (char *)data, format);
 
 	cc_copy_string(buffer, (char *)data, sizeof(buffer));
-	parse_dialstring(buffer, &interface, &dest, &param, &ocid);
+	capi_parse_dialstring(buffer, &interface, &dest, &param, &ocid);
 
 	if ((!interface) || (!dest)) {
 		cc_log(LOG_ERROR, "Syntax error in dialstring. Read the docs!\n");
@@ -2348,6 +1902,16 @@ pbx_capi_request(const char *type, int format, void *data, int *cause)
 		controller = atoi(interface + 5);
 		cc_verbose(1, 1, VERBOSE_PREFIX_4 "capi request controller = %d\n",
 				controller);
+	} else if (!strncmp(interface, "ccbs", 4)) {
+		ccbsnrhandle = (unsigned int)strtoul(dest, NULL, 0);
+		cc_verbose(1, 1, VERBOSE_PREFIX_4 "capi request ccbs handle = %u\n",
+				ccbsnrhandle);
+		if ((controller = capi_get_ccbsnrcontroller(ccbsnrhandle)) == 0) {
+			cc_verbose(2, 0, VERBOSE_PREFIX_3 "didn't find CCBS handle %u\n",
+				ccbsnrhandle);
+			*cause = AST_CAUSE_REQUESTED_CHAN_UNAVAIL;
+			return NULL;
+		}
 	} else {
 		cc_verbose(1, 1, VERBOSE_PREFIX_4 "capi request for interface '%s'\n",
 				interface);
@@ -2355,8 +1919,8 @@ pbx_capi_request(const char *type, int format, void *data, int *cause)
 
 	cc_mutex_lock(&iflock);
 	
-	for (i = iflist; (i && notfound); i = i->next) {
-		if ((i->owner) || (i->channeltype != CAPI_CHANNELTYPE_B)) {
+	for (i = capi_iflist; i; i = i->next) {
+		if ((i->used) || (i->channeltype != CAPI_CHANNELTYPE_B)) {
 			/* if already in use or no real channel */
 			continue;
 		}
@@ -2388,6 +1952,7 @@ pbx_capi_request(const char *type, int format, void *data, int *cause)
 		}
 		i->PLCI = 0;
 		i->outgoing = 1;	/* this is an outgoing line */
+		i->ccbsnrhandle = ccbsnrhandle;
 		cc_mutex_unlock(&iflock);
 		return tmp;
 	}
@@ -2651,7 +2216,7 @@ static void capi_handle_dtmf_fax(struct capi_pvt *i)
 	struct ast_channel *c = i->owner;
 
 	if (!c) {
-		cc_log(LOG_ERROR, "No channel!\n");
+		/* no channel, ignore */
 		return;
 	}
 	
@@ -2684,46 +2249,6 @@ static void capi_handle_dtmf_fax(struct capi_pvt *i)
 	capi_channel_task(c, CAPI_CHANNEL_TASK_GOTOFAX);
 
 	return;
-}
-
-/*
- * find the interface (pvt) the PLCI belongs to
- */
-static struct capi_pvt *find_interface_by_plci(unsigned int plci)
-{
-	struct capi_pvt *i;
-
-	if (plci == 0)
-		return NULL;
-
-	cc_mutex_lock(&iflock);
-	for (i = iflist; i; i = i->next) {
-		if (i->PLCI == plci)
-			break;
-	}
-	cc_mutex_unlock(&iflock);
-
-	return i;
-}
-
-/*
- * find the interface (pvt) the messagenumber belongs to
- */
-static struct capi_pvt *find_interface_by_msgnum(unsigned short msgnum)
-{
-	struct capi_pvt *i;
-
-	if (msgnum == 0x0000)
-		return NULL;
-
-	cc_mutex_lock(&iflock);
-	for (i = iflist; i; i = i->next) {
-		    if ((i->PLCI == 0) && (i->MessageNumber == msgnum))
-			break;
-	}
-	cc_mutex_unlock(&iflock);
-
-	return i;
 }
 
 /*
@@ -2818,7 +2343,6 @@ static void handle_progress_indicator(_cmsg *CMSG, unsigned int PLCI, struct cap
 static void start_pbx_on_match(struct capi_pvt *i, unsigned int PLCI, _cword MessageNumber)
 {
 	struct ast_channel *c;
-	_cmsg CMSG2;
 
 	c = i->owner;
 
@@ -2843,11 +2367,11 @@ static void start_pbx_on_match(struct capi_pvt *i, unsigned int PLCI, _cword Mes
 		return;
 	}
 
-	switch(search_did(i->owner)) {
+	switch(search_did(c)) {
 	case 0: /* match */
 		i->isdnstate |= CAPI_ISDN_STATE_PBX;
 		ast_setstate(c, AST_STATE_RING);
-		if (ast_pbx_start(i->owner)) {
+		if (ast_pbx_start(c)) {
 			cc_log(LOG_ERROR, "%s: Unable to start pbx on channel!\n",
 				i->vname);
 			capi_channel_task(c, CAPI_CHANNEL_TASK_HANGUP); 
@@ -2867,10 +2391,8 @@ static void start_pbx_on_match(struct capi_pvt *i, unsigned int PLCI, _cword Mes
 		i->isdnstate |= CAPI_ISDN_STATE_PBX_DONT; /* don't try again */
 		cc_log(LOG_NOTICE, "%s: did not find exten for '%s', ignoring call.\n",
 			i->vname, i->dnid);
-		CONNECT_RESP_HEADER(&CMSG2, capi_ApplID, MessageNumber, 0);
-		CONNECT_RESP_PLCI(&CMSG2) = PLCI;
-		CONNECT_RESP_REJECT(&CMSG2) = 1; /* ignore */
-		_capi_put_cmsg(&CMSG2);
+		capi_sendf(NULL, 0, CAPI_CONNECT_RESP, PLCI, MessageNumber,
+			"w()()()()()", 1 /* ignore */);
 	}
 	return;
 }
@@ -2878,7 +2400,8 @@ static void start_pbx_on_match(struct capi_pvt *i, unsigned int PLCI, _cword Mes
 /*
  * Called Party Number via INFO_IND
  */
-static void capidev_handle_did_digits(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
+static void capidev_handle_did_digits(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI,
+	struct capi_pvt *i, unsigned int skip)
 {
 	char *did;
 	struct ast_frame fr = { AST_FRAME_NULL, };
@@ -2895,15 +2418,20 @@ static void capidev_handle_did_digits(_cmsg *CMSG, unsigned int PLCI, unsigned i
 		return;
 	}
 
-	did = capi_number(INFO_IND_INFOELEMENT(CMSG), 1);
+	did = capi_number(INFO_IND_INFOELEMENT(CMSG), skip);
 
 	if ((!(i->isdnstate & CAPI_ISDN_STATE_DID)) && 
 	    (strlen(i->dnid) && !strcasecmp(i->dnid, did))) {
 		did = NULL;
 	}
 
-	if ((did) && (strlen(i->dnid) < (sizeof(i->dnid) - 1)))
+	if ((did) && (strlen(i->dnid) < (sizeof(i->dnid) - 1))) {
+		if ((!strlen(i->dnid)) && (INFO_IND_INFONUMBER(CMSG) = 0x002c)) {
+			/* start of keypad */
+			strcat(i->dnid, "K");
+		}
 		strcat(i->dnid, did);
+	}
 
 	i->isdnstate |= CAPI_ISDN_STATE_DID;
 	
@@ -2926,7 +2454,7 @@ static void capidev_handle_did_digits(_cmsg *CMSG, unsigned int PLCI, unsigned i
 /*
  * send control according to cause code
  */
-static void queue_cause_control(struct capi_pvt *i, int control)
+void capi_queue_cause_control(struct capi_pvt *i, int control)
 {
 	struct ast_frame fr = { AST_FRAME_CONTROL, AST_CONTROL_HANGUP, };
 	
@@ -2949,25 +2477,14 @@ static void queue_cause_control(struct capi_pvt *i, int control)
  */
 static void capidev_handle_info_disconnect(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
 {
-	_cmsg CMSG2;
-
 	i->isdnstate |= CAPI_ISDN_STATE_DISCONNECT;
 
-	if ((i->isdnstate & CAPI_ISDN_STATE_ECT)) {
-		cc_verbose(4, 1, VERBOSE_PREFIX_3 "%s: Disconnect ECT call\n",
-			i->vname);
-		/* we do nothing, just wait for DISCONNECT_IND */
-		return;
-	}
-
-	if (PLCI == i->onholdPLCI) {
-		cc_verbose(4, 1, VERBOSE_PREFIX_3 "%s: Disconnect onhold call\n",
+	if ((PLCI == i->onholdPLCI) || (i->isdnstate & CAPI_ISDN_STATE_ECT)) {
+		cc_verbose(4, 1, VERBOSE_PREFIX_3 "%s: Disconnect onhold/ECT call\n",
 			i->vname);
 		/* the caller onhold hung up (or ECTed away) */
 		/* send a disconnect_req , we cannot hangup the channel here!!! */
-		DISCONNECT_REQ_HEADER(&CMSG2, capi_ApplID, get_capi_MessageNumber(), 0);
-		DISCONNECT_REQ_PLCI(&CMSG2) = i->onholdPLCI;
-		_capi_put_cmsg(&CMSG2);
+		capi_send_disconnect(PLCI, NULL);
 		return;
 	}
 
@@ -2975,10 +2492,17 @@ static void capidev_handle_info_disconnect(_cmsg *CMSG, unsigned int PLCI, unsig
 	if ((i->doB3 != CAPI_B3_ALWAYS) && (i->outgoing == 1)) {
 		cc_verbose(4, 1, VERBOSE_PREFIX_3 "%s: Disconnect case 1\n",
 			i->vname);
-		if (i->state == CAPI_STATE_CONNECTED) 
-			queue_cause_control(i, 0);
-		else
-			queue_cause_control(i, 1);
+		if (i->state == CAPI_STATE_CONNECTED) {
+			capi_queue_cause_control(i, 0);
+		} else {
+			if ((i->isdnstate & CAPI_ISDN_STATE_STAYONLINE)) {
+				cc_verbose(3, 1, VERBOSE_PREFIX_2 "%s: stay-online hangup frame queued.\n",
+					i->vname);
+				i->whentoqueuehangup = time(NULL) + 1;
+			} else {
+				capi_queue_cause_control(i, 1);
+			}
+		}
 		return;
 	}
 	
@@ -2987,7 +2511,7 @@ static void capidev_handle_info_disconnect(_cmsg *CMSG, unsigned int PLCI, unsig
 	    (i->state == CAPI_STATE_CONNECTED) && (i->outgoing == 1)) {
 		cc_verbose(4, 1, VERBOSE_PREFIX_3 "%s: Disconnect case 2\n",
 			i->vname);
-		queue_cause_control(i, 1);
+		capi_queue_cause_control(i, 1);
 		return;
 	}
 
@@ -3001,12 +2525,10 @@ static void capidev_handle_info_disconnect(_cmsg *CMSG, unsigned int PLCI, unsig
 			i->vname);
 		if (i->FaxState & CAPI_FAX_STATE_ACTIVE) {
 			/* in fax mode, we just hangup */
-			DISCONNECT_REQ_HEADER(&CMSG2, capi_ApplID, get_capi_MessageNumber(), 0);
-			DISCONNECT_REQ_PLCI(&CMSG2) = i->PLCI;
-			_capi_put_cmsg(&CMSG2);
+			capi_send_disconnect(i->PLCI, NULL);
 			return;
 		}
-		queue_cause_control(i, 0);
+		capi_queue_cause_control(i, 0);
 		return;
 	}
 	
@@ -3016,7 +2538,7 @@ static void capidev_handle_info_disconnect(_cmsg *CMSG, unsigned int PLCI, unsig
 			i->vname);
 		if ((i->state == CAPI_STATE_CONNECTED) &&
 		    (i->isdnstate & CAPI_ISDN_STATE_B3_UP)) {
-			queue_cause_control(i, 1);
+			capi_queue_cause_control(i, 1);
 			return;
 		}
 		/* wait for the 0x001e (PROGRESS), play audio and wait for a timeout from the network */
@@ -3046,7 +2568,7 @@ static void capidev_handle_setup_element(_cmsg *CMSG, unsigned int PLCI, struct 
 	}
 
 	if (i->isdnmode == CAPI_ISDNMODE_DID) {
-		if (!strlen(i->dnid) && (i->immediate)) {
+		if (strlen(i->dnid) || (i->immediate)) {
 			start_pbx_on_match(i, PLCI, HEADER_MSGNUM(CMSG));
 		}
 	} else {
@@ -3056,18 +2578,49 @@ static void capidev_handle_setup_element(_cmsg *CMSG, unsigned int PLCI, struct 
 }
 
 /*
+ * Send info elements back to calling channel if in NT-mode
+ * (this works with peerlink only)
+ */
+static void capidev_sendback_info(struct capi_pvt *i, _cmsg *CMSG)
+{
+	struct capi_pvt *i2;
+	unsigned char fac[CAPI_MAX_FACILITYDATAARRAY_SIZE];
+	unsigned char length;
+
+	if (!(i->peer))
+		return;
+
+	if (i->peer->tech != &capi_tech)
+		return;
+
+	i2 = CC_CHANNEL_PVT(i->peer);
+
+	if (!(i2->ntmode))
+		return;
+
+	length = INFO_IND_INFOELEMENT(CMSG)[0];
+
+	fac[0] = length + 2;
+	fac[1] = (unsigned char) INFO_IND_INFONUMBER(CMSG) & 0xff;
+	memcpy(&fac[2], &INFO_IND_INFOELEMENT(CMSG)[0], length + 1);
+
+	capi_sendf(NULL, 0, CAPI_INFO_REQ, i2->PLCI, get_capi_MessageNumber(),
+		"()(()()()s())",
+		fac
+	);
+}
+
+/*
  * CAPI INFO_IND
  */
 static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
 {
-	_cmsg CMSG2;
 	struct ast_frame fr = { AST_FRAME_NULL, };
 	char *p = NULL;
 	char *p2 = NULL;
 	int val = 0;
 
-	INFO_RESP_HEADER(&CMSG2, capi_ApplID, HEADER_MSGNUM(CMSG), PLCI);
-	_capi_put_cmsg(&CMSG2);
+	capi_sendf(NULL, 0, CAPI_INFO_RESP, PLCI, HEADER_MSGNUM(CMSG), "");
 
 	return_on_no_interface("INFO_IND");
 
@@ -3078,14 +2631,20 @@ static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 		if (i->owner) {
 			i->owner->hangupcause = INFO_IND_INFOELEMENT(CMSG)[2] & 0x7f;
 		}
+		capidev_sendback_info(i, CMSG);
 		break;
 	case 0x0014:	/* Call State */
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: info element CALL STATE %02x\n",
 			i->vname, INFO_IND_INFOELEMENT(CMSG)[1]);
+		capidev_sendback_info(i, CMSG);
 		break;
 	case 0x0018:	/* Channel Identification */
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: info element CHANNEL IDENTIFICATION %02x\n",
 			i->vname, INFO_IND_INFOELEMENT(CMSG)[1]);
+		if (i->doB3 == CAPI_B3_ON_SUCCESS) { 
+			/* try early B3 Connect */
+			cc_start_b3(i);
+		}
 		break;
 	case 0x001c:	/*  Facility Q.932 */
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: info element FACILITY\n",
@@ -3095,6 +2654,7 @@ static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: info element PI %02x %02x\n",
 			i->vname, INFO_IND_INFOELEMENT(CMSG)[1], INFO_IND_INFOELEMENT(CMSG)[2]);
 		handle_progress_indicator(CMSG, PLCI, i);
+		capidev_sendback_info(i, CMSG);
 		break;
 	case 0x0027: {	/*  Notification Indicator */
 		char *desc = "?";
@@ -3119,11 +2679,13 @@ static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 		}
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: info element NOTIFICATION INDICATOR '%s' (0x%02x)\n",
 			i->vname, desc, INFO_IND_INFOELEMENT(CMSG)[1]);
+		capidev_sendback_info(i, CMSG);
 		break;
 	}
 	case 0x0028:	/* DSP */
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: info element DSP\n",
 			i->vname);
+		capidev_sendback_info(i, CMSG);
 		break;
 	case 0x0029:	/* Date/Time */
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: info element Date/Time %02d/%02d/%02d %02d:%02d\n",
@@ -3131,11 +2693,18 @@ static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 			INFO_IND_INFOELEMENT(CMSG)[1], INFO_IND_INFOELEMENT(CMSG)[2],
 			INFO_IND_INFOELEMENT(CMSG)[3], INFO_IND_INFOELEMENT(CMSG)[4],
 			INFO_IND_INFOELEMENT(CMSG)[5]);
+		capidev_sendback_info(i, CMSG);
+		break;
+	case 0x002c:	/* Keypad facility */
+		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: info element KEYPAD FACILITY\n",
+			i->vname);
+		/* we handle keypad digits as normal digits */
+		capidev_handle_did_digits(CMSG, PLCI, NCCI, i, 0);
 		break;
 	case 0x0070:	/* Called Party Number */
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: info element CALLED PARTY NUMBER\n",
 			i->vname);
-		capidev_handle_did_digits(CMSG, PLCI, NCCI, i);
+		capidev_handle_did_digits(CMSG, PLCI, NCCI, i, 1);
 		break;
 	case 0x0074:	/* Redirecting Number */
 		p = capi_number(INFO_IND_INFOELEMENT(CMSG), 3);
@@ -3154,6 +2723,7 @@ static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 			}
 			i->owner->cid.cid_rdnis = strdup(p);
 		}
+		capidev_sendback_info(i, CMSG);
 		break;
 	case 0x0076:	/* Redirection Number */
 		p = capi_number(INFO_IND_INFOELEMENT(CMSG), 2);
@@ -3173,6 +2743,7 @@ static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 			snprintf(numberbuf, sizeof(numberbuf) - 1, "%s%s", p2, p);
 			pbx_builtin_setvar_helper(i->owner, "REDIRECTIONNUMBER", numberbuf);
 		}
+		capidev_sendback_info(i, CMSG);
 		break;
 	case 0x00a1:	/* Sending Complete */
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: info element Sending Complete\n",
@@ -3196,6 +2767,7 @@ static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 		local_queue_frame(i, &fr);
 		if (i->owner)
 			ast_setstate(i->owner, AST_STATE_RINGING);
+		
 		break;
 	case 0x8002:	/* CALL PROCEEDING */
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: info element CALL PROCEEDING\n",
@@ -3205,6 +2777,7 @@ static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 		local_queue_frame(i, &fr);
 		break;
 	case 0x8003:	/* PROGRESS */
+		i->isdnstate |= CAPI_ISDN_STATE_ISDNPROGRESS;
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: info element PROGRESS\n",
 			i->vname);
 		/*
@@ -3222,7 +2795,7 @@ static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 		if (i->doB3 == CAPI_B3_DONT) {
 			if ((i->owner) &&
 			    (i->owner->hangupcause == AST_CAUSE_USER_BUSY)) {
-				queue_cause_control(i, 1);
+				capi_queue_cause_control(i, 1);
 				break;
 			}
 		}
@@ -3287,7 +2860,67 @@ static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 			i->vname, INFO_IND_INFONUMBER(CMSG), PLCI);
 		break;
 	}
+	
+	/* QSIG worker - is only executed, if QSIG is enabled */
+	pbx_capi_qsig_handle_info_indication(CMSG, PLCI, NCCI, i);
+	
 	return;
+}
+
+/*
+ * CAPI FACILITY_IND line interconnect
+ */
+static int handle_facility_indication_line_interconnect(
+	_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
+{
+	if ((FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[1] == 0x01) &&
+	    (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[2] == 0x00)) {
+		cc_verbose(3, 0, VERBOSE_PREFIX_3 "%s: Line Interconnect activated\n",
+			i->vname);
+	}
+	if ((FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[1] == 0x02) &&
+	    (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[2] == 0x00) &&
+	    (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[0] > 8)) {
+		show_capi_info(i, read_capi_word(&FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[8]));
+	}
+	return 0;
+}
+
+/*
+ * CAPI FACILITY_IND dtmf received 
+ */
+static int handle_facility_indication_dtmf(
+	_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
+{
+	struct ast_frame fr = { AST_FRAME_NULL, };
+	char dtmf;
+	unsigned dtmflen = 0;
+	unsigned dtmfpos = 0;
+
+	if (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[0] != (0xff)) {
+		dtmflen = FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[0];
+		FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG) += 1;
+	} else {
+		dtmflen = read_capi_word(FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG) + 1);
+		FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG) += 3;
+	}
+	while (dtmflen) {
+		dtmf = (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG))[dtmfpos];
+		cc_verbose(1, 1, VERBOSE_PREFIX_4 "%s: c_dtmf = %c\n",
+			i->vname, dtmf);
+		if ((!(i->ntmode)) || (i->state == CAPI_STATE_CONNECTED)) {
+			if ((dtmf == 'X') || (dtmf == 'Y')) {
+				capi_handle_dtmf_fax(i);
+			} else {
+				fr.frametype = AST_FRAME_DTMF;
+				fr.subclass = dtmf;
+				local_queue_frame(i, &fr);
+			}
+		}
+		dtmflen--;
+		dtmfpos++;
+	}
+	return 0;
 }
 
 /*
@@ -3295,124 +2928,31 @@ static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsig
  */
 static void capidev_handle_facility_indication(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
 {
-	_cmsg CMSG2;
-	struct ast_frame fr = { AST_FRAME_NULL, };
-	char dtmf;
-	unsigned dtmflen;
-	unsigned dtmfpos = 0;
+	int resp_done = 0;
 
-	FACILITY_RESP_HEADER(&CMSG2, capi_ApplID, HEADER_MSGNUM(CMSG), PLCI);
-	FACILITY_RESP_FACILITYSELECTOR(&CMSG2) = FACILITY_IND_FACILITYSELECTOR(CMSG);
-	FACILITY_RESP_FACILITYRESPONSEPARAMETERS(&CMSG2) = FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG);
-	_capi_put_cmsg(&CMSG2);
-	
-	return_on_no_interface("FACILITY_IND");
-
-	if (FACILITY_IND_FACILITYSELECTOR(CMSG) == FACILITYSELECTOR_LINE_INTERCONNECT) {
-		/* line interconnect */
-		if ((FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[1] == 0x01) &&
-		    (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[2] == 0x00)) {
-			cc_verbose(3, 0, VERBOSE_PREFIX_3 "%s: Line Interconnect activated\n",
-				i->vname);
-		}
-		if ((FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[1] == 0x02) &&
-		    (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[2] == 0x00) &&
-		    (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[0] > 8)) {
-			show_capi_info(i, read_capi_word(&FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[8]));
-		}
+	switch (FACILITY_IND_FACILITYSELECTOR(CMSG)) {
+	case FACILITYSELECTOR_LINE_INTERCONNECT:
+		return_on_no_interface("FACILITY_IND LI");
+		resp_done = handle_facility_indication_line_interconnect(CMSG, PLCI, NCCI, i);
+		break;
+	case FACILITYSELECTOR_DTMF:
+		return_on_no_interface("FACILITY_IND DTMF");
+		resp_done = handle_facility_indication_dtmf(CMSG, PLCI, NCCI, i);
+		break;
+	case FACILITYSELECTOR_SUPPLEMENTARY:
+		resp_done = handle_facility_indication_supplementary(CMSG, PLCI, NCCI, i);
+		break;
+	default:
+		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: unhandled FACILITY_IND selector %d\n",
+			(i) ? i->vname:"???", FACILITY_IND_FACILITYSELECTOR(CMSG));
 	}
-	
-	if (FACILITY_IND_FACILITYSELECTOR(CMSG) == FACILITYSELECTOR_DTMF) {
-		/* DTMF received */
-		if (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[0] != (0xff)) {
-			dtmflen = FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[0];
-			FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG) += 1;
-		} else {
-			dtmflen = read_capi_word(FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG) + 1);
-			FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG) += 3;
-		}
-		while (dtmflen) {
-			dtmf = (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG))[dtmfpos];
-			cc_verbose(1, 1, VERBOSE_PREFIX_4 "%s: c_dtmf = %c\n",
-				i->vname, dtmf);
-			if ((!(i->ntmode)) || (i->state == CAPI_STATE_CONNECTED)) {
-				if ((dtmf == 'X') || (dtmf == 'Y')) {
-					capi_handle_dtmf_fax(i);
-				} else {
-					fr.frametype = AST_FRAME_DTMF;
-					fr.subclass = dtmf;
-					local_queue_frame(i, &fr);
-				}
-			}
-			dtmflen--;
-			dtmfpos++;
-		} 
-	}
-	
-	if (FACILITY_IND_FACILITYSELECTOR(CMSG) == FACILITYSELECTOR_SUPPLEMENTARY) {
-		/* supplementary sservices */
-		/* ECT */
-		if ( (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[1] == 0x6) &&
-		     (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[3] == 0x2) ) {
-			cc_verbose(1, 1, VERBOSE_PREFIX_3 "%s: PLCI=%#x ECT  Reason=0x%02x%02x\n",
-				i->vname, PLCI,
-				FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[5],
-				FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[4]);
-			show_capi_info(i, read_capi_word(&FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[4]));
-		}
 
-		/* 3PTY */
-		if ( (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[1] == 0x7) &&
-		     (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[3] == 0x2) ) {
-			cc_verbose(1, 1, VERBOSE_PREFIX_3 "%s: PLCI=%#x 3PTY  Reason=0x%02x%02x\n",
-				i->vname, PLCI,
-				FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[5],
-				FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[4]);
-			show_capi_info(i, read_capi_word(&FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[4]));
-		}
-
-		/* RETRIEVE */
-		if ( (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[1] == 0x3) &&
-		     (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[3] == 0x2) ) {
-			if ((FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[5] != 0) || 
-			    (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[4] != 0)) { 
-				cc_log(LOG_WARNING, "%s: unable to retrieve PLCI=%#x, REASON = 0x%02x%02x\n",
-					i->vname, PLCI,
-					FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[5],
-					FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[4]);
-				show_capi_info(i, read_capi_word(&FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[4]));
-			} else {
-				/* reason != 0x0000 == problem */
-				i->state = CAPI_STATE_CONNECTED;
-				i->PLCI = i->onholdPLCI;
-				i->onholdPLCI = 0;
-				cc_verbose(1, 1, VERBOSE_PREFIX_3 "%s: PLCI=%#x retrieved\n",
-					i->vname, PLCI);
-				cc_start_b3(i);
-			}
-		}
-		
-		/* HOLD */
-		if ( (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[1] == 0x2) &&
-		     (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[3] == 0x2) ) {
-			if ((FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[5] != 0) || 
-			    (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[4] != 0)) { 
-				/* reason != 0x0000 == problem */
-				i->onholdPLCI = 0;
-				cc_log(LOG_WARNING, "%s: unable to put PLCI=%#x onhold, REASON = 0x%02x%02x, maybe you need to subscribe for this...\n",
-					i->vname, PLCI,
-					FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[5],
-					FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[4]);
-				show_capi_info(i, read_capi_word(&FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG)[4]));
-			} else {
-				/* reason = 0x0000 == call on hold */
-				i->state = CAPI_STATE_ONHOLD;
-				cc_verbose(1, 1, VERBOSE_PREFIX_3 "%s: PLCI=%#x put onhold\n",
-					i->vname, PLCI);
-			}
-		}
+	if (!resp_done) {
+		capi_sendf(NULL, 0, CAPI_FACILITY_RESP, PLCI, HEADER_MSGNUM(CMSG),
+			"w()",
+			FACILITY_IND_FACILITYSELECTOR(CMSG)
+		);
 	}
-	return;
 }
 
 /*
@@ -3420,8 +2960,6 @@ static void capidev_handle_facility_indication(_cmsg *CMSG, unsigned int PLCI, u
  */
 static void capidev_handle_data_b3_indication(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
 {
-	_cmsg CMSG2;
-	struct ast_channel *chan;
 	struct ast_frame fr = { AST_FRAME_NULL, };
 	unsigned char *b3buf = NULL;
 	int b3len = 0;
@@ -3438,14 +2976,10 @@ static void capidev_handle_data_b3_indication(_cmsg *CMSG, unsigned int PLCI, un
 	}
 	
 	/* send a DATA_B3_RESP very quickly to free the buffer in capi */
-	DATA_B3_RESP_HEADER(&CMSG2, capi_ApplID, HEADER_MSGNUM(CMSG), 0);
-	DATA_B3_RESP_NCCI(&CMSG2) = NCCI;
-	DATA_B3_RESP_DATAHANDLE(&CMSG2) = DATA_B3_IND_DATAHANDLE(CMSG);
-	_capi_put_cmsg(&CMSG2);
+	capi_sendf(NULL, 0, CAPI_DATA_B3_RESP, NCCI, HEADER_MSGNUM(CMSG),
+		"w", DATA_B3_IND_DATAHANDLE(CMSG));
 
 	return_on_no_interface("DATA_B3_IND");
-
-	chan = i->owner;
 
 	if (i->fFax) {
 		/* we are in fax mode and have a file open */
@@ -3483,13 +3017,13 @@ static void capidev_handle_data_b3_indication(_cmsg *CMSG, unsigned int PLCI, un
 		i->B3q += b3len;
 	}
 
-	if ((i->doES == 1) && (!tcap_is_digital(chan->transfercapability))) {
+	if ((i->doES == 1) && (!capi_tcap_is_digital(i->transfercapability))) {
 		for (j = 0; j < b3len; j++) {
-			*(b3buf + j) = reversebits[*(b3buf + j)]; 
+			*(b3buf + j) = capi_reversebits[*(b3buf + j)]; 
 			if (capi_capability == AST_FORMAT_ULAW) {
-				rxavg += abs(capiULAW2INT[ reversebits[*(b3buf + j)]]);
+				rxavg += abs(capiULAW2INT[ capi_reversebits[*(b3buf + j)]]);
 			} else {
-				rxavg += abs(capiALAW2INT[ reversebits[*(b3buf + j)]]);
+				rxavg += abs(capiALAW2INT[ capi_reversebits[*(b3buf + j)]]);
 			}
 		}
 		rxavg = rxavg / j;
@@ -3508,13 +3042,13 @@ static void capidev_handle_data_b3_indication(_cmsg *CMSG, unsigned int PLCI, un
 					i->vname, rxavg, txavg);
 		}
 	} else {
-		if ((i->rxgain == 1.0) || (tcap_is_digital(chan->transfercapability))) {
+		if ((i->rxgain == 1.0) || (capi_tcap_is_digital(i->transfercapability))) {
 			for (j = 0; j < b3len; j++) {
-				*(b3buf + j) = reversebits[*(b3buf + j)];
+				*(b3buf + j) = capi_reversebits[*(b3buf + j)];
 			}
 		} else {
 			for (j = 0; j < b3len; j++) {
-				*(b3buf + j) = reversebits[i->g.rxgains[*(b3buf + j)]];
+				*(b3buf + j) = capi_reversebits[i->g.rxgains[*(b3buf + j)]];
 			}
 		}
 	}
@@ -3556,7 +3090,6 @@ static void capidev_send_faxdata(struct capi_pvt *i)
 #endif
 	unsigned char faxdata[CAPI_MAX_B3_BLOCK_SIZE];
 	size_t len;
-	_cmsg CMSG;
 
 	if (i->NCCI == 0) {
 		cc_verbose(3, 0, VERBOSE_PREFIX_3 "%s: send_faxdata on NCCI = 0.\n",
@@ -3573,16 +3106,11 @@ static void capidev_send_faxdata(struct capi_pvt *i)
 	if ((i->fFax) && (!(feof(i->fFax)))) {
 		len = fread(faxdata, 1, CAPI_MAX_B3_BLOCK_SIZE, i->fFax);
 		if (len > 0) {
-			DATA_B3_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-			DATA_B3_REQ_NCCI(&CMSG) = i->NCCI;
-			DATA_B3_REQ_DATALENGTH(&CMSG) = len;
-			DATA_B3_REQ_FLAGS(&CMSG) = 0; 
-			DATA_B3_REQ_DATAHANDLE(&CMSG) = i->send_buffer_handle;
-			DATA_B3_REQ_DATA(&CMSG) = faxdata;
 			i->send_buffer_handle++;
+			capi_sendf(NULL, 0, CAPI_DATA_B3_REQ, i->NCCI, get_capi_MessageNumber(),
+				"dwww", faxdata, len, i->send_buffer_handle, 0);
 			cc_verbose(5, 1, VERBOSE_PREFIX_3 "%s: send %d fax bytes.\n",
 				i->vname, len);
-			_capi_put_cmsg(&CMSG);
 #ifndef CC_AST_HAS_VERSION_1_4
 			local_queue_frame(i, &fr);
 #endif
@@ -3592,9 +3120,8 @@ static void capidev_send_faxdata(struct capi_pvt *i)
 	/* finished send fax, so we hangup */
 	cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: completed faxsend.\n",
 		i->vname);
-	DISCONNECT_B3_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-	DISCONNECT_B3_REQ_NCCI(&CMSG) = i->NCCI;
-	_capi_put_cmsg(&CMSG);
+	capi_sendf(NULL, 0, CAPI_DISCONNECT_B3_REQ, i->NCCI, get_capi_MessageNumber(),
+		"()");
 }
 
 /*
@@ -3602,12 +3129,8 @@ static void capidev_send_faxdata(struct capi_pvt *i)
  */
 static void capidev_handle_manufacturer_indication(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
 {
-	_cmsg CMSG2;
-	
-	MANUFACTURER_RESP_HEADER(&CMSG2, capi_ApplID, HEADER_MSGNUM(CMSG), 0);
-	MANUFACTURER_RESP_CONTROLLER(&CMSG2) = MANUFACTURER_IND_CONTROLLER(CMSG);
-	MANUFACTURER_RESP_MANUID(&CMSG2) = MANUFACTURER_IND_MANUID(CMSG);
-	_capi_put_cmsg(&CMSG2);
+	capi_sendf(NULL, 0, CAPI_MANUFACTURER_RESP, MANUFACTURER_IND_CONTROLLER(CMSG), HEADER_MSGNUM(CMSG),
+		"d", MANUFACTURER_IND_MANUID(CMSG));
 	
 	return_on_no_interface("MANUFACTURER_IND");
 
@@ -3622,11 +3145,7 @@ static void capidev_handle_manufacturer_indication(_cmsg *CMSG, unsigned int PLC
  */
 static void capidev_handle_connect_active_indication(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
 {
-	_cmsg CMSG2;
-	
-	CONNECT_ACTIVE_RESP_HEADER(&CMSG2, capi_ApplID, HEADER_MSGNUM(CMSG), 0);
-	CONNECT_ACTIVE_RESP_PLCI(&CMSG2) = PLCI;
-	_capi_put_cmsg(&CMSG2);
+	capi_sendf(NULL, 0, CAPI_CONNECT_ACTIVE_RESP, PLCI, HEADER_MSGNUM(CMSG), "");
 	
 	return_on_no_interface("CONNECT_ACTIVE_IND");
 
@@ -3656,6 +3175,15 @@ static void capidev_handle_connect_active_indication(_cmsg *CMSG, unsigned int P
 		/* send a CONNECT_B3_REQ */
 		if (i->outgoing == 1) {
 			/* outgoing call */
+			if (i->channeltype == CAPI_CHANNELTYPE_NULL) {
+				/* NULL-PLCI needs a virtual connection */
+				capi_sendf(NULL, 0, CAPI_FACILITY_REQ, PLCI, get_capi_MessageNumber(),
+					"w(w(d()))",
+					FACILITYSELECTOR_LINE_INTERCONNECT,
+					0x0001, /* CONNECT */
+					0x0000000c /* mask */
+				);
+			}
 			cc_start_b3(i);
 		} else {
 			/* incoming call */
@@ -3672,16 +3200,13 @@ static void capidev_handle_connect_active_indication(_cmsg *CMSG, unsigned int P
  */
 static void capidev_handle_connect_b3_active_indication(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
 {
-	_cmsg CMSG2;
-
-	/* then send a CONNECT_B3_ACTIVE_RESP */
-	CONNECT_B3_ACTIVE_RESP_HEADER(&CMSG2, capi_ApplID, HEADER_MSGNUM(CMSG), 0);
-	CONNECT_B3_ACTIVE_RESP_NCCI(&CMSG2) = NCCI;
-	_capi_put_cmsg(&CMSG2);
+	capi_sendf(NULL, 0, CAPI_CONNECT_B3_ACTIVE_RESP, NCCI, HEADER_MSGNUM(CMSG), "");
 
 	return_on_no_interface("CONNECT_ACTIVE_B3_IND");
 
-	capi_controllers[i->controller]->nfreebchannels--;
+	if (i->channeltype != CAPI_CHANNELTYPE_NULL) {
+		capi_controllers[i->controller]->nfreebchannels--;
+	}
 
 	if (i->state == CAPI_STATE_DISCONNECTING) {
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: CONNECT_B3_ACTIVE_IND during disconnect for NCCI %#x\n",
@@ -3713,19 +3238,13 @@ static void capidev_handle_connect_b3_active_indication(_cmsg *CMSG, unsigned in
 		return;
 	}
 
-	if (!i->owner) {
-		cc_log(LOG_ERROR, "%s: No channel for interface!\n",
-			i->vname);
-		return;
-	}
-
 	if (i->FaxState & CAPI_FAX_STATE_ACTIVE) {
 		i->FaxState |= CAPI_FAX_STATE_CONN;
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: Fax connection, no EC/DTMF\n",
 			i->vname);
 	} else {
-		capi_echo_canceller(i->owner, EC_FUNCTION_ENABLE);
-		capi_detect_dtmf(i->owner, 1);
+		capi_echo_canceller(i, EC_FUNCTION_ENABLE);
+		capi_detect_dtmf(i, 1);
 	}
 
 	if (i->state == CAPI_STATE_CONNECTED) {
@@ -3739,11 +3258,7 @@ static void capidev_handle_connect_b3_active_indication(_cmsg *CMSG, unsigned in
  */
 static void capidev_handle_disconnect_b3_indication(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
 {
-	_cmsg CMSG2;
-
-	DISCONNECT_B3_RESP_HEADER(&CMSG2, capi_ApplID, HEADER_MSGNUM(CMSG), 0);
-	DISCONNECT_B3_RESP_NCCI(&CMSG2) = NCCI;
-	_capi_put_cmsg(&CMSG2);
+	capi_sendf(NULL, 0, CAPI_DISCONNECT_B3_RESP, NCCI, HEADER_MSGNUM(CMSG), "");
 
 	return_on_no_interface("DISCONNECT_B3_IND");
 
@@ -3781,16 +3296,19 @@ static void capidev_handle_disconnect_b3_indication(_cmsg *CMSG, unsigned int PL
 		}
 	}
 
-	if ((i->state == CAPI_STATE_DISCONNECTING) ||
-	    ((!(i->isdnstate & CAPI_ISDN_STATE_B3_SELECT)) &&
-	     (i->FaxState & CAPI_FAX_STATE_SENDMODE))) {
-		/* active disconnect */
-		DISCONNECT_REQ_HEADER(&CMSG2, capi_ApplID, get_capi_MessageNumber(), 0);
-		DISCONNECT_REQ_PLCI(&CMSG2) = PLCI;
-		_capi_put_cmsg(&CMSG2);
+	if ((i->state == CAPI_STATE_DISCONNECTING)) {
+		if (!(i->isdnstate & CAPI_ISDN_STATE_STAYONLINE)) {
+			/* active disconnect */
+			capi_send_disconnect(PLCI, NULL);
+		}
+	} else if ((!(i->isdnstate & CAPI_ISDN_STATE_B3_SELECT)) &&
+	           (i->FaxState & CAPI_FAX_STATE_SENDMODE)) {
+		capi_send_disconnect(PLCI, NULL);
 	}
 
-	capi_controllers[i->controller]->nfreebchannels++;
+	if (i->channeltype != CAPI_CHANNELTYPE_NULL) {
+		capi_controllers[i->controller]->nfreebchannels++;
+	}
 }
 
 /*
@@ -3798,14 +3316,10 @@ static void capidev_handle_disconnect_b3_indication(_cmsg *CMSG, unsigned int PL
  */
 static void capidev_handle_connect_b3_indication(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
 {
-	_cmsg CMSG2;
-
-	/* then send a CONNECT_B3_RESP */
-	CONNECT_B3_RESP_HEADER(&CMSG2, capi_ApplID, HEADER_MSGNUM(CMSG), 0);
-	CONNECT_B3_RESP_NCCI(&CMSG2) = NCCI;
-	CONNECT_B3_RESP_REJECT(&CMSG2) = 0;
-	CONNECT_B3_RESP_NCPI(&CMSG2) = capi_rtp_ncpi(i);
-	_capi_put_cmsg(&CMSG2);
+	capi_sendf(NULL, 0, CAPI_CONNECT_B3_RESP, NCCI, HEADER_MSGNUM(CMSG),
+		"ws",
+		0x0000, /* accept */
+		capi_rtp_ncpi(i));
 
 	return_on_no_interface("CONNECT_B3_IND");
 
@@ -3820,13 +3334,10 @@ static void capidev_handle_connect_b3_indication(_cmsg *CMSG, unsigned int PLCI,
  */
 static void capidev_handle_disconnect_indication(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
 {
-	_cmsg CMSG2;
 	struct ast_frame fr = { AST_FRAME_CONTROL, AST_CONTROL_HANGUP, };
 	int state;
 
-	DISCONNECT_RESP_HEADER(&CMSG2, capi_ApplID, HEADER_MSGNUM(CMSG) , 0);
-	DISCONNECT_RESP_PLCI(&CMSG2) = PLCI;
-	_capi_put_cmsg(&CMSG2);
+	capi_sendf(NULL, 0, CAPI_DISCONNECT_RESP, PLCI, HEADER_MSGNUM(CMSG), "");
 	
 	show_capi_info(i, DISCONNECT_IND_REASON(CMSG));
 
@@ -3891,9 +3402,9 @@ static void capidev_handle_disconnect_indication(_cmsg *CMSG, unsigned int PLCI,
 static void capidev_handle_connect_indication(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt **interface)
 {
 	struct capi_pvt *i;
-	_cmsg CMSG2;
 	char *DNID;
 	char *CID;
+	char *KEYPAD = NULL;
 	int callernplan = 0, callednplan = 0;
 	int controller = 0;
 	char *msn;
@@ -3915,10 +3426,20 @@ static void capidev_handle_connect_indication(_cmsg *CMSG, unsigned int PLCI, un
 		return;
 	}
 
+	if (CONNECT_IND_KEYPADFACILITY(CMSG)) {
+		KEYPAD = capi_number(CONNECT_IND_KEYPADFACILITY(CMSG), 0);
+	}
 	DNID = capi_number(CONNECT_IND_CALLEDPARTYNUMBER(CMSG), 1);
 	if (!DNID) {
-		DNID = emptydnid;
+		if (!KEYPAD) {
+			DNID = emptydnid;
+		} else {
+			/* if keypad is signaled instead, use it as DID with 'K' */
+			DNID = alloca(AST_MAX_EXTENSION);
+			snprintf(DNID, AST_MAX_EXTENSION -1, "K%s", KEYPAD);
+		}
 	}
+
 	if (CONNECT_IND_CALLEDPARTYNUMBER(CMSG)[0] > 1) {
 		callednplan = (CONNECT_IND_CALLEDPARTYNUMBER(CMSG)[1] & 0x7f);
 	}
@@ -3933,15 +3454,15 @@ static void capidev_handle_connect_indication(_cmsg *CMSG, unsigned int PLCI, un
 	cc_verbose(1, 1, VERBOSE_PREFIX_3 "CONNECT_IND (PLCI=%#x,DID=%s,CID=%s,CIP=%#x,CONTROLLER=%#x)\n",
 		PLCI, DNID, CID, CONNECT_IND_CIPVALUE(CMSG), controller);
 
-	if (CONNECT_IND_BCHANNELINFORMATION(CMSG)) {
+	if (CONNECT_IND_BCHANNELINFORMATION(CMSG) && (CONNECT_IND_BCHANNELINFORMATION(CMSG)[0] > 0)) {
 		bchannelinfo[0] = CONNECT_IND_BCHANNELINFORMATION(CMSG)[1] + '0';
 	}
 
 	/* well...somebody is calling us. let's set up a channel */
 	cc_mutex_lock(&iflock);
-	for (i = iflist; i; i = i->next) {
-		if (i->owner) {
-			/* has already owner */
+	for (i = capi_iflist; i; i = i->next) {
+		if (i->used) {
+			/* is already used */
 			continue;
 		}
 		if (i->controller != controller) {
@@ -4005,8 +3526,9 @@ static void capidev_handle_connect_indication(_cmsg *CMSG, unsigned int PLCI, un
 				interface_cleanup(i);
 				break;
 			}
- 			i->owner->transfercapability = cip2tcap(i->cip);
-			if (tcap_is_digital(i->owner->transfercapability)) {
+			i->transfercapability = cip2tcap(i->cip);
+ 			i->owner->transfercapability = i->transfercapability;
+			if (capi_tcap_is_digital(i->transfercapability)) {
 				i->bproto = CC_BPROTO_TRANSPARENT;
 			}
 			i->owner->cid.cid_pres = callpres;
@@ -4017,7 +3539,7 @@ static void capidev_handle_connect_indication(_cmsg *CMSG, unsigned int PLCI, un
 			cc_mutex_unlock(&iflock);
 			cc_mutex_lock(&i->lock);
 		
-			pbx_builtin_setvar_helper(i->owner, "TRANSFERCAPABILITY", transfercapability2str(i->owner->transfercapability));
+			pbx_builtin_setvar_helper(i->owner, "TRANSFERCAPABILITY", transfercapability2str(i->transfercapability));
 			pbx_builtin_setvar_helper(i->owner, "BCHANNELINFO", bchannelinfo);
 			sprintf(buffer, "%d", callednplan);
 			pbx_builtin_setvar_helper(i->owner, "CALLEDTON", buffer);
@@ -4035,9 +3557,8 @@ static void capidev_handle_connect_indication(_cmsg *CMSG, unsigned int PLCI, un
 			pbx_builtin_setvar_helper(i->owner, "SECONDCALLERID", buffer);
 			*/
 
-			if (i->qsigfeat != QSIG_DISABLED) {
-				cc_qsig_handle_capiind(CONNECT_IND_FACILITYDATAARRAY(CMSG), i);
-			}
+			/* Handle QSIG informations, if any */
+			cc_qsig_handle_capiind(CONNECT_IND_FACILITYDATAARRAY(CMSG), i);
 			
 			if ((i->isdnmode == CAPI_ISDNMODE_MSN) && (i->immediate)) {
 				/* if we don't want to wait for SETUP/SENDING-COMPLETE in MSN mode */
@@ -4054,53 +3575,45 @@ static void capidev_handle_connect_indication(_cmsg *CMSG, unsigned int PLCI, un
 		cc_log(LOG_WARNING, "did not find device for msn = %s\n", DNID);
 	}
 	
-	CONNECT_RESP_HEADER(&CMSG2, capi_ApplID, HEADER_MSGNUM(CMSG), 0);
-	CONNECT_RESP_PLCI(&CMSG2) = CONNECT_IND_PLCI(CMSG);
-	CONNECT_RESP_REJECT(&CMSG2) = 1; /* ignore */
-	_capi_put_cmsg(&CMSG2);
+	capi_sendf(NULL, 0, CAPI_CONNECT_RESP, CONNECT_IND_PLCI(CMSG), HEADER_MSGNUM(CMSG),
+			"w()()()()()", 1 /* ignore */);
 	return;
 }
 
 /*
  * CAPI FACILITY_CONF
  */
-static void capidev_handle_facility_confirmation(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
+static void capidev_handle_facility_confirmation(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt **i)
 {
 	int selector;
 
-	if (i == NULL)
-		return;
-
 	selector = FACILITY_CONF_FACILITYSELECTOR(CMSG);
+
+	if (selector == FACILITYSELECTOR_SUPPLEMENTARY) {
+		handle_facility_confirmation_supplementary(CMSG, PLCI, NCCI, i);
+		return;
+	}
+	
+	if (*i == NULL)
+		return;
 
 	if (selector == FACILITYSELECTOR_DTMF) {
 		cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: DTMF conf(PLCI=%#x)\n",
-			i->vname, PLCI);
+			(*i)->vname, PLCI);
 		return;
 	}
-	if (selector == i->ecSelector) {
+	if (selector == (*i)->ecSelector) {
 		if (FACILITY_CONF_INFO(CMSG)) {
 			cc_verbose(2, 0, VERBOSE_PREFIX_3 "%s: Error setting up echo canceller (PLCI=%#x)\n",
-				i->vname, PLCI);
+				(*i)->vname, PLCI);
 			return;
 		}
 		if (FACILITY_CONF_FACILITYCONFIRMATIONPARAMETER(CMSG)[1] == EC_FUNCTION_DISABLE) {
 			cc_verbose(3, 0, VERBOSE_PREFIX_3 "%s: Echo canceller successfully disabled (PLCI=%#x)\n",
-				i->vname, PLCI);
+				(*i)->vname, PLCI);
 		} else {
 			cc_verbose(3, 0, VERBOSE_PREFIX_3 "%s: Echo canceller successfully set up (PLCI=%#x)\n",
-				i->vname, PLCI);
-		}
-		return;
-	}
-	if (selector == FACILITYSELECTOR_SUPPLEMENTARY) {
-		/* HOLD */
-		if ((FACILITY_CONF_FACILITYCONFIRMATIONPARAMETER(CMSG)[1] == 0x2) &&
-		    (FACILITY_CONF_FACILITYCONFIRMATIONPARAMETER(CMSG)[2] == 0x0) &&
-		    ((FACILITY_CONF_FACILITYCONFIRMATIONPARAMETER(CMSG)[4] != 0x0) ||
-		     (FACILITY_CONF_FACILITYCONFIRMATIONPARAMETER(CMSG)[5] != 0x0))) {
-			cc_verbose(2, 0, VERBOSE_PREFIX_3 "%s: Call on hold (PLCI=%#x)\n",
-				i->vname, PLCI);
+				(*i)->vname, PLCI);
 		}
 		return;
 	}
@@ -4109,18 +3622,18 @@ static void capidev_handle_facility_confirmation(_cmsg *CMSG, unsigned int PLCI,
 		    (FACILITY_CONF_FACILITYCONFIRMATIONPARAMETER(CMSG)[2] == 0x0)) {
 			/* enable */
 			if (FACILITY_CONF_FACILITYCONFIRMATIONPARAMETER(CMSG)[0] > 12) {
-				show_capi_info(i, read_capi_word(&FACILITY_CONF_FACILITYCONFIRMATIONPARAMETER(CMSG)[12]));
+				show_capi_info(*i, read_capi_word(&FACILITY_CONF_FACILITYCONFIRMATIONPARAMETER(CMSG)[12]));
 			}
 		} else {
 			/* disable */
 			if (FACILITY_CONF_FACILITYCONFIRMATIONPARAMETER(CMSG)[0] > 12) {
-				show_capi_info(i, read_capi_word(&FACILITY_CONF_FACILITYCONFIRMATIONPARAMETER(CMSG)[12]));
+				show_capi_info(*i, read_capi_word(&FACILITY_CONF_FACILITYCONFIRMATIONPARAMETER(CMSG)[12]));
 			}
 		}
 		return;
 	}
 	cc_log(LOG_ERROR, "%s: unhandled FACILITY_CONF 0x%x\n",
-		i->vname, FACILITY_CONF_FACILITYSELECTOR(CMSG));
+		(*i)->vname, FACILITY_CONF_FACILITYSELECTOR(CMSG));
 }
 
 /*
@@ -4195,6 +3708,39 @@ static void capidev_post_handling(struct capi_pvt *i, _cmsg *CMSG)
 }
 
 /*
+ * handle CONNECT_CONF or FACILITY_CONF(CCBS call)
+ */
+void capidev_handle_connection_conf(struct capi_pvt **i, unsigned int PLCI,
+	unsigned short wInfo, unsigned short wMsgNum)
+{
+	struct capi_pvt *ii;
+	struct ast_frame fr = { AST_FRAME_CONTROL, AST_CONTROL_BUSY, };
+
+	if (*i) {
+		cc_log(LOG_ERROR, "CAPI: CONNECT_CONF for already "
+			"defined interface received\n");
+		return;
+	}
+	*i = capi_find_interface_by_msgnum(wMsgNum);
+	ii = *i;
+	if (ii == NULL) {
+		return;
+	}
+	cc_verbose(1, 1, VERBOSE_PREFIX_3 "%s: received CONNECT_CONF PLCI = %#x\n",
+		ii->vname, PLCI);
+	cc_mutex_lock(&ii->lock);
+	if (wInfo == 0) {
+		ii->PLCI = PLCI;
+	} else {
+		/* error in connect, so set correct state and signal busy */
+		ii->state = CAPI_STATE_DISCONNECTED;
+		if (ii->owner) {
+			local_queue_frame(ii, &fr);
+		}
+	}
+}
+
+/*
  * handle CAPI msg
  */
 static void capidev_handle_msg(_cmsg *CMSG)
@@ -4204,7 +3750,7 @@ static void capidev_handle_msg(_cmsg *CMSG)
 	unsigned short wCmd = HEADER_CMD(CMSG);
 	unsigned short wMsgNum = HEADER_MSGNUM(CMSG);
 	unsigned short wInfo = 0xffff;
-	struct capi_pvt *i = find_interface_by_plci(PLCI);
+	struct capi_pvt *i = capi_find_interface_by_plci(PLCI);
 
 	if ((wCmd == CAPI_P_IND(DATA_B3)) ||
 	    (wCmd == CAPI_P_CONF(DATA_B3))) {
@@ -4260,28 +3806,11 @@ static void capidev_handle_msg(_cmsg *CMSG)
 
 	case CAPI_P_CONF(FACILITY):
 		wInfo = FACILITY_CONF_INFO(CMSG);
-		capidev_handle_facility_confirmation(CMSG, PLCI, NCCI, i);
+		capidev_handle_facility_confirmation(CMSG, PLCI, NCCI, &i);
 		break;
 	case CAPI_P_CONF(CONNECT):
 		wInfo = CONNECT_CONF_INFO(CMSG);
-		if (i) {
-			cc_log(LOG_ERROR, "CAPI: CONNECT_CONF for already "
-				"defined interface received\n");
-			break;
-		}
-		i = find_interface_by_msgnum(wMsgNum);
-		if ((i == NULL) || (!i->owner))
-			break;
-		cc_verbose(1, 1, VERBOSE_PREFIX_3 "%s: received CONNECT_CONF PLCI = %#x\n",
-			i->vname, PLCI);
-		if (wInfo == 0) {
-			i->PLCI = PLCI;
-		} else {
-			/* error in connect, so set correct state and signal busy */
-			i->state = CAPI_STATE_DISCONNECTED;
-			struct ast_frame fr = { AST_FRAME_CONTROL, AST_CONTROL_BUSY, };
-			local_queue_frame(i, &fr);
-		}
+		capidev_handle_connection_conf(&i, PLCI, wInfo, wMsgNum);
 		break;
 	case CAPI_P_CONF(CONNECT_B3):
 		wInfo = CONNECT_B3_CONF_INFO(CMSG);
@@ -4314,8 +3843,8 @@ static void capidev_handle_msg(_cmsg *CMSG)
 				cc_start_b3(i);
 			}
 			if ((i->owner) && (i->FaxState & CAPI_FAX_STATE_ACTIVE)) {
-				capi_echo_canceller(i->owner, EC_FUNCTION_DISABLE);
-				capi_detect_dtmf(i->owner, 0);
+				capi_echo_canceller(i, EC_FUNCTION_DISABLE);
+				capi_detect_dtmf(i, 0);
 			}
 		} else {
 			i->isdnstate &= ~CAPI_ISDN_STATE_B3_PEND;
@@ -4379,11 +3908,9 @@ static void capidev_handle_msg(_cmsg *CMSG)
 static int pbx_capi_call_deflect(struct ast_channel *c, char *param)
 {
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
-	_cmsg	CMSG;
-	char	fac[64];
-	int	res = 0;
 	char *number;
 	int numberlen;
+	char facnumber[32];
 
 	if (!param) {
 		cc_log(LOG_WARNING, "capi deflection requires an argument (destination phone number)\n");
@@ -4418,34 +3945,48 @@ static int pbx_capi_call_deflect(struct ast_channel *c, char *param)
 	if (i->state != CAPI_STATE_ALERTING) {
 		pbx_capi_alert(c);
 	}
-	
-	fac[0] = 0x0a + numberlen; /* length */
-	fac[1] = 0x0d; /* call deflection */
-	fac[2] = 0x00;
-	fac[3] = 0x07 + numberlen; /* struct len */
-	fac[4] = 0x01; /* display of own address allowed */
-	fac[5] = 0x00;
-	fac[6] = 0x03 + numberlen;
-	fac[7] = 0x00; /* type of facility number */
-	fac[8] = 0x00; /* number plan */
-	fac[9] = 0x00; /* presentation allowed */
-	fac[10 + numberlen] = 0x00; /* subaddress len */
 
-	memcpy((unsigned char *)fac + 10, number, numberlen);
-
-	FACILITY_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(),0);
-	FACILITY_REQ_PLCI(&CMSG) = i->PLCI;
-	FACILITY_REQ_FACILITYSELECTOR(&CMSG) = FACILITYSELECTOR_SUPPLEMENTARY;
-	FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)&fac;
+	facnumber[0] = 0x03 + numberlen; 
+	facnumber[1] = 0x00; /* type of facility number */
+	facnumber[2] = 0x00; /* number plan */
+	facnumber[3] = 0x00; /* presentation allowed */
+	memcpy(&facnumber[4], number, numberlen);
 	
-	_capi_put_cmsg_wait_conf(i, &CMSG);
+	capi_sendf(i, 1, CAPI_FACILITY_REQ, i->PLCI, get_capi_MessageNumber(),
+		"w(w(ws()))",
+		FACILITYSELECTOR_SUPPLEMENTARY,
+		0x000d,  /* call deflection */
+		0x0001,  /* display of own address allowed */
+		&facnumber[0]
+	);
 
 	cc_mutex_unlock(&i->lock);
 
 	cc_verbose(2, 1, VERBOSE_PREFIX_3 "%s: sent FACILITY_REQ for CD PLCI = %#x\n",
 		i->vname, i->PLCI);
 
-	return(res);
+	return 0;
+}
+
+/*
+ * store the peer for future actions 
+ */
+static int pbx_capi_peer_link(struct ast_channel *c, char *param)
+{
+	char buffer[32];
+	int id;
+
+	id = cc_add_peer_link_id(c);
+
+	if (id >= 0) {
+		snprintf(buffer, sizeof(buffer) - 1, "%d", id);
+		pbx_builtin_setvar_helper(c, "_CAPIPEERLINKID", buffer);
+	}
+
+	cc_verbose(2, 1, VERBOSE_PREFIX_3 "Added %s as CAPI peer link.\n",
+		c->name);
+
+	return 0;
 }
 
 /*
@@ -4454,8 +3995,6 @@ static int pbx_capi_call_deflect(struct ast_channel *c, char *param)
 static int pbx_capi_retrieve(struct ast_channel *c, char *param)
 {
 	struct capi_pvt *i = CC_CHANNEL_PVT(c); 
-	_cmsg	CMSG;
-	char	fac[4];
 	unsigned int plci = 0;
 
 	if (c->tech == &capi_tech) {
@@ -4467,7 +4006,7 @@ static int pbx_capi_retrieve(struct ast_channel *c, char *param)
 	if (param) {
 		plci = (unsigned int)strtoul(param, NULL, 0);
 		cc_mutex_lock(&iflock);
-		for (i = iflist; i; i = i->next) {
+		for (i = capi_iflist; i; i = i->next) {
 			if (i->onholdPLCI == plci)
 				break;
 		}
@@ -4506,21 +4045,23 @@ static int pbx_capi_retrieve(struct ast_channel *c, char *param)
 		return -1;
 	}
 
-	fac[0] = 3;	/* len */
-	fac[1] = 0x03;	/* retrieve */
-	fac[2] = 0x00;
-	fac[3] = 0;	
+	if (param != NULL)
+		cc_mutex_lock(&i->lock);
 
-	FACILITY_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(),0);
-	FACILITY_REQ_PLCI(&CMSG) = plci;
-	FACILITY_REQ_FACILITYSELECTOR(&CMSG) = FACILITYSELECTOR_SUPPLEMENTARY;
-	FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)&fac;
+	capi_sendf(i, (param == NULL) ? 0:1, CAPI_FACILITY_REQ, plci, get_capi_MessageNumber(),
+		"w(w())",
+		FACILITYSELECTOR_SUPPLEMENTARY,
+		0x0003  /* retrieve */
+	);
+	
+	i->isdnstate &= ~CAPI_ISDN_STATE_HOLD;
 
-	_capi_put_cmsg(&CMSG);
+	if (param != NULL)
+		cc_mutex_unlock(&i->lock);
+
 	cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: sent RETRIEVE for PLCI=%#x\n",
 		i->vname, plci);
 
-	i->isdnstate &= ~CAPI_ISDN_STATE_HOLD;
 	pbx_builtin_setvar_helper(i->owner, "_CALLERHOLDID", NULL);
 
 	return 0;
@@ -4533,17 +4074,19 @@ static int pbx_capi_ect(struct ast_channel *c, char *param)
 {
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
 	struct capi_pvt *ii = NULL;
-	_cmsg CMSG;
-	char fac[8];
 	const char *id;
 	unsigned int plci = 0;
+	unsigned int ectplci;
+	char *holdid;
 
 	if ((id = pbx_builtin_getvar_helper(c, "CALLERHOLDID"))) {
 		plci = (unsigned int)strtoul(id, NULL, 0);
 	}
 	
-	if (param) {
-		plci = (unsigned int)strtoul(param, NULL, 0);
+	holdid = strsep(&param, "|");
+
+	if (holdid) {
+		plci = (unsigned int)strtoul(holdid, NULL, 0);
 	}
 
 	if (!plci) {
@@ -4552,7 +4095,7 @@ static int pbx_capi_ect(struct ast_channel *c, char *param)
 	}
 
 	cc_mutex_lock(&iflock);
-	for (ii = iflist; ii; ii = ii->next) {
+	for (ii = capi_iflist; ii; ii = ii->next) {
 		if (ii->onholdPLCI == plci)
 			break;
 	}
@@ -4564,8 +4107,13 @@ static int pbx_capi_ect(struct ast_channel *c, char *param)
 		return -1;
 	}
 
+	ectplci = plci;
+	if ((param) && (*param == 'x')) {
+		ectplci = i->PLCI;
+	}
+
 	cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: using PLCI=%#x for ECT\n",
-		i->vname, plci);
+		i->vname, ectplci);
 
 	if (!(capi_controllers[i->controller]->ECT)) {
 		cc_log(LOG_WARNING, "%s: ECT for %s not supported by controller.\n",
@@ -4587,21 +4135,16 @@ static int pbx_capi_ect(struct ast_channel *c, char *param)
 		return -1;
 	}
 
-	fac[0] = 7;	/* len */
-	fac[1] = 0x06;	/* ECT (function) */
-	fac[2] = 0x00;
-	fac[3] = 4;	/* len / sservice specific parameter , cstruct */
-	write_capi_dword(&(fac[4]), plci);
-
-	FACILITY_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-	FACILITY_REQ_CONTROLLER(&CMSG) = i->controller;
-	FACILITY_REQ_PLCI(&CMSG) = plci; /* implicit ECT */
-	FACILITY_REQ_FACILITYSELECTOR(&CMSG) = FACILITYSELECTOR_SUPPLEMENTARY;
-	FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)&fac;
-
 	cc_mutex_lock(&ii->lock);
-	_capi_put_cmsg_wait_conf(ii, &CMSG);
-	
+
+    /* implicit ECT */
+	capi_sendf(ii, 1, CAPI_FACILITY_REQ, ectplci, get_capi_MessageNumber(),
+		"w(w(d))",
+		FACILITYSELECTOR_SUPPLEMENTARY,
+		0x0006,  /* ECT */
+		plci
+	);
+
 	ii->isdnstate &= ~CAPI_ISDN_STATE_HOLD;
 	ii->isdnstate |= CAPI_ISDN_STATE_ECT;
 	i->isdnstate |= CAPI_ISDN_STATE_ECT;
@@ -4609,7 +4152,7 @@ static int pbx_capi_ect(struct ast_channel *c, char *param)
 	cc_mutex_unlock(&ii->lock);
 
 	cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: sent ECT for PLCI=%#x to PLCI=%#x\n",
-		i->vname, plci, i->PLCI);
+		i->vname, plci, ectplci);
 
 	return 0;
 }
@@ -4620,9 +4163,7 @@ static int pbx_capi_ect(struct ast_channel *c, char *param)
 static int pbx_capi_hold(struct ast_channel *c, char *param)
 {
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
-	_cmsg	CMSG;
 	char buffer[16];
-	char	fac[4];
 
 	/*  TODO: support holdtype notify */
 
@@ -4643,22 +4184,21 @@ static int pbx_capi_hold(struct ast_channel *c, char *param)
 		return 0;
 	}
 
-	fac[0] = 3;	/* len */
-	fac[1] = 0x02;	/* this is a HOLD up */
-	fac[2] = 0x00;
-	fac[3] = 0;	
+	cc_mutex_lock(&i->lock);
 
-	FACILITY_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(),0);
-	FACILITY_REQ_PLCI(&CMSG) = i->PLCI;
-	FACILITY_REQ_FACILITYSELECTOR(&CMSG) = FACILITYSELECTOR_SUPPLEMENTARY;
-	FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)&fac;
-
-	_capi_put_cmsg(&CMSG);
-	cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: sent HOLD for PLCI=%#x\n",
-		i->vname, i->PLCI);
+	capi_sendf(i, 1, CAPI_FACILITY_REQ, i->PLCI, get_capi_MessageNumber(),
+		"w(w())",
+		FACILITYSELECTOR_SUPPLEMENTARY,
+		0x0002  /* hold */
+	);
 
 	i->onholdPLCI = i->PLCI;
 	i->isdnstate |= CAPI_ISDN_STATE_HOLD;
+
+	cc_mutex_unlock(&i->lock);
+
+	cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: sent HOLD for PLCI=%#x\n",
+		i->vname, i->PLCI);
 
 	snprintf(buffer, sizeof(buffer) - 1, "%d", i->PLCI);
 	if (param) {
@@ -4675,8 +4215,6 @@ static int pbx_capi_hold(struct ast_channel *c, char *param)
 static int pbx_capi_malicious(struct ast_channel *c, char *param)
 {
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
-	_cmsg	CMSG;
-	char	fac[4];
 
 	if (!(capi_controllers[i->controller]->MCID)) {
 		cc_log(LOG_NOTICE, "%s: MCID for %s not supported by controller.\n",
@@ -4684,18 +4222,14 @@ static int pbx_capi_malicious(struct ast_channel *c, char *param)
 		return -1;
 	}
 
-	fac[0] = 3;      /* len */
-	fac[1] = 0x0e;   /* MCID */
-	fac[2] = 0x00;
-	fac[3] = 0;	
-
-	FACILITY_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(),0);
-	FACILITY_REQ_PLCI(&CMSG) = i->PLCI;
-	FACILITY_REQ_FACILITYSELECTOR(&CMSG) = FACILITYSELECTOR_SUPPLEMENTARY;
-	FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)&fac;
-
 	cc_mutex_lock(&i->lock);
-	_capi_put_cmsg_wait_conf(i, &CMSG);
+
+	capi_sendf(i, 1, CAPI_FACILITY_REQ, i->PLCI, get_capi_MessageNumber(),
+		"w(w())",
+		FACILITYSELECTOR_SUPPLEMENTARY,
+		0x000e  /* MCID */
+	);
+
 	cc_mutex_unlock(&i->lock);
 
 	cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: sent MCID for PLCI=%#x\n",
@@ -4717,9 +4251,9 @@ static int pbx_capi_echocancel(struct ast_channel *c, char *param)
 	}
 	if (ast_true(param)) {
 		i->doEC = 1;
-		capi_echo_canceller(c, EC_FUNCTION_ENABLE);
+		capi_echo_canceller(i, EC_FUNCTION_ENABLE);
 	} else if (ast_false(param)) {
-		capi_echo_canceller(c, EC_FUNCTION_DISABLE);
+		capi_echo_canceller(i, EC_FUNCTION_DISABLE);
 		i->doEC = 0;
 	} else {
 		cc_log(LOG_WARNING, "Parameter for echocancel invalid.\n");
@@ -4781,12 +4315,53 @@ static int pbx_capi_holdtype(struct ast_channel *c, char *param)
 }
 
 /*
+ * send the disconnect commands to capi
+ */
+static void capi_disconnect(struct capi_pvt *i)
+{
+	cc_mutex_lock(&i->lock);
+
+	i->isdnstate &= ~CAPI_ISDN_STATE_STAYONLINE;
+	if ((i->isdnstate & CAPI_ISDN_STATE_B3_UP)) {
+		cc_disconnect_b3(i, 0);
+	} else {
+		capi_send_disconnect(i->PLCI, NULL);
+	}
+	
+	cc_mutex_unlock(&i->lock);
+}
+
+/*
+ * really hangup a channel if the stay-online mode was activated
+ */
+static int pbx_capi_realhangup(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i;
+
+	cc_mutex_lock(&iflock);
+	for (i = capi_iflist; i; i = i->next) {
+		if (i->peer == c)
+			break;
+	}
+	cc_mutex_unlock(&iflock);
+
+	if ((i) && (i->state == CAPI_STATE_DISCONNECTING)) {
+		cc_verbose(3, 1, VERBOSE_PREFIX_2 "%s: capi command hangup PLCI=0x%#x.\n",
+			i->vname, i->PLCI);
+		capi_disconnect(i);
+	}
+
+	return 0;
+}
+
+/*
  * set early-B3 (progress) for incoming connections
  * (only for NT mode)
  */
 static int pbx_capi_signal_progress(struct ast_channel *c, char *param)
 {
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
+	unsigned char fac[] = "\x04\x1e\x02\x82\x88"; /* In-Band info available */
 
 	if ((i->state != CAPI_STATE_DID) && (i->state != CAPI_STATE_INCALL)) {
 		cc_log(LOG_DEBUG, "wrong channel state to signal PROGRESS\n");
@@ -4810,6 +4385,12 @@ static int pbx_capi_signal_progress(struct ast_channel *c, char *param)
 
 	cc_select_b(i, NULL);
 
+	/* send facility for Progress 'In-Band info available' */
+	capi_sendf(NULL, 0, CAPI_INFO_REQ, i->PLCI, get_capi_MessageNumber(),
+		"()(()()()s())",
+		fac
+	);
+
 	return 0;
 }
 
@@ -4821,8 +4402,6 @@ static int pbx_capi_3pty_begin(struct ast_channel *c, char *param)
 {
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
 	struct capi_pvt *ii = NULL;
-	_cmsg		CMSG;
-	char		fac[8];
 	const char	*id;
 	unsigned int	plci = 0;
 
@@ -4840,7 +4419,7 @@ static int pbx_capi_3pty_begin(struct ast_channel *c, char *param)
 	}
 
 	cc_mutex_lock(&iflock);
-	for (ii = iflist; ii; ii = ii->next) {
+	for (ii = capi_iflist; ii; ii = ii->next) {
 		if (ii->onholdPLCI == plci)
 			break;
 	}
@@ -4871,20 +4450,14 @@ static int pbx_capi_3pty_begin(struct ast_channel *c, char *param)
 		return 0;
 	}
 
-	fac[0] = 7;	/* len */
-	fac[1] = 0x07;	/* this is a 3PTY Begin */
-	fac[2] = 0x00;
-	fac[3] = 4;	/* length of PLCI parameter (DWORD) */
-	write_capi_dword(&(fac[4]), plci);
-
-	FACILITY_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-	FACILITY_REQ_CONTROLLER(&CMSG) = i->controller;
-	FACILITY_REQ_PLCI(&CMSG) = plci; /* implicit 3PTY */
-	FACILITY_REQ_FACILITYSELECTOR(&CMSG) = FACILITYSELECTOR_SUPPLEMENTARY;
-	FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)&fac;
-
 	cc_mutex_lock(&ii->lock);
-	_capi_put_cmsg_wait_conf(ii, &CMSG);
+
+	capi_sendf(ii, 1, CAPI_FACILITY_REQ, plci, get_capi_MessageNumber(),
+		"w(w(d))",
+		FACILITYSELECTOR_SUPPLEMENTARY,
+		0x0007,  /* 3PTY begin */
+		plci
+	);
 
 	ii->isdnstate &= ~CAPI_ISDN_STATE_HOLD;
 	ii->isdnstate |= CAPI_ISDN_STATE_3PTY;
@@ -4899,33 +4472,6 @@ static int pbx_capi_3pty_begin(struct ast_channel *c, char *param)
 }
 
 /*
- * Initiate a QSIG Call Transfer
- */
-static int pbx_capi_qsig_ct(struct ast_channel *c, char *param)
-{
-	unsigned char fac[CAPI_MAX_FACILITYDATAARRAY_SIZE];
-	_cmsg		CMSG;
-	struct capi_pvt *i = CC_CHANNEL_PVT(c);
-
-	if (!param) { /* no data implies no Calling Number and Destination Number */
-		cc_log(LOG_WARNING, "capi qsig_ct requires source number and destination number\n");
-		return -1;
-	}
-
-	cc_qsig_do_facility(fac, c, param, 99);
-	
-	INFO_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(),0);
-	INFO_REQ_PLCI(&CMSG) = i->PLCI;
-	//		/ *INFO_REQ_FACILITYSELECTOR(&CMSG) = 0;* /
-	INFO_REQ_FACILITYDATAARRAY(&CMSG) = fac;
-		
-	_capi_put_cmsg(&CMSG);
-
-
-	return 0;
-}
-
-/*
  * struct of capi commands
  */
 static struct capicommands_s {
@@ -4933,6 +4479,7 @@ static struct capicommands_s {
 	int (*cmd)(struct ast_channel *, char *);
 	int capionly;
 } capicommands[] = {
+	{ "peerlink",     pbx_capi_peer_link,       0 },
 	{ "progress",     pbx_capi_signal_progress, 1 },
 	{ "deflect",      pbx_capi_call_deflect,    1 },
 	{ "receivefax",   pbx_capi_receive_fax,     1 },
@@ -4945,8 +4492,16 @@ static struct capicommands_s {
 	{ "retrieve",     pbx_capi_retrieve,        0 },
 	{ "ect",          pbx_capi_ect,             1 },
 	{ "3pty_begin",   pbx_capi_3pty_begin,      1 },
-	{ "qsig_ct",      pbx_capi_qsig_ct,         1 },
-	{ NULL, NULL, 0 }
+	{ "ccbs",         pbx_capi_ccbs,            0 },
+	{ "ccbsstop",     pbx_capi_ccbsstop,        0 },
+	{ "ccpartybusy",  pbx_capi_ccpartybusy,     0 },
+	{ "chat",         pbx_capi_chat,            0 },
+	{ "hangup",       pbx_capi_realhangup,      0 },
+ 	{ "qsig_ssct",	  pbx_capi_qsig_ssct,	    1 },
+  	{ "qsig_ct",      pbx_capi_qsig_ct,         1 },
+   	{ "qsig_callmark",pbx_capi_qsig_callmark,   1 },
+	{ "qsig_getplci", pbx_capi_qsig_getplci,    1 },
+  	{ NULL, NULL, 0 }
 };
 
 /*
@@ -5029,7 +4584,6 @@ static int pbx_capi_indicate(struct ast_channel *c, int condition)
 #endif
 {
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
-	_cmsg CMSG;
 	int ret = -1;
 
 	if (i == NULL) {
@@ -5062,10 +4616,8 @@ static int pbx_capi_indicate(struct ast_channel *c, int condition)
 			i->vname, c->name);
 		if ((i->state == CAPI_STATE_ALERTING) ||
 		    (i->state == CAPI_STATE_DID) || (i->state == CAPI_STATE_INCALL)) {
-			CONNECT_RESP_HEADER(&CMSG, capi_ApplID, i->MessageNumber, 0);
-			CONNECT_RESP_PLCI(&CMSG) = i->PLCI;
-			CONNECT_RESP_REJECT(&CMSG) = 3;
-			_capi_put_cmsg(&CMSG);
+			capi_sendf(NULL, 0, CAPI_CONNECT_RESP, i->PLCI, i->MessageNumber,
+				"w()()()()()", 3);
 			ret = 0;
 		}
 		if ((i->isdnstate & CAPI_ISDN_STATE_HOLD))
@@ -5076,10 +4628,8 @@ static int pbx_capi_indicate(struct ast_channel *c, int condition)
 			i->vname, c->name);
 		if ((i->state == CAPI_STATE_ALERTING) ||
 		    (i->state == CAPI_STATE_DID) || (i->state == CAPI_STATE_INCALL)) {
-			CONNECT_RESP_HEADER(&CMSG, capi_ApplID, i->MessageNumber, 0);
-			CONNECT_RESP_PLCI(&CMSG) = i->PLCI;
-			CONNECT_RESP_REJECT(&CMSG) = 4;
-			_capi_put_cmsg(&CMSG);
+			capi_sendf(NULL, 0, CAPI_CONNECT_RESP, i->PLCI, i->MessageNumber,
+				"w()()()()()", 4);
 			ret = 0;
 		}
 		if ((i->isdnstate & CAPI_ISDN_STATE_HOLD))
@@ -5152,12 +4702,31 @@ static int pbx_capi_devicestate(void *data)
 	return res;
 }
 
+static void capi_do_interface_task(void)
+{
+	if (interface_for_task == NULL)
+		return;
+
+	switch (interface_task) {
+	case CAPI_INTERFACE_TASK_NULLIFREMOVE:
+		/* remove an old null-plci interface */
+		capi_remove_nullif(interface_for_task);
+		break;
+	default:
+		/* nothing to do */
+		break;
+	}
+
+	interface_for_task = NULL;
+	interface_task = CAPI_INTERFACE_TASK_NONE;
+}
+
 static void capi_do_channel_task(void)
 {
 	if (chan_for_task == NULL)
 		return;
 
-	switch(channel_task) {
+	switch (channel_task) {
 	case CAPI_CHANNEL_TASK_HANGUP:
 		/* deferred (out of lock) hangup */
 		ast_hangup(chan_for_task);
@@ -5192,18 +4761,52 @@ static void capi_do_channel_task(void)
 }
 
 /*
+ * check for tasks every second
+ */
+static void capidev_run_secondly(time_t now)
+{
+	struct capi_pvt *i;
+
+	/* check for channels to hangup (timeout) */
+	cc_mutex_lock(&iflock);
+	for (i = capi_iflist; i; i = i->next) {
+		if (i->used == NULL) {
+			continue;
+		}
+		if ((i->whentohangup) && (i->whentohangup < now)) {
+			cc_verbose(3, 1, VERBOSE_PREFIX_2 "%s: stay-online timeout, hanging up.\n",
+				i->vname);
+			i->whentohangup = 0;
+			capi_disconnect(i);
+		}
+		if ((i->whentoqueuehangup) && (i->whentoqueuehangup < now)) {
+			cc_verbose(3, 1, VERBOSE_PREFIX_2 "%s: stay-online queue-hangup.\n",
+				i->vname);
+			capi_queue_cause_control(i, 1);
+			i->whentoqueuehangup = 0;
+		}
+	}
+	cc_mutex_unlock(&iflock);
+}
+
+/*
  * module stuff, monitor...
  */
 static void *capidev_loop(void *data)
 {
 	unsigned int Info;
 	_cmsg monCMSG;
+	time_t lastcall = 0;
+	time_t newtime;
 	
+	cc_log(LOG_NOTICE, "Started CAPI monitor-thread.\n");
+
 	for (/* for ever */;;) {
 		switch(Info = capidev_check_wait_get_cmsg(&monCMSG)) {
 		case 0x0000:
 			capidev_handle_msg(&monCMSG);
 			capi_do_channel_task();
+			capi_do_interface_task();
 			break;
 		case 0x1104:
 			/* CAPI queue is empty */
@@ -5219,6 +4822,11 @@ static void *capidev_loop(void *data)
 			/* something is wrong! */
 			break;
 		} /* switch */
+		newtime = time(NULL);
+		if (lastcall != newtime) {
+			lastcall = newtime;
+			capidev_run_secondly(newtime);
+		}
 	} /* for */
 	
 	/* never reached */
@@ -5228,7 +4836,7 @@ static void *capidev_loop(void *data)
 /*
  * GAIN
  */
-static void capi_gains(struct cc_capi_gains *g, float rxgain, float txgain)
+void capi_gains(struct cc_capi_gains *g, float rxgain, float txgain)
 {
 	int i = 0;
 	int x = 0;
@@ -5368,10 +4976,11 @@ int mkif(struct cc_capi_conf *conf)
 		tmp->doDTMF = conf->softdtmf;
 		tmp->capability = conf->capability;
 
-		tmp->qsigfeat = conf->qsigfeat;
-
-		tmp->next = iflist; /* prepend */
-		iflist = tmp;
+		/* Initialize QSIG code */
+		cc_qsig_interface_init(conf, tmp);
+		
+		tmp->next = capi_iflist; /* prepend */
+		capi_iflist = tmp;
 		cc_verbose(2, 0, VERBOSE_PREFIX_3 "capi %c %s (%s:%s) contr=%d devs=%d EC=%d,opt=%d,tail=%d\n",
 			(tmp->channeltype == CAPI_CHANNELTYPE_B)? 'B' : 'D',
 			tmp->vname, tmp->incomingmsn, tmp->context, tmp->controller,
@@ -5386,19 +4995,16 @@ int mkif(struct cc_capi_conf *conf)
 static void supported_sservices(struct cc_capi_controller *cp)
 {
 	MESSAGE_EXCHANGE_ERROR error;
-	_cmsg CMSG, CMSG2;
+	_cmsg CMSG2;
 	struct timeval tv;
-	unsigned char fac[20];
 	unsigned int services;
 
-	memset(fac, 0, sizeof(fac));
-	FACILITY_REQ_HEADER(&CMSG, capi_ApplID, get_capi_MessageNumber(), 0);
-	FACILITY_REQ_CONTROLLER(&CMSG) = cp->controller;
-	FACILITY_REQ_FACILITYSELECTOR(&CMSG) = FACILITYSELECTOR_SUPPLEMENTARY;
-	fac[0] = 3;
-	FACILITY_REQ_FACILITYREQUESTPARAMETER(&CMSG) = (_cstruct)&fac;
-	_capi_put_cmsg(&CMSG);
-
+	capi_sendf(NULL, 0, CAPI_FACILITY_REQ, cp->controller, get_capi_MessageNumber(),
+		"w(w())",
+		FACILITYSELECTOR_SUPPLEMENTARY,
+		0x0000  /* get supported services */
+	);
+	
 	tv.tv_sec = 1;
 	tv.tv_usec = 0;
 	
@@ -5564,7 +5170,7 @@ static int pbxcli_capi_show_channels(int fd, int argc, char *argv[])
 
 	cc_mutex_lock(&iflock);
 
-	for (i = iflist; i; i = i->next) {
+	for (i = capi_iflist; i; i = i->next) {
 		if (i->channeltype != CAPI_CHANNELTYPE_B)
 			continue;
 
@@ -5611,6 +5217,8 @@ static int pbxcli_capi_info(int fd, int argc, char *argv[])
 	
 	if (argc != 2)
 		return RESULT_SHOWUSAGE;
+	
+	ast_cli(fd, "%s www.chan-capi.org\n", tdesc);
 		
 	for (i = 1; i <= capi_num_controllers; i++) {
 		if (capi_controllers[i] != NULL) {
@@ -5669,6 +5277,10 @@ static char no_debug_usage[] =
 "Usage: capi no debug\n"
 "       Disables dumping of CAPI packets for debugging purposes\n";
 
+static char chatinfo_usage[] = 
+"Usage: capi chatinfo\n"
+"       Show info about chat status.\n";
+
 /*
  * define commands
  */
@@ -5680,8 +5292,10 @@ static struct ast_cli_entry  cli_debug =
 	{ { "capi", "debug", NULL }, pbxcli_capi_do_debug, "Enable CAPI debugging", debug_usage };
 static struct ast_cli_entry  cli_no_debug =
 	{ { "capi", "no", "debug", NULL }, pbxcli_capi_no_debug, "Disable CAPI debugging", no_debug_usage };
+static struct ast_cli_entry  cli_chatinfo =
+	{ { "capi", "chatinfo", NULL }, pbxcli_capi_chatinfo, "Show CAPI chat info", chatinfo_usage };
 
-static const struct ast_channel_tech capi_tech = {
+const struct ast_channel_tech capi_tech = {
 	.type = channeltype,
 	.description = tdesc,
 	.capabilities = AST_FORMAT_ALAW,
@@ -5692,7 +5306,7 @@ static const struct ast_channel_tech capi_tech = {
 #else
 	.send_digit = pbx_capi_send_digit,
 #endif
-	.send_text = NULL,
+	.send_text = pbx_capi_qsig_sendtext,
 	.call = pbx_capi_call,
 	.hangup = pbx_capi_hangup,
 	.answer = pbx_capi_answer,
@@ -5882,7 +5496,7 @@ static int cc_post_init_capi(void)
 	int rtp_ext_size = 0;
 	unsigned needchannels = 0;
 
-	for (i = iflist; i && !rtp_ext_size; i = i->next) {
+	for (i = capi_iflist; i && !rtp_ext_size; i = i->next) {
 		/* if at least one line wants RTP, we need to re-register with
 		   bigger block size for RTP-header */
 		if (capi_controllers[i->controller]->rtpcodec & i->capability) {
@@ -5900,7 +5514,7 @@ static int cc_post_init_capi(void)
 
 	for (controller = 1; controller <= capi_num_controllers; controller++) {
 		if (capi_used_controllers & (1 << controller)) {
-			if ((error = ListenOnController(ALL_SERVICES, controller)) != 0) {
+			if ((error = capi_ListenOnController(ALL_SERVICES, controller)) != 0) {
 				cc_log(LOG_ERROR,"Unable to listen on contr%d (error=0x%x)\n",
 					controller, error);
 			} else {
@@ -5977,7 +5591,6 @@ static int conf_interface(struct cc_capi_conf *conf, struct ast_variable *v)
 		CONF_TRUE(conf->es, "echosquelch", 1)
 		CONF_TRUE(conf->bridge, "bridge", 1)
 		CONF_TRUE(conf->ntmode, "ntmode", 1)
-		CONF_INTEGER(conf->qsigfeat, "qsig")
 		if (!strcasecmp(v->name, "callgroup")) {
 			conf->callgroup = ast_get_group(v->value);
 			continue;
@@ -6078,6 +5691,7 @@ static int conf_interface(struct cc_capi_conf *conf, struct ast_variable *v)
 		if (!strcasecmp(v->name, "disallow")) {
 			ast_parse_allow_disallow(&conf->prefs, &conf->capability, v->value, 0);
 		}
+		cc_pbx_qsig_conf_interface_value(conf, v);
 	}
 #undef CONF_STRING
 #undef CONF_INTEGER
@@ -6202,6 +5816,7 @@ int unload_module(void)
 	ast_cli_unregister(&cli_show_channels);
 	ast_cli_unregister(&cli_debug);
 	ast_cli_unregister(&cli_no_debug);
+	ast_cli_unregister(&cli_chatinfo);
 
 #ifdef CC_AST_HAS_VERSION_1_4
 	ast_module_user_hangup_all();
@@ -6227,12 +5842,15 @@ int unload_module(void)
 		}
 	}
 	
-	i = iflist;
+	i = capi_iflist;
 	while (i) {
-		if (i->owner)
-			cc_log(LOG_WARNING, "On unload, interface still has owner.\n");
+		if ((i->owner) || (i->used))
+			cc_log(LOG_WARNING, "On unload, interface still has owner or is used.\n");
 		if (i->smoother)
 			ast_smoother_free(i->smoother);
+		
+		pbx_capi_qsig_unload_module(i);
+		
 		cc_mutex_destroy(&i->lock);
 		ast_cond_destroy(&i->event_trigger);
 		itmp = i;
@@ -6243,6 +5861,8 @@ int unload_module(void)
 	cc_mutex_unlock(&iflock);
 	
 	ast_channel_unregister(&capi_tech);
+
+	cleanup_ccbsnr();
 	
 	return 0;
 }
@@ -6303,6 +5923,7 @@ int load_module(void)
 	ast_cli_register(&cli_show_channels);
 	ast_cli_register(&cli_debug);
 	ast_cli_register(&cli_no_debug);
+	ast_cli_register(&cli_chatinfo);
 	
 	ast_register_application(commandapp, pbx_capicommand_exec, commandsynopsis, commandtdesc);
 
@@ -6338,10 +5959,8 @@ char *description()
 	return ccdesc;
 }
 
-#ifndef PBX_IS_OPBX
 char *key()
 {
 	return ASTERISK_GPL_KEY;
 }
-#endif
 #endif /* CC_AST_HAS_VERSION_1_4 */

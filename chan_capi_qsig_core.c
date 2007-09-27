@@ -1,8 +1,7 @@
 /*
  * (CAPI*)
  *
- * An implementation of Common ISDN API 2.0 for
- * Asterisk / OpenPBX.org
+ * An implementation of Common ISDN API 2.0 for Asterisk
  *
  * Copyright (C) 2005-2007 Cytronics & Melware
  * Copyright (C) 2007 Mario Goegel
@@ -23,12 +22,20 @@
 #include <asterisk/pbx.h>
 #include "chan_capi20.h"
 #include "chan_capi.h"
+#include "chan_capi_utils.h"
 #include "chan_capi_qsig.h"
+#include "chan_capi_qsig_ecma.h"
 #include "chan_capi_qsig_asn197ade.h"
 #include "chan_capi_qsig_asn197no.h"
 
-/*
- * Encodes an ASN.1 string
+/*!
+ * \brief Encodes an ASN.1 string
+ *
+ * \param buf destination pointer for string
+ * \param idx index points to string position in buffer
+ * \param data string
+ * \param datalen string length 
+ * \return always zero 
  */
 unsigned int cc_qsig_asn1_add_string(unsigned char *buf, int *idx, char *data, int datalen)
 {
@@ -60,7 +67,8 @@ unsigned int cc_qsig_asn1_get_string(unsigned char *buf, int buflen, unsigned ch
 		strsize = buflen - 1;
 	memcpy(buf, &data[myidx], strsize);
 	buf[strsize] = 0;
-/*	cc_verbose(1, 1, VERBOSE_PREFIX_4 " get_string length %i\n", strsize); */
+	/* don't increase strsize after closing zero - string ends at strsize ! */
+	
 	return strsize;
 }
 
@@ -119,10 +127,44 @@ unsigned int cc_qsig_asn1_get_integer(unsigned char *data, int *idx)
 /*
  * Returns an Human Readable OID from ASN.1 Encoded OID
  */
-unsigned char cc_qsig_asn1_get_oid(unsigned char *data, int *idx)
+unsigned char *cc_qsig_asn1_oid2str(unsigned char *data, int size)
 {
-	/* TODO: Add code */
-	return 0;
+	unsigned char buf[1024];
+	char numbuf[10];
+	unsigned char *s;
+	int len, i;
+	unsigned long n;
+	
+	s = buf;
+	if (size < 3) {
+		cc_verbose(1, 1, VERBOSE_PREFIX_3 "OID2STR: Object identifier too small (%i).\n", size);
+		return NULL;
+	}
+	
+#define N(n) \
+		snprintf(numbuf, sizeof numbuf, "%lu", (unsigned long)n); \
+		len = strlen(numbuf); \
+		memcpy(s, numbuf, len); \
+		s += len;
+	
+	N(data[0] / 40)
+	*s++ = '.';
+	N(data[0] % 40)
+	n = 0;
+	for (i = 1; i < size; i++) {
+		n = n << 7 | (data[i] & 0x7f);
+		if ((data[i] & 0x80) == 0) {
+			*s++ = '.';
+			N(n)
+			n = 0;
+		}
+	}
+	
+	*s++ = 0;
+	
+	s = buf;
+	return (unsigned char *) strdup((char*)s);
+	
 }
 
 
@@ -150,13 +192,15 @@ void cc_qsig_update_facility_length(unsigned char * buf, unsigned int idx)
 /*
  * Create Invoke Struct
  */
-int cc_qsig_build_facility_struct(unsigned char * buf, unsigned int *idx, int apdu_interpr, struct cc_qsig_nfe *nfe)
+int cc_qsig_build_facility_struct(unsigned char * buf, unsigned int *idx, int protocolvar, int apdu_interpr, struct cc_qsig_nfe *nfe)
 {
-	int myidx = 1;	/* we start with Index 1 - Byte 0 is Length of Facilitydataarray */
+	int myidx = *idx;	/* we start with Index 1 - Byte 0 is Length of Facilitydataarray */
+	if (!myidx)
+		myidx++;
 	
 	buf[myidx++] = 0x1c;
 	buf[myidx++] = 0;		/* Byte 2 length of Facilitydataarray */
-	buf[myidx++] = COMP_TYPE_DISCR_SS;	/* QSIG Facility */
+	buf[myidx++] = 0x80 | protocolvar;	/* QSIG Facility */
 	/* TODO: Outsource following struct to an separate function */
 	buf[myidx++] = COMP_TYPE_NFE;		/* Network Facility Extension */
 	buf[myidx++] = 6;				/* NFE Size hardcoded - not good */
@@ -179,8 +223,9 @@ int cc_qsig_build_facility_struct(unsigned char * buf, unsigned int *idx, int ap
 /*
  * Add invoke to buf
  */
-int cc_qsig_add_invoke(unsigned char * buf, unsigned int *idx, struct cc_qsig_invokedata *invoke)
+int cc_qsig_add_invoke(unsigned char * buf, unsigned int *idx, struct cc_qsig_invokedata *invoke, struct capi_pvt *i)
 {
+	unsigned char oid1[] = {0x2b,0x0c,0x09,0x00};
 	int myidx = *idx;
 	int invlenidx;
 	int result;
@@ -195,11 +240,31 @@ int cc_qsig_add_invoke(unsigned char * buf, unsigned int *idx, struct cc_qsig_in
 		return -1;
 	}
 	
+	if (invoke->descr_type == -1) {
+		switch (i->qsigfeat) {
+			case QSIG_TYPE_ALCATEL_ECMA:
+				invoke->descr_type = ASN1_OBJECTIDENTIFIER;
+				/* Set ECMA/ETSI OID */
+				oid1[3] = (unsigned char)invoke->type;
+				invoke->oid_len = sizeof(oid1);
+				memcpy(invoke->oid_bin, oid1, sizeof(oid1));
+				break;
+			case QSIG_TYPE_HICOM_ECMAV2:
+				invoke->descr_type = ASN1_INTEGER;
+				/* Leave type as it is */
+				break;
+			default: 
+				/* INVOKE is not encoded */
+				break;
+		}
+	}
+		
+		
 	switch (invoke->descr_type) {
 		case ASN1_INTEGER:
 			result = cc_qsig_asn1_add_integer(buf, &myidx, invoke->type);
 			if (result) {
-				cc_log(LOG_ERROR, "QSIG: Cannot add invoke, identifier is not encoded!\n");
+				cc_log(LOG_ERROR, "QSIG: Cannot add invoke, type is not encoded!\n");
 				return -1;
 			}
 			break;
@@ -239,25 +304,32 @@ int cc_qsig_add_invoke(unsigned char * buf, unsigned int *idx, struct cc_qsig_in
 unsigned int cc_qsig_check_facility(unsigned char *data, int *idx, int *apduval, int protocol)
 {
 	int myidx = *idx;
+	char *APDU_STR[] = {"IGNORE", "REJECT CALL", "CLEAR CALL"};
 	
 	/* First byte after Facility Length */ 
-	if (data[myidx] == (unsigned char)(0x80 | protocol)) {
-		myidx++;
-		cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: Supplementary Services\n");
-		if (data[myidx++] == (unsigned char)COMP_TYPE_NFE) {
-			/* Todo: Check Entities? */
-			myidx = myidx + data[myidx] + 1;
-			/* cc_verbose(1, 1, VERBOSE_PREFIX_3 "CONNECT_IND (idc #1 %i)\n",idx); */
-			if ((data[myidx++] == (unsigned char)COMP_TYPE_APDU_INTERP)) {
-				myidx = myidx + data[myidx];
-				*apduval = data[myidx];
-				/* ToDo: implement real reject or clear call ? */
-				*idx = ++myidx;
-				return 1;
-			}
-		}
+	if (data[myidx] != (unsigned char)(0x80 | protocol)) {
+		cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: received protocol 0x%#x not configured!\n", (data[myidx] ^= 0x80));
+		return 0;
 	}
-	return 0;
+	
+	myidx++;
+	cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: Supplementary Services\n");
+	if (data[myidx] == (unsigned char)COMP_TYPE_NFE) {
+		myidx++;
+		/* TODO: Check Entities? */
+		myidx += data[myidx] + 1;
+		*idx = myidx;
+		cc_verbose(1, 1, VERBOSE_PREFIX_3  "QSIG: Facility has NFE struct\n");
+	}
+	if ((data[myidx] == (unsigned char)COMP_TYPE_APDU_INTERP)) {
+		myidx++;
+		myidx += data[myidx];
+		*apduval = data[myidx++];
+		/* TODO: implement real reject or clear call ? */
+		*idx = myidx;
+		 cc_verbose(1, 1, VERBOSE_PREFIX_3  "QSIG: Facility has APDU - What to do if INVOKE is unknown: %s\n", APDU_STR[*apduval]); 
+	}
+	return 1;
 }
 
 
@@ -272,13 +344,12 @@ signed int cc_qsig_check_invoke(unsigned char *data, int *idx)
 {
 	int myidx = *idx;
 	
-	if (data[myidx] == (unsigned char)COMP_TYPE_INVOKE) {
-		/* is an INVOKE_IDENT */
-		*idx = myidx + 1;		/* Set index to length byte of component */
-/*		cc_verbose(1, 1, VERBOSE_PREFIX_4 "CONNECT_IND (Invoke Length %i)\n", data[myidx+1]); */
+	if (data[myidx++] == (unsigned char)COMP_TYPE_INVOKE) {
+		/* is an INVOKE */
+		*idx = myidx;		/* Set index to length byte of component */
 		return data[myidx + 1];	/* return component length */
 	}
-	*idx = ++myidx;
+	*idx += data[myidx];	/* we can end here, if it is an Invoke Result or Error */
 	return -1;			/* what to do now? got no Invoke */
 }
 
@@ -343,7 +414,7 @@ signed int cc_qsig_fill_invokestruct(unsigned char *data, int *idx, struct cc_qs
 			
 			invoke->datalen = datalen;
 			memcpy(invoke->data, &data[myidx], datalen);	/* copy data of Invoke Operation */
-			myidx = myidx + datalen;		/* points to next INVOKE component, if there's any */
+			myidx += datalen;		/* points to next INVOKE component, if there's any */
 			*idx = myidx;
 			
 			break;
@@ -359,10 +430,15 @@ signed int cc_qsig_fill_invokestruct(unsigned char *data, int *idx, struct cc_qs
 			
 			/* TODO: Maybe we decode the OID here and be verbose - have to write cc_qsig_asn1get_oid */
 			
-/*			cc_verbose(1, 1, VERBOSE_PREFIX_3 "CONNECT_IND (OID, Length %i)\n", temp); */
 			invoke->oid_len = temp;
 			memcpy(invoke->oid_bin, &data[myidx], temp);	/* Copy OID to separate array */
 			myidx = myidx + temp;				/* Set index to next information */
+			
+			if (temp == 4) {	/* even if we have an OID, set the numeric invoke type */
+				invoke->type = (int) invoke->oid_bin[3];
+			} else {
+				invoke->type = -1;
+			}
 			
 			temp2 = (invoke->len) + (invoke->offset) + 1;	/* Array End = Invoke Length + Invoke Offset +1 */
 			datalen = temp2 - myidx;
@@ -372,10 +448,9 @@ signed int cc_qsig_fill_invokestruct(unsigned char *data, int *idx, struct cc_qs
 				datalen = 255;
 			}
 			
-/*			cc_verbose(1, 1, VERBOSE_PREFIX_3 "CONNECT_IND (OID, Datalength %i)\n",datalen); */
 			invoke->datalen = datalen;
 			memcpy(invoke->data, &data[myidx], datalen);	/* copy data of Invoke Operation */
-			myidx = myidx + datalen;		/* points to next INVOKE component, if there's any */
+			myidx += datalen;		/* points to next INVOKE component, if there's any */
 			*idx = myidx;
 
 			break;
@@ -391,12 +466,32 @@ signed int cc_qsig_fill_invokestruct(unsigned char *data, int *idx, struct cc_qs
 				datalen = 255;
 			}
 			
-			*idx = datalen;	/* Set index to next INVOKE, if there's any */
+			*idx = myidx + datalen;	/* Set index to next INVOKE, if there's any */
 			return -1;
 			break;
 	}
 	return 0;	/* No problems */
 	
+}
+
+static int ident_qsig_invoke(int invoketype)
+{
+	switch (invoketype) {
+		case 0:
+		case 1:
+		case 2:
+		case 3:
+			return CCQSIG__ECMA__NAMEPRES;
+		case 4:
+			return CCQSIG__ECMA__PRPROPOSE;
+		case 12:
+			return CCQSIG__ECMA__CTCOMPLETE;
+		case 21:
+			return CCQSIG__ECMA__LEGINFO2;
+		default:
+			cc_verbose(1, 1, VERBOSE_PREFIX_4 "QSIG: Unhandled QSIG INVOKE (%i)\n", invoketype);
+			return -1;
+	}
 }
 
 /*
@@ -414,24 +509,28 @@ signed int cc_qsig_identifyinvoke(struct cc_qsig_invokedata *invoke, int protoco
 			switch (invoke->descr_type) {
 				case ASN1_INTEGER:
 					invokedescrtype = 1;
+					cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: INVOKE OP (%i)\n", invoke->type);
+					return ident_qsig_invoke(invoke->type);
 					break;
 				case ASN1_OBJECTIDENTIFIER:
 					invokedescrtype = 2;
 					datalen = invoke->oid_len;
-					if ((datalen) == 4) {
-						if (!cc_qsig_asn1_check_ecma_isdn_oid(invoke->oid_bin, datalen)) {
-							switch (invoke->oid_bin[3]) {
-								case 0:		/* ECMA QSIG Name Presentation */
-									return CCQSIG__ECMA__NAMEPRES;
-								case 21:
-									return CCQSIG__ECMA__LEGINFO2;
-								default:	/* Unknown Operation */
-									cc_verbose(1, 1, VERBOSE_PREFIX_4 "QSIG: Unhandled ECMA-ISDN QSIG INVOKE (%i)\n", invoke->oid_bin[3]);
-									return 0;
-							}
-						}
+					
+					unsigned char *oidstr = NULL;
+					oidstr = cc_qsig_asn1_oid2str(invoke->oid_bin, invoke->oid_len);
+					if (oidstr) {
+						cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: INVOKE OP (%s)\n", oidstr);
+						free(oidstr);
+					} else {
+						cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: INVOKE OP (unknown - OID not displayable)\n");
 					}
 					
+					if ((datalen) == 4) {
+						if (!cc_qsig_asn1_check_ecma_isdn_oid(invoke->oid_bin, datalen)) {
+							return ident_qsig_invoke( (int)invoke->oid_bin[3]);
+						}
+					}
+					return -1;
 					break;
 				default:
 					cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: Unidentified INVOKE OP\n");
@@ -442,18 +541,27 @@ signed int cc_qsig_identifyinvoke(struct cc_qsig_invokedata *invoke, int protoco
 			switch (invoke->descr_type) {
 				case ASN1_INTEGER:
 					invokedescrtype = 1;
-					switch (invoke->type) {
-						case 0:
-							return CCQSIG__ECMA__NAMEPRES;
-						case 21:
-							return CCQSIG__ECMA__LEGINFO2;
-						default:
-							cc_verbose(1, 1, VERBOSE_PREFIX_4 "QSIG: Unhandled QSIG INVOKE (%i)\n", invoke->type);
-							return 0;
-					}
+					cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: INVOKE OP (%i)\n", invoke->type);
+					return ident_qsig_invoke(invoke->type);
 					break;
 				case ASN1_OBJECTIDENTIFIER:
 					invokedescrtype = 2;
+					datalen = invoke->oid_len;
+					
+					unsigned char *oidstr = NULL;
+					oidstr = cc_qsig_asn1_oid2str(invoke->oid_bin, invoke->oid_len);
+					if (oidstr) {
+						cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: INVOKE OP (%s)\n", oidstr);
+						free(oidstr);
+					} else {
+						cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: INVOKE OP (unknown - OID not displayable)\n");
+					}
+					
+					if ((datalen) == 4) {
+						if (!cc_qsig_asn1_check_ecma_isdn_oid(invoke->oid_bin, datalen)) {
+							return ident_qsig_invoke( (int)invoke->oid_bin[3]);
+						}
+					}
 					break;
 				default:
 					cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: Unidentified INVOKE OP\n");
@@ -463,19 +571,122 @@ signed int cc_qsig_identifyinvoke(struct cc_qsig_invokedata *invoke, int protoco
 		default:
 			break;
 	}
-	return 0;
+	return -1;
 	
 }
 
+/*
+ * find the interface (pvt) the PLCI belongs to
+ */
+static struct capi_pvt *capi_find_interface_bynumber(char * num)
+{
+	struct capi_pvt *i;
+
+	if (!num)
+		return NULL;
+
+	for (i = capi_iflist; i; i = i->next) {
+		if (strcmp(i->cid, num) == 0 ||
+		    strcmp(i->dnid, num) == 0)
+			return i;
+	}
+
+#if 0
+	cc_mutex_lock(&nullif_lock);
+	for (i = nulliflist; i; i = i->next) {
+		if (strcmp(i->cid, num) == 0 ||
+		    strcmp(i->dnid, num) == 0)
+			break;
+	}
+	cc_mutex_unlock(&nullif_lock);
+#endif
+	
+	return i;
+}
+
+static void pbx_capi_qsig_handle_ctc(struct cc_qsig_invokedata *invoke, struct capi_pvt *i)
+{
+	struct cc_qsig_ctcomplete ctc;
+	struct capi_pvt *ii;
+	
+#define CLEAR_CTC {	if (ctc.redirectionNumber.partyNumber)	free_null(ctc.redirectionNumber.partyNumber);\
+			if (ctc.basicCallInfoElements)	free_null(ctc.basicCallInfoElements); \
+			if (ctc.redirectionName) free_null(ctc.redirectionName); \
+			if (ctc.argumentExtension) free_null(ctc.argumentExtension); }
+
+	int res = cc_qsig_decode_ecma_calltransfer(invoke, i, &ctc);
+	
+	if (!res)
+		return;
+	
+	if (ctc.redirectionNumber.partyNumber && (ctc.endDesignation == 0)) { 
+		ii = capi_find_interface_bynumber(ctc.redirectionNumber.partyNumber);
+		if (ii) {
+			char *prpn = i->qsig_data.if_pr_propose_pn;
+			cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: Call Transfer partner channel for %s found at channel %s, bridging possible.\n", ctc.redirectionNumber.partyNumber, ii->vname);
+			
+			if (!(strlen(prpn))) {
+				cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: Path Replacement not configured, bridging not available!\n");
+			} else {
+				unsigned char fac[CAPI_MAX_FACILITYDATAARRAY_SIZE];
+					
+				cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: Trying to bridge with Path Replacement number %s...\n", prpn);
+				
+				switch (ii->state) {
+					case CAPI_STATE_ALERTING:
+						cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: peer is in state ALERTING, PATH REPLACE follows after CONNECT...\n");
+ 						ii->qsig_data.pr_propose_cid = strdup("123");	/* HACK: need an dynamic ID */
+ 						ii->qsig_data.pr_propose_pn = strdup(i->qsig_data.if_pr_propose_pn);
+ 						ii->qsig_data.pr_propose_doinboundbridge = 1;
+						i->qsig_data.pr_propose_doinboundbridge = 1;
+						i->qsig_data.partner_plci = ii->PLCI;
+						break;
+					case CAPI_STATE_CONNECTED:
+						cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: peer is CONNECTED...\n");
+ 						i->qsig_data.pr_propose_cid = strdup("123");	/* HACK: need an dynamic ID */
+ 						i->qsig_data.pr_propose_pn = strdup(i->qsig_data.if_pr_propose_pn);
+						ii->qsig_data.pr_propose_doinboundbridge = 1;
+  						ii->qsig_data.partner_plci = i->PLCI;
+						
+ 						cc_qsig_do_facility(fac, i->owner, NULL, 4, 0);
+							
+ 						capi_sendf(NULL, 0, CAPI_INFO_REQ, i->PLCI, get_capi_MessageNumber(),
+ 								"()(()()()s)", fac  );
+						
+						i->qsig_data.pr_propose_cid = NULL;
+						i->qsig_data.pr_propose_pn = NULL;
+						break;
+					default:
+						cc_verbose(1, 1, VERBOSE_PREFIX_3 "QSIG: peer's state is %i, which is not handled yet...\n", ii->state);
+						break;
+				} 
+				
+			} 
+			
+  			CLEAR_CTC
+			
+		}
+	}
+	
+  	CLEAR_CTC
+		
+	return ;
+}
 
 /*
- *
+ * Handle inbound INVOKEs
  */
 unsigned int cc_qsig_handle_invokeoperation(int invokeident, struct cc_qsig_invokedata *invoke, struct capi_pvt *i)
 {
 	switch (invokeident) {
 		case CCQSIG__ECMA__NAMEPRES:
 			cc_qsig_op_ecma_isdn_namepres(invoke, i);
+			break;
+		case CCQSIG__ECMA__PRPROPOSE:
+			cc_qsig_op_ecma_isdn_prpropose(invoke, i);
+			break;
+		case CCQSIG__ECMA__CTCOMPLETE:
+			pbx_capi_qsig_handle_ctc(invoke, i);
 			break;
 		case CCQSIG__ECMA__LEGINFO2:
 			cc_qsig_op_ecma_isdn_leginfo2(invoke, i);
@@ -486,69 +697,150 @@ unsigned int cc_qsig_handle_invokeoperation(int invokeident, struct cc_qsig_invo
 	return 0;
 }
 
+/**
+ * Handles incoming facilities
+ *
+ * @internal
+ * @param data facility buffer
+ * @param i points to capip_pvt struct
+ * @param idx index in facility buffer
+ * @param faclen facility length
+ * @param protocoltype Q932_PROTOCOL_ROSE | Q932_PROTOCOL_EXTENSIONS
+ * @return zero
+ */
+static int qsig_handle_q932facility(unsigned char *data, struct capi_pvt *i, int *idx, int faclen, int protocoltype)
+{
+	int facidx = *idx;
+	int action_unkn_apdu;		/* What to do with unknown Invoke-APDUs (0=Ignore, 1=clear call, 2=reject APDU) */
+	struct cc_qsig_invokedata invoke;
+	int invoke_len;
+	int invoketmp1;
+	unsigned int invoke_op = 0;	/* Invoke Operation ID */
+		
+	if (cc_qsig_check_facility(data, &facidx, &action_unkn_apdu, protocoltype)) {
+		while ((facidx) < faclen) {
+			cc_verbose(1, 1, VERBOSE_PREFIX_3 "Checking INVOKE at index %i (of %i)\n", facidx, faclen);
+			invoke_len = cc_qsig_check_invoke(data, &facidx);
+			if (invoke_len > 0) {
+				if (cc_qsig_get_invokeid(data, &facidx, &invoke) == 0) {
+					invoketmp1 = cc_qsig_fill_invokestruct(data, &facidx, &invoke, action_unkn_apdu);
+					invoke_op = cc_qsig_identifyinvoke(&invoke, i->qsigfeat);
+					if (invoke_op < 0) {
+						cc_verbose(1, 1, VERBOSE_PREFIX_3 "Invoke not identified!\n");
+					}
+					cc_qsig_handle_invokeoperation(invoke_op, &invoke, i);
+				}
+			} else {
+				/* Not an Invoke */
+			}
+		}
+	} else { /* kill endlessloop */
+		facidx += faclen;
+	}
+	*idx = facidx;
+	return 0;
+}
+
 /*
  * Handles incoming Indications from CAPI
  */
 unsigned int cc_qsig_handle_capiind(unsigned char *data, struct capi_pvt *i)
 {
+	int faclen0 = 0;
 	int faclen = 0;
 	int facidx = 2;
-	int action_unkn_apdu;		/* What to do with unknown Invoke-APDUs (0=Ignore, 1=clear call, 2=reject APDU) */
 	
-	int invoke_len;			/* Length of Invoke APDU */
-	unsigned int invoke_op;		/* Invoke Operation ID */
-	struct cc_qsig_invokedata invoke;
-	int invoketmp1;
+	if (!i->qsigfeat)
+		return 0;
 	
-	
-	if (data) {
-		faclen=data[facidx-2];
-/*					cc_verbose(1, 1, VERBOSE_PREFIX_3 "CONNECT_IND (Got Facility IE, Length=%#x)\n", faclen); */
-		facidx++;
-		while (facidx < faclen) {
-			cc_verbose(1, 1, VERBOSE_PREFIX_3 "Checking Facility at index %i\n", facidx);
-			switch (i->qsigfeat) {
-				case QSIG_TYPE_ALCATEL_ECMA:
-					if (cc_qsig_check_facility(data, &facidx, &action_unkn_apdu, Q932_PROTOCOL_ROSE)) {
-	/*						cc_verbose(1, 1, VERBOSE_PREFIX_3 "CONNECT_IND ROSE Supplementary Services (APDU Interpretation:  %i)\n", action_unkn_apdu); */
-						while ((facidx-1)<faclen) {
-							invoke_len=cc_qsig_check_invoke(data, &facidx);
-							if (invoke_len>0) {
-								if (cc_qsig_get_invokeid(data, &facidx, &invoke)==0) {
-									invoketmp1=cc_qsig_fill_invokestruct(data, &facidx, &invoke, action_unkn_apdu);
-									invoke_op=cc_qsig_identifyinvoke(&invoke, i->qsigfeat);
-									cc_qsig_handle_invokeoperation(invoke_op, &invoke, i);
-								}
-							} else {
-									/* Not an Invoke */
-							}
-						}
-					}
-					break;
-				case QSIG_TYPE_HICOM_ECMAV2:
-					if (cc_qsig_check_facility(data, &facidx, &action_unkn_apdu, Q932_PROTOCOL_EXTENSIONS)) {
-						/*						cc_verbose(1, 1, VERBOSE_PREFIX_3 "CONNECT_IND ROSE Supplementary Services (APDU Interpretation:  %i)\n", action_unkn_apdu); */
-						while ((facidx-1)<faclen) {
-							invoke_len=cc_qsig_check_invoke(data, &facidx);
-							if (invoke_len>0) {
-								if (cc_qsig_get_invokeid(data, &facidx, &invoke)==0) {
-									invoketmp1=cc_qsig_fill_invokestruct(data, &facidx, &invoke, action_unkn_apdu);
-									invoke_op=cc_qsig_identifyinvoke(&invoke, i->qsigfeat);
-									cc_qsig_handle_invokeoperation(invoke_op, &invoke, i);
-								}
-							} else {
-								/* Not an Invoke */
-							}
-						}
-					}
-					break;
-				default:
-					cc_verbose(1, 1, VERBOSE_PREFIX_3 "Unknown QSIG protocol configured (%i)\n", i->qsigfeat);
-					break;
+	if (!data) {
+		return 0;
+	}
+
+	faclen0 = data[facidx-2];	/* Length of facility array - there may be more facilities encoded in this struct */
+	faclen = data[facidx++];
+ 	faclen += facidx;
+	while (facidx < faclen0) {
+		cc_verbose(1, 1, VERBOSE_PREFIX_3 "Checking Facility at index %i\n", facidx);
+		switch (i->qsigfeat) {
+			case QSIG_TYPE_ALCATEL_ECMA:
+				qsig_handle_q932facility(data, i, &facidx, faclen, Q932_PROTOCOL_ROSE);
+				break;
+			case QSIG_TYPE_HICOM_ECMAV2:
+				qsig_handle_q932facility(data, i, &facidx, faclen, Q932_PROTOCOL_EXTENSIONS);
+				break;
+			default:
+				cc_verbose(1, 1, VERBOSE_PREFIX_3 "Unknown QSIG protocol configured (%i)\n", i->qsigfeat);
+				break;
+		}
+		
+		if (facidx < faclen0) {	/* there may follow a new facility */
+			if (data[facidx] == 0x1c) {
+				cc_verbose(1, 1, VERBOSE_PREFIX_3 "Found another facility at index %i\n", facidx);
+				facidx++;
+				faclen = data[facidx++];
+				faclen += facidx;
+			} else {
+				cc_verbose(1, 1, VERBOSE_PREFIX_3 "More data found in facility at index %i, but this is not an facility (%#x)\n", facidx, data[facidx]);
+				facidx++; /* don't start an endlessloop */
 			}
 		}
 	}
 	cc_verbose(1, 1, VERBOSE_PREFIX_3 "Facility done at index %i from %i\n", facidx, faclen);
+	return 1;
+}
+
+/*
+ * Handles incoming Facility Indications from CAPI
+ */
+unsigned int cc_qsig_handle_capi_facilityind(unsigned char *data, struct capi_pvt *i)
+{
+	int faclen = 0;
+	int facidx = 0;
+
+	if (!data) {
+		return 0;
+	}
+	faclen = data[facidx++];
+	/*					cc_verbose(1, 1, VERBOSE_PREFIX_3 "CONNECT_IND (Got Facility IE, Length=%#x)\n", faclen); */
+	while (facidx < faclen) {
+		cc_verbose(1, 1, VERBOSE_PREFIX_3 "Checking Facility at index %i\n", facidx);
+		switch (i->qsigfeat) {
+			case QSIG_TYPE_ALCATEL_ECMA:
+				qsig_handle_q932facility(data, i, &facidx, faclen, Q932_PROTOCOL_ROSE);
+				break;
+			case QSIG_TYPE_HICOM_ECMAV2:
+				qsig_handle_q932facility(data, i, &facidx, faclen, Q932_PROTOCOL_EXTENSIONS);
+				break;
+			default:
+				cc_verbose(1, 1, VERBOSE_PREFIX_3 "Unknown QSIG protocol configured (%i)\n", i->qsigfeat);
+				/* kill endlessloop */
+				facidx += faclen;
+				break;
+		}
+	}
+	cc_verbose(1, 1, VERBOSE_PREFIX_3 "Facility done at index %i from %i\n", facidx, faclen);
+	return 1;
+}
+
+static int identify_qsig_setup_callfeature(char *param)
+{
+	char *p = param;
+	switch (*p) {
+		case 't':
+			cc_verbose(1, 1, "Call Transfer");
+			p++;
+			if (*p == 'r') {
+				cc_verbose(1, 1, " on ALERT");
+				return 2;
+			} else {
+				return 1;
+			}
+		default:
+			cc_verbose(1, 1, "unknown (%c)\n", *p);
+			break;
+	}
+	
 	return 0;
 }
 
@@ -561,67 +853,759 @@ unsigned int cc_qsig_add_call_setup_data(unsigned char *data, struct capi_pvt *i
 	struct cc_qsig_invokedata invoke;
 	struct cc_qsig_nfe nfe;
 	unsigned int dataidx = 0;
+	int protocolvar = 0;
 	
 	const unsigned char xprogress[] = {0x1e,0x02,0xa0,0x90};
 	char *p = NULL;
+	char *pp = NULL;
 	int add_externalinfo = 0;
 			
-	if ((p = pbx_builtin_getvar_helper(c, "QSIG_SETUP"))) {
+	data[0] = 0; /* Initialize array length */
+	
+	if ((p = (char *)pbx_builtin_getvar_helper(c, "QSIG_SETUP"))) {
 		/* some special dial parameters */
 		/* parse the parameters */
 		while ((p) && (*p)) {
 			switch (*p) {
 				case 'X':	/* add PROGRESS INDICATOR for external calls*/
-					cc_verbose(1, 1, VERBOSE_PREFIX_4, "Sending QSIG external PROGRESS IE.\n");
+					cc_verbose(1, 1, VERBOSE_PREFIX_4 "Sending QSIG external PROGRESS IE.\n");
 					add_externalinfo = 1;
-					while (((char)*p!=',')&&(*p)) 	/* Remove next values until separator (,), stop if zero */
-						p++;
+ 					pp = strsep (&p, "/");
+ 					pp = NULL;
+					break;
+				case 'C':
+					cc_verbose(1, 1, VERBOSE_PREFIX_4 "QSIG Call Feature requested: ");
+					p++;
+					switch(identify_qsig_setup_callfeature(p)) {
+						case 1: /* Call transfer */
+							p++;
+ 							pp = strsep(&p, "/");
+							if (!pp) {
+								cc_log(LOG_WARNING, "QSIG Call Feature needs plci as parameter!\n");
+							} else {
+								i->qsig_data.calltransfer = 1;
+								i->qsig_data.partner_plci = atoi(pp);
+								/* set the other channel as partner to me */
+								struct capi_pvt *ii = capi_find_interface_by_plci(i->qsig_data.partner_plci);
+								if (ii)
+									ii->qsig_data.partner_plci = i->PLCI;
+								
+								cc_verbose(1, 1, " for plci %#x\n", i->qsig_data.partner_plci);
+							}
+							break;
+						case 2: /* Call transfer on ring */
+							p += 2;
+ 							pp = strsep(&p, "/");
+							if (!pp) {
+								cc_log(LOG_WARNING, "QSIG Call Feature needs plci as parameter!\n");
+							} else {
+								i->qsig_data.calltransfer_onring = 1;
+								i->qsig_data.partner_plci = atoi(pp);
+								/* set the other channel as partner to me */
+								struct capi_pvt *ii = capi_find_interface_by_plci(i->qsig_data.partner_plci);
+								if (ii)
+									ii->qsig_data.partner_plci = i->PLCI;
+								
+								cc_verbose(1, 1, " for plci %#x\n", i->qsig_data.partner_plci);
+							}
+							break;
+						default:
+ 							pp = strsep(&p, "/");
+							break;
+					}
+					pp = NULL;
 					break;
 				default:
 					cc_log(LOG_WARNING, "Unknown parameter '%c' in QSIG_SETUP, ignoring.\n", *p);
-					while (((char)*p!=',')&&(*p)) 
-						p++;
+					p++;
 			}
-			if (*p)	/* this is not the end */
-				p++;
 		}
 	}
 	
-/*mg:remember me	switch (i->doqsig) {*/
-	cc_qsig_build_facility_struct(data, &dataidx, APDUINTERPRETATION_IGNORE, &nfe);
-	cc_qsig_encode_ecma_name_invoke(data, &dataidx, &invoke, i, 0);
-	cc_qsig_add_invoke(data, &dataidx, &invoke);
+	switch (i->qsigfeat) {
+		case QSIG_TYPE_ALCATEL_ECMA:
+			protocolvar = Q932_PROTOCOL_ROSE;
+			break;
+		case QSIG_TYPE_HICOM_ECMAV2:
+			protocolvar = Q932_PROTOCOL_EXTENSIONS;
+			break;
+		default:
+			cc_log(LOG_WARNING, " Unknown QSIG variant configured.\n");
+			return 0;
+			break;
+	}
+		
+	cc_qsig_build_facility_struct(data, &dataidx, protocolvar, APDUINTERPRETATION_IGNORE, &nfe);
+	cc_qsig_encode_ecma_name_invoke(data, &dataidx, &invoke, i, 0, i->owner->cid.cid_name);
+	cc_qsig_add_invoke(data, &dataidx, &invoke, i);
 	
 	if (add_externalinfo) {
 		/* add PROGRESS INDICATOR for external calls*/
-		memcpy(&data[dataidx], xprogress, sizeof(xprogress));
-		data[0] += data[0] + sizeof(xprogress);
+		int progress_size = sizeof(xprogress);
+		memcpy(&data[dataidx], xprogress, progress_size);
+		data[0] += progress_size;
+		dataidx += progress_size;
 	}
-/*	}*/
+	
 	return 0;
 }
 
+/*
+ * Handles outgoing Facilies on Call Answer
+ */
+unsigned int cc_qsig_add_call_answer_data(unsigned char *data, struct capi_pvt *i, struct  ast_channel *c)
+{
+	struct cc_qsig_invokedata invoke;
+	struct cc_qsig_nfe nfe;
+	unsigned int dataidx = 0;
+	int protocolvar = 0;
+	const char *connectedname;
+	
+	data[0] = 0;
+
+	if (!i->qsigfeat)
+		return 0;
+	
+	if (!(connectedname = pbx_builtin_getvar_helper(c, "CONNECTEDNAME")))
+		return 0;
+	
+	if (!strlen(connectedname)) 
+		return 0;
+	
+	switch (i->qsigfeat) {
+		case QSIG_TYPE_ALCATEL_ECMA:
+			protocolvar = Q932_PROTOCOL_ROSE;
+			break;
+		case QSIG_TYPE_HICOM_ECMAV2:
+			protocolvar = Q932_PROTOCOL_EXTENSIONS;
+			break;
+		default:
+			cc_log(LOG_WARNING, " Unknown QSIG variant configured.\n");
+			return 0;
+			break;
+	}
+
+	cc_qsig_build_facility_struct(data, &dataidx, protocolvar, APDUINTERPRETATION_IGNORE, &nfe);
+	cc_qsig_encode_ecma_name_invoke(data, &dataidx, &invoke, i, 2, (char *)connectedname);
+	cc_qsig_add_invoke(data, &dataidx, &invoke, i);
+
+	return 1;
+}
+
+/*
+ * Handles outgoing Facilies on Call Alert
+ */
+unsigned int cc_qsig_add_call_alert_data(unsigned char *data, struct capi_pvt *i, struct  ast_channel *c)
+{
+	struct cc_qsig_invokedata invoke;
+	struct cc_qsig_nfe nfe;
+	unsigned int dataidx = 0;
+	int protocolvar = 0;
+	const char *connectedname;
+	
+	data[0] = 0;
+	
+	if (!i->qsigfeat)
+		return 0;
+	
+ 	if (!(connectedname = pbx_builtin_getvar_helper(c, "CALLEDNAME")))
+		return 0;
+		
+	if (!strlen(connectedname)) 
+		return 0;
+	
+	switch (i->qsigfeat) {
+		case QSIG_TYPE_ALCATEL_ECMA:
+			protocolvar = Q932_PROTOCOL_ROSE;
+			break;
+		case QSIG_TYPE_HICOM_ECMAV2:
+			protocolvar = Q932_PROTOCOL_EXTENSIONS;
+			break;
+		default:
+			cc_log(LOG_WARNING, " Unknown QSIG variant configured.\n");
+			return 0;
+			break;
+	}
+
+	cc_qsig_build_facility_struct(data, &dataidx, protocolvar, APDUINTERPRETATION_IGNORE, &nfe);
+	cc_qsig_encode_ecma_name_invoke(data, &dataidx, &invoke, i, 1, (char *)connectedname);
+	cc_qsig_add_invoke(data, &dataidx, &invoke, i);
+
+	return 1;
+}
 
 /*
  * Handles outgoing Facilies on capicommand
  */
-unsigned int cc_qsig_do_facility(unsigned char *fac, struct  ast_channel *c, char *param, unsigned int factype)
+unsigned int cc_qsig_do_facility(unsigned char *fac, struct  ast_channel *c, char *param, unsigned int factype, int info1)
 {
 	struct cc_qsig_invokedata invoke;
 	struct cc_qsig_nfe nfe;
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
 	/* struct capi_pvt *ii = NULL; */
 	unsigned int facidx = 0;
+	int protocolvar = 0;
 	
-	cc_qsig_build_facility_struct(fac, &facidx, APDUINTERPRETATION_REJECT, &nfe);
+	switch (i->qsigfeat) {
+		case QSIG_TYPE_ALCATEL_ECMA:
+			protocolvar = Q932_PROTOCOL_ROSE;
+			break;
+		case QSIG_TYPE_HICOM_ECMAV2:
+			protocolvar = Q932_PROTOCOL_EXTENSIONS;
+			break;
+		default:
+			cc_log(LOG_WARNING, " Unknown QSIG variant configured.\n");
+			return 0;
+			break;
+	}
+	
+	cc_qsig_build_facility_struct(fac, &facidx, protocolvar, APDUINTERPRETATION_IGNORE, &nfe);
 	switch (factype) {
+		case 4: /* ECMA-xxx pathReplacementPropose */
+			cc_qsig_encode_ecma_prpropose(fac, &facidx, &invoke, i, param);
+			cc_qsig_add_invoke(fac, &facidx, &invoke, i);
+			
+			break;
+		case 12: /* ECMA-178 callTransfer */
+			cc_qsig_encode_ecma_calltransfer(fac, &facidx, &invoke, i, param, info1);
+			cc_qsig_add_invoke(fac, &facidx, &invoke, i);
+			
+			break;
 		case 99: /* ECMA-300 simpleCallTransfer */
 			cc_qsig_encode_ecma_sscalltransfer(fac, &facidx, &invoke, i, param);
-			cc_qsig_add_invoke(fac, &facidx, &invoke);
+			cc_qsig_add_invoke(fac, &facidx, &invoke, i);
 			break;
 		default:
 			break;
 	}
 	
 	return 0;
+}
+
+/*
+ * capicommand getplci - needed for Call Transfer
+ */
+int pbx_capi_qsig_getplci(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = CC_CHANNEL_PVT(c);
+	char buffer[10];
+
+	snprintf(buffer, sizeof(buffer)-1, "%d", i->PLCI);
+	cc_verbose(4, 1, VERBOSE_PREFIX_4 "QSIG_GETPLCI: %s\n", buffer);
+	pbx_builtin_setvar_helper(c, "QSIG_PLCI", buffer);
+	
+	return 0;
+}
+
+/*
+ * Initiate a QSIG Single Step Call Transfer
+ */
+int pbx_capi_qsig_ssct(struct ast_channel *c, char *param)
+{
+	unsigned char fac[CAPI_MAX_FACILITYDATAARRAY_SIZE];
+	struct capi_pvt *i = CC_CHANNEL_PVT(c);
+
+	if (!param) { /* no data implies no Calling Number and Destination Number */
+		cc_log(LOG_WARNING, "capi qsig_ssct requires source number and destination number\n");
+		return -1;
+	}
+
+	cc_qsig_do_facility(fac, c, param, 99, 0);
+	
+	capi_sendf(NULL, 0, CAPI_INFO_REQ, i->PLCI, get_capi_MessageNumber(),
+		"()(()()()s)",
+		fac
+	);
+
+	return 0;
+}
+
+/*
+ * Initiate a QSIG Call Transfer
+ */
+int pbx_capi_qsig_ct(struct ast_channel *c, char *param)
+{
+	unsigned char fac[CAPI_MAX_FACILITYDATAARRAY_SIZE];
+	struct capi_pvt *i = CC_CHANNEL_PVT(c);
+	struct capi_pvt *ii = NULL;
+	unsigned int callmark;
+	char *marker;
+
+	if (!param) { /* no data implies no Calling Number and Destination Number */
+		cc_log(LOG_WARNING, "capi qsig_ct requires call marker, source number, destination number and await_connect info\n");
+		return -1;
+	}
+
+	marker = strsep(&param, "|");
+	
+	callmark = atoi(marker);
+	cc_verbose(1, 1, VERBOSE_PREFIX_4 "  * QSIG_CT: using call marker %i(%s)\n", callmark, marker);
+	
+	for (ii = capi_iflist; ii; ii = ii->next) {
+		if (ii->qsig_data.callmark == callmark)
+			break;
+	}
+	
+	if (!ii) {
+		cc_log(LOG_WARNING, "capi qsig_ct call marker not found!\n");
+		return -1;
+	}
+	
+	cc_qsig_do_facility(fac, c, param, 12, 1);
+	
+	capi_sendf(NULL, 0, CAPI_INFO_REQ, i->PLCI, get_capi_MessageNumber(),
+		"()(()()()s())",
+		fac
+	);
+
+	cc_qsig_do_facility(fac, c, param, 12, 0);
+	
+	capi_sendf(NULL, 0, CAPI_INFO_REQ, ii->PLCI, get_capi_MessageNumber(),
+		   "()(()()()s())",
+		   fac
+	);
+	
+
+	return 0;
+}
+
+/*
+ * mark an call
+ */
+int pbx_capi_qsig_callmark(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = CC_CHANNEL_PVT(c);
+
+	if (!param) { /* no data implies no Calling Number and Destination Number */
+		cc_log(LOG_WARNING, "capi qsig_callmark requires an call identifier\n");
+		return -1;
+	}
+
+	i->qsig_data.callmark = atoi(param);
+
+	return 0;
+}
+
+
+static void send_feature_calltransfer(struct capi_pvt *i)
+{
+	unsigned char *fac = alloca(CAPI_MAX_FACILITYDATAARRAY_SIZE);
+
+	struct capi_pvt *ii = capi_find_interface_by_plci(i->qsig_data.partner_plci);
+
+	/* needed for Path Replacement */
+	ii->qsig_data.partner_plci = i->PLCI;
+
+	if (ii) {
+		cc_qsig_do_facility(fac, i->owner, NULL, 12, 1);
+		
+		capi_sendf(NULL, 0, CAPI_INFO_REQ, i->PLCI, get_capi_MessageNumber(), "()(()()()s())", fac);
+		
+		cc_qsig_do_facility(fac, ii->owner, NULL, 12, 0);
+
+		capi_sendf(NULL, 0, CAPI_INFO_REQ, ii->PLCI, get_capi_MessageNumber(), "()(()()()s())", fac);
+	} else {
+		cc_log(LOG_WARNING, "Call Transfer failed - second channel not found (PLCI %#x)!\n", i->qsig_data.partner_plci);
+	}
+
+}
+
+/*
+ * init QSIG data on new channel - will be called by mkif
+ */
+void cc_qsig_interface_init(struct cc_capi_conf *conf, struct capi_pvt *tmp)
+{
+	tmp->qsigfeat = conf->qsigfeat;
+	if (!conf->qsigfeat) 
+		return;
+		
+	tmp->qsig_data.calltransfer_active = 0;
+	tmp->qsig_data.calltransfer = 0;
+	tmp->qsig_data.calltransfer_onring = 0;
+	tmp->qsig_data.callmark = 0;
+	tmp->qsig_data.dnameid = NULL;
+
+	/* Path Replacement */
+	tmp->qsig_data.pr_propose_active = 0;
+	tmp->qsig_data.pr_propose_sendback = 0; /* send back an prior received PR PROPOSE on Connect */
+	tmp->qsig_data.pr_propose_sentback = 0;
+	tmp->qsig_data.pr_propose_doinboundbridge = 0;
+	tmp->qsig_data.pr_propose_cid = NULL;	/* Call identity */
+	tmp->qsig_data.pr_propose_pn = NULL;	/* Party Number */
+	
+	cc_copy_string(tmp->qsig_data.if_pr_propose_pn, conf->qsigconf.if_pr_propose_pn, sizeof(tmp->qsig_data.if_pr_propose_pn));
+	
+	/* Partner Channel - needed for many features */
+	tmp->qsig_data.partner_ch = NULL;
+	tmp->qsig_data.partner_plci = 0;
+	tmp->qsig_data.waitevent = 0;
+	
+ 	ast_cond_init(&tmp->qsig_data.event_trigger, NULL);
+}
+
+/*
+ * build the qsig-interface according to configs
+ */
+void cc_pbx_qsig_conf_interface_value(struct cc_capi_conf *conf, struct ast_variable *v)
+{
+#define CONF_STRING(var, token)            \
+	if (!strcasecmp(v->name, token)) { \
+	cc_copy_string(var, v->value, sizeof(var)); \
+	}
+#define CONF_INTEGER(var, token)           \
+	if (!strcasecmp(v->name, token)) { \
+	var = atoi(v->value);      \
+}
+#define CONF_TRUE(var, token, val)         \
+	if (!strcasecmp(v->name, token)) { \
+	if (ast_true(v->value))    \
+	var = val;         \
+}
+
+	CONF_INTEGER(conf->qsigfeat, "qsig")
+	CONF_STRING(conf->qsigconf.if_pr_propose_pn, "qsig_prnum")
+
+	
+#undef CONF_STRING
+#undef CONF_INTEGER
+#undef CONF_TRUE
+}
+
+/*
+ * cleanup QSIG stuff on every (end of) call per interface
+ */
+static void qsig_cleanup_channel(struct  capi_pvt *i)
+{
+	i->qsig_data.callmark = 0;
+	i->qsig_data.partner_ch = NULL;
+	i->qsig_data.calltransfer_active = 0;
+	i->qsig_data.calltransfer_onring = 0;
+	i->qsig_data.pr_propose_active = 0;
+	i->qsig_data.pr_propose_sentback = 0;
+	i->qsig_data.pr_propose_doinboundbridge = 0;
+	if (i->qsig_data.pr_propose_cid) {
+		free(i->qsig_data.pr_propose_cid);
+		i->qsig_data.pr_propose_cid = NULL;
+	}
+	if (i->qsig_data.pr_propose_pn) {
+		free(i->qsig_data.pr_propose_pn);
+		i->qsig_data.pr_propose_pn = NULL;
+	}
+	if (i->qsig_data.dnameid) {
+		free(i->qsig_data.dnameid);
+		i->qsig_data.dnameid = NULL;
+	}
+	
+}
+
+/*
+ * cleanup QSIG stuff on interface
+ */
+void interface_cleanup_qsig(struct capi_pvt *i)
+{
+	if (i->qsigfeat) {
+		cc_verbose(1, 1, VERBOSE_PREFIX_4 "QSIG: cleanup channel\n");
+		qsig_cleanup_channel(i);
+	}
+}
+
+/*
+ * cleanup QSIG stuff on module unload
+ */
+void pbx_capi_qsig_unload_module(struct capi_pvt *i)
+{
+	if (!i->qsigfeat)
+		return;
+	ast_cond_destroy(&i->qsig_data.event_trigger);
+}
+
+/*
+ * wait for B3 up
+ */
+int pbx_capi_qsig_wait_for_prpropose(struct capi_pvt *i)
+{
+	struct timespec abstime;
+	int ret = 1;
+
+  	cc_mutex_lock(&i->lock);
+	if (!(i->qsig_data.pr_propose_sentback)) {
+		i->qsig_data.waitevent = CAPI_QSIG_WAITEVENT_PRPROPOSE;
+		abstime.tv_sec = time(NULL) + CCQSIG_TIMER_WAIT_PRPROPOSE;  /* PR PROPOSE TIMER */
+		abstime.tv_nsec = 0;
+		cc_verbose(4, 1, "%s: wait for PATH REPLACEMENT.\n",
+			   i->vname);
+		if (ast_cond_timedwait(&i->qsig_data.event_trigger, &i->lock, &abstime) != 0) {
+			cc_log(LOG_WARNING, "%s: timed out waiting for PATH REPLACEMENT.\n",
+			       i->vname);
+			ret = 0;
+		} else {
+			cc_verbose(4, 1, "%s: cond signal received for PATH REPLACEMENT.\n",
+				   i->vname);
+		}
+	}
+	cc_mutex_unlock(&i->lock);
+
+	return ret;
+}
+
+/*
+ * check special conditions, wake waiting threads and send outstanding commands
+ * for the given interface
+ */
+static void pbx_capi_qsig_post_handling(struct capi_pvt *i)
+{
+	if ((i->qsig_data.waitevent == CAPI_QSIG_WAITEVENT_PRPROPOSE) &&
+		    (i->qsig_data.pr_propose_sentback == 1)) {
+		i->qsig_data.waitevent = 0;
+ 		ast_cond_signal(&i->qsig_data.event_trigger);
+		cc_verbose(4, 1, "%s: found and signal for PATH REPLACEMENT state.\n",
+			   i->vname);
+		return;
+	}
+}
+
+/* 
+ * handle a bridge attempt - maybe we're allowed to make a path replacement
+ */
+int pbx_capi_qsig_bridge(struct capi_pvt *i0,struct capi_pvt *i1)
+{
+	if (i1->qsig_data.pr_propose_sentback) {
+		return 2; /* Path Replacement already sent out - call will be cleared in short */
+	}
+	
+	i1->qsig_data.partner_plci = i0->PLCI;
+	send_feature_calltransfer(i1);	
+	
+	if (pbx_capi_qsig_wait_for_prpropose(i1))
+		return 1; /* Path Replacement successful */
+
+	/* No Path Replacement - allow line interconnect */
+	return 0;
+
+}
+
+int pbx_capi_qsig_sendtext(struct ast_channel *c, const char *text)
+{
+	struct capi_pvt *i = CC_CHANNEL_PVT(c);
+	
+#if 0
+	/* suppress compiler warnings */
+	unsigned char *data = alloca(CAPI_MAX_FACILITYDATAARRAY_SIZE);
+	unsigned int dataidx = 0;
+	struct cc_qsig_invokedata invoke;
+	struct cc_qsig_nfe nfe;
+#endif
+	
+	int protocolvar = 0;
+	
+	if (!i->qsigfeat)
+		return 0;
+	
+	
+	if (!strlen(text)) 
+		return 0;
+	
+	switch (i->qsigfeat) {
+		case QSIG_TYPE_ALCATEL_ECMA:
+			protocolvar = Q932_PROTOCOL_ROSE;
+			break;
+		case QSIG_TYPE_HICOM_ECMAV2:
+			protocolvar = Q932_PROTOCOL_EXTENSIONS;
+			break;
+		default:
+			cc_log(LOG_WARNING, " Unknown QSIG variant configured.\n");
+			return 0;
+			break;
+	}
+
+	/* TODO: implement something - QSIG_LEG_INFO3 doesn't work here */	
+	
+	return 0;
+}
+		
+/*
+ *  CAPI INFO_IND (QSIG part)
+ */
+void pbx_capi_qsig_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i)
+{
+	if (!i->qsigfeat)	/* Run only, if QSIG enabled */
+		return;
+	
+	switch(INFO_IND_INFONUMBER(CMSG)) {
+		case 0x0008:	/* Cause */
+			break;
+		case 0x0014:	/* Call State */
+			break;
+		case 0x0018:	/* Channel Identification */
+			break;
+		case 0x001c:	/*  Facility Q.932 */
+			{
+				unsigned int qsiginvoke;
+				qsiginvoke = cc_qsig_handle_capi_facilityind( (unsigned char*) INFO_IND_INFOELEMENT(CMSG), i);
+			
+				/* got an Path Replacement */
+				if ((i->qsig_data.pr_propose_cid && i->qsig_data.pr_propose_pn) &! i->qsig_data.pr_propose_sendback &! i->qsig_data.pr_propose_doinboundbridge) {
+					struct capi_pvt *ii = capi_find_interface_by_plci(i->qsig_data.partner_plci);
+					
+					if (ii) {
+						if (ii->state == CAPI_STATE_CONNECTED) { /* second line is connected, we can proceed */
+							unsigned char fac[CAPI_MAX_FACILITYDATAARRAY_SIZE];
+					
+							cc_qsig_do_facility(fac, i->owner, NULL, 4, 0);
+							
+							capi_sendf(NULL, 0, CAPI_INFO_REQ, ii->PLCI, get_capi_MessageNumber(),
+									"()(()()()s)",
+									fac
+							);
+							i->qsig_data.pr_propose_active = 1;
+							ii->qsig_data.pr_propose_sentback = 1;
+						} else { /* Path Replacement has to be sent back after Connect on second line */
+							ii->qsig_data.pr_propose_sendback = 1;
+							ii->qsig_data.pr_propose_cid = strdup(i->qsig_data.pr_propose_cid);
+							ii->qsig_data.pr_propose_pn = strdup(i->qsig_data.pr_propose_pn);
+							ii->qsig_data.pr_propose_active = 1;
+						}
+					} else 
+						cc_verbose(1, 1, VERBOSE_PREFIX_4 "  * QSIG_PATHREPLACEMENT_PROPOSE: no partner channel found (%#x)\n", i->qsig_data.partner_plci);
+					
+
+								
+					free(i->qsig_data.pr_propose_cid);
+					i->qsig_data.pr_propose_cid = NULL;
+					free(i->qsig_data.pr_propose_pn);
+					i->qsig_data.pr_propose_pn = NULL;
+				}
+				
+				if ((i->qsig_data.pr_propose_cid && i->qsig_data.pr_propose_pn) && i->qsig_data.pr_propose_doinboundbridge) {
+					struct ast_channel *chanx;
+					struct capi_pvt *ii = capi_find_interface_by_plci(i->qsig_data.partner_plci);
+					
+					if (ii) {
+						cc_verbose(1, 1, VERBOSE_PREFIX_4 "  * QSIG_PATHREPLACEMENT_PROPOSE: trying to complete bridge...\n");
+						chanx = ast_bridged_channel(i->owner);
+						ast_channel_masquerade(ii->owner, chanx);
+					}
+					
+					free(i->qsig_data.pr_propose_cid);
+					i->qsig_data.pr_propose_cid = NULL;
+					free(i->qsig_data.pr_propose_pn);
+					i->qsig_data.pr_propose_pn = NULL;
+				}			
+				
+			}
+			break;
+		case 0x001e:	/* Progress Indicator */
+			break;
+		case 0x0027:	/*  Notification Indicator */
+			break;
+		case 0x0028:	/* DSP */
+			break;
+		case 0x0029:	/* Date/Time */
+			break;
+		case 0x0070:	/* Called Party Number */
+			break;
+		case 0x0074:	/* Redirecting Number */
+			break;
+		case 0x0076:	/* Redirection Number */
+			break;
+		case 0x00a1:	/* Sending Complete */
+			break;
+		case 0x4000:	/* CHARGE in UNITS */
+			break;
+		case 0x4001:	/* CHARGE in CURRENCY */
+			break;
+		case 0x8001:	/* ALERTING */
+			/* TODO: some checks, if there's any work here */
+			if (i->qsig_data.calltransfer_onring) {
+				i->qsig_data.calltransfer_onring = 0;
+				send_feature_calltransfer(i);
+			}
+			break;
+		case 0x8002:	/* CALL PROCEEDING */
+			break;
+		case 0x8003:	/* PROGRESS */
+			break;
+		case 0x8005:	/* SETUP */
+			break;
+		case 0x8007:	/* CONNECT */
+			if (i->qsig_data.calltransfer) {
+				i->qsig_data.calltransfer = 0;
+				send_feature_calltransfer(i);
+			}
+			{
+				/* handle prior received Path Replacement */
+				if ((i->qsig_data.pr_propose_cid && i->qsig_data.pr_propose_pn) && i->qsig_data.pr_propose_sendback) {
+					unsigned char fac[CAPI_MAX_FACILITYDATAARRAY_SIZE];
+			
+					cc_qsig_do_facility(fac, i->owner, NULL, 4, 0);
+						
+					capi_sendf(NULL, 0, CAPI_INFO_REQ, i->PLCI, get_capi_MessageNumber(),
+							"()(()()()s)",
+							fac
+					);
+					
+					i->qsig_data.pr_propose_sendback = 0;
+ 					free(i->qsig_data.pr_propose_cid);
+					i->qsig_data.pr_propose_cid = NULL;
+ 					free(i->qsig_data.pr_propose_pn);
+					i->qsig_data.pr_propose_pn = NULL;
+					
+					i->qsig_data.pr_propose_sentback = 1;
+				}
+			}
+
+			break;
+		case 0x800d:	/* SETUP ACK */
+			break;
+		case 0x800f:	/* CONNECT ACK */
+			{
+				unsigned int qsiginvoke;
+				qsiginvoke = cc_qsig_handle_capi_facilityind( (unsigned char*) INFO_IND_INFOELEMENT(CMSG), i);
+			}
+			{
+				/* handle outbound Path Replacement */
+				if ((i->qsig_data.pr_propose_cid && i->qsig_data.pr_propose_pn) && i->qsig_data.pr_propose_doinboundbridge) {
+					unsigned char fac[CAPI_MAX_FACILITYDATAARRAY_SIZE];
+			
+					cc_qsig_do_facility(fac, i->owner, NULL, 4, 0);
+						
+					capi_sendf(NULL, 0, CAPI_INFO_REQ, i->PLCI, get_capi_MessageNumber(),
+							"()(()()()s)", fac  );
+					
+					i->qsig_data.pr_propose_sendback = 0;
+					free(i->qsig_data.pr_propose_cid);
+					i->qsig_data.pr_propose_cid = NULL;
+					free(i->qsig_data.pr_propose_pn);
+					i->qsig_data.pr_propose_pn = NULL;
+					
+					i->qsig_data.pr_propose_sentback = 1;
+					i->qsig_data.pr_propose_doinboundbridge = 0;
+
+				}
+			}
+			break;
+		case 0x8045:	/* DISCONNECT */
+			qsig_cleanup_channel(i);
+			
+			break;
+		case 0x804d:	/* RELEASE */
+			break;
+		case 0x805a:	/* RELEASE COMPLETE */
+			qsig_cleanup_channel(i);
+
+			break;
+		case 0x8062:	/* FACILITY */
+			break;
+		case 0x806e:	/* NOTIFY */
+			break;
+		case 0x807b:	/* INFORMATION */
+			break;
+		case 0x807d:	/* STATUS */
+			break;
+		default:
+			break;
+	}
+  	pbx_capi_qsig_post_handling(i);
+	return;
+
 }

@@ -1,5 +1,4 @@
-(CAPI*) chan_capi a Common ISDN API 2.0 implementation
-for Asterisk/OpenPBX
+(CAPI*) chan_capi a Common ISDN API 2.0 implementation for Asterisk
 
 QSIG Extension for chan_capi
 
@@ -36,7 +35,9 @@ To use Q.SIG with asterisk, you'll need a card like Eicon DIVA Server
 
 The QSIG support includes:
 ==========================
+
 - Name presentation on Call SETUP incoming like outgoing
+
 - ISDN LEG INFO2 field - a message which delivers informations about call diversions on incoming call to asterisk
     Data is stored in Asterisk variables:
     QSIG_LI2_DIVREASON		Reason of divertion: 0 - unknown, 1 - unconditional, 2 - user busy, 3 - user no reply
@@ -48,43 +49,62 @@ The QSIG support includes:
     QSIG_LI2_ODIVNAME		original diverting name
 
     at the moment only incoming handling is supported
+    
 - Possibility to inform QSIG switch about call from public network
     If you set variable QSIG_SETUP=X then the QSIG switch on the other side will know, 
     this call source is public network - you will get different ring tone, etc.
     In dialplan use:    Set(__QSIG_SETUP=X)  command.
     The leading "__" tells asterisk, to export this variable to the outgoing channel and
     its subchannels
+    
 - Simple Call Transfer
     With capicommand(qsig_ct|src-id|dst-id) you can transfer an inbound call back to the qsig switch.
     The B-Channel of this call will be relased, so that the line is free for a next call.
     Unfortunately the call will be completely released by the switch, if the target is busy.
-    I have to read the ECMA-300 standard, if there's a chance, to refuse the transfer in such a case.
+    If you want need to know, if your target is busy, you can use the call transfer feature below.
+    
+- Call Transfer (outgoing)
+    You can do an outbound call transfer.
+    First you need the PLCI (logical channel id) of your first channel. You'll get it with capicommand(getplci). This 
+    command returns the channel id in the variable QSIG_PLCI. Now you can enable the call transfer feature.
+    Simply add "Ct<PLCI>" to QSIG_SETUP (i.e. QSIG_SETUP="X/Ct${QSIG_PLCI}" ). On the next dial command the call will 
+    be automatically transferred. The transfer occurs after the CONNECT. If you want an transfer early on ringing you 
+    can use "Ctr<PLCI>". Then the target user will get the infos about the originating user, while his phone is ringing.
+    
+    If the external switch offers an path replacement propose, it will be taken automatically in account.
+    The B-Channels will be cleared by the switch after call connection. Your channels stay free.
+    
+- Automatic Call Transfer and Path Replacement (if allowed/possible) on bridge/line interconnect
+    If an line interconnect is set up from asterisk, chan_capi sends an Call Transfer facility out and waits for an
+    Path Replacement Propose message - if no Path Replacement is received, the line interconnect will proceed.
+    The Call Transfer allows your connected extensions in every case (if the switch supports the Call Transfer feature)
+    to see the name and number of his connected peer.
+    This should be configurable in the next release.
+
+- decoding of incoming Call Transfer feature
+    Enables inbound Path Replacement. If received, an automatic Path Replacement with asterisk internal bridging will be fired.
+
+- Support for sending CalledName
+    If in dialplan a variable CALLEDNAME was set, it will be sent out to the switch, while the asterisk extension is ringing.
+
+- Support for sending ConnectedName
+    If in dialplan a variable CONNECTEDNAME was set, it will be sent out to the switch AFTER connection is answered by asterisk
+    
 
 Future Targets:
 ===============
 - check code for buffer overflows
-- Call Transfer
-- Path Replacement
+- complete path replacement features
+- Call Rerouting feature [ECMA-174]
 - CCBS
 - AOC
+- sendtext implementation (e.g. display instructions on the connected set)
 - ...
 
 How to use:
 ===========
 
 simply enable Q.SIG with following line in your capi.conf interface:
-
-================================================================================
-********** deprecated **********************************************************
-#### qsig=on
-
-#### Take care that you enable this only for interfaces, where the other end 
-#### understands the Q.SIG protocoll. If not, then these switches may reject the 
-#### entire call, because of wrong facility contents.
-
-#### Later this will change to qsig=off or qsig=1..x where we can support some 
-#### pbx manufacturer specific operations.
-================================================================================
 
 Here we go with new configuration
 
@@ -98,6 +118,6 @@ Set qsig to one of the following values, which corresponds to your configuration
 ToDo List:
 ==========
 
-- Invoke Identifier handling - currently i use invoke id #1, will be corrected by capi (outgoing)
-- Handle later facilities - i don't know what to do with most informations now, maybe they are useless in asterisk
-- Outgoing calls support only qsig type 1 (Alcatel) - add support for others on outgoing
+- Support for inbound rerouting
+- Enhance ASN1-97 Addressing Data Elements support - will save much code
+- Allow/Disallow Path Replacement within capi.conf  - partially done

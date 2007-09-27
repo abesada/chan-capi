@@ -1,5 +1,4 @@
-(CAPI*) chan_capi a Common ISDN API 2.0 implementation
-for Asterisk/OpenPBX
+(CAPI*) chan_capi a Common ISDN API 2.0 implementation for Asterisk
 
  Copyright (C) 2005-2007 Cytronics & Melware
  Armin Schindler <armin@melware.de>
@@ -7,9 +6,6 @@ for Asterisk/OpenPBX
  Reworked, but based on the work of
  Copyright (C) 2002-2005 Junghanns.NET GmbH
  Klaus-Peter Junghanns <kpj@junghanns.net>
-
- Ported to OpenPBX.org 22nd October 2004,
- Rob Thomas, <xrobau@gmail.com>
 
 This program is free software and may be modified and distributed under
 the terms of the GNU Public License. There is _NO_ warranty for this!
@@ -72,14 +68,10 @@ This chan_capi version includes:
 - CLI command "capi show channels" shows details on channel status.
 - Asterisk 1.4 jitterbuffer configuration.
 - some QSIG extensions (see README.qsig)
+- CCBS (call completion on busy subscriber)
+- CAPI CHAT (CAPI MeetMe using onboard DSPs)
+- KEYPAD digits detection
 
-Permissions
-===========
-
-OpenPBX.org, by default, runs as the non-root user/group
-openpbx/openpbx.  You must make sure that the /dev/capi* device files
-are readable by OpenPBX.org either by changing the ownership or the
-permissions of the the device files or by running OpenPBX.org as root.
 
 The Dial string
 ===============
@@ -104,6 +96,10 @@ The Dial string
          (Useful if additional digits shall be send afterwards or together
           with 'b' to get dialtone and then send the number, e.g. if otherwise
           no progress tones are available)
+   's' : activate 'stay-online': don't disconnect CAPI connection on Hangup.
+         This is needed to give additional commands like CCBS after Hangup.
+         To really hangup the CAPI connection, use either capicommand(hangup)
+         or wait for chan-capi/network timeout (about 20 seconds).
 
   If the <interface-name> is used in dialstring, be sure the name (specified
   in capi.conf) does not start with 'contr' or 'g'.
@@ -112,6 +108,27 @@ The Dial string
   be modified using the SetCallerPres() application. Use
   SetCallerPres(prohib_not_screened) for CLIR. That is why the msn= param in
   capi.conf has been removed. The callerID is also taken from the calling channel.
+
+
+CLI commands
+============
+
+capi info:
+    Show chan-capi version info.
+    Show status of available B-channels.
+
+capi debug:
+    Enable CAPI message verbosity.
+
+capi no debug:
+    Disable CAPI message verbosity.
+
+capi show channels:
+    Display detailed information on CAPI B-channels.
+    (Description see below)
+
+capi chatinfo:
+    Show status of CAPI CHAT.
 
 
 CAPI command application
@@ -201,6 +218,10 @@ ECT:
         exten => s,1,capicommand(hold)
         exten => s,2,Wait(1)
         exten => s,3,Dial(CAPI/contr1/1234,60,M(capiect))
+    Note: Normaly a PBX needs 'implicit call transfer', which is done by default
+    with this command. But if the line needs real 'explicit call transfer', use
+        exten => s,1,capicommand(ect|x)
+    instead.
 
 3PTY:
     Initiate a Three-Party Conference (must have one call on hold and one active call!).
@@ -212,6 +233,58 @@ ECT:
         [default]
         exten => s,1,capicommand(hold)
         exten => s,2,Dial(CAPI/contr1/1234,,M(capi3pty))
+
+Peer link creation:
+    Create a reference for chan-capi to know who is the calling channel on Dial().
+    This is needed if you want to use CCBS/CCNR afterwards.
+        Example:
+        exten => s,1,capicommand(peerlink)
+
+Hangup in mode 'stay-online':
+    After hangup in 'stay-online' mode, the line isn't really disconnected
+    until timeout or command:
+        exten => s,1,capicommand(hangup)
+    This works after capicommand(peerlink) only.
+
+Set local party to 'busy' or 'free':
+    Set the local phone to status to 'busy' or 'free' when
+    awaiting a callback for CCBS/CCNR. If the network wants to
+    call you back for CCBS/CCNR, chan-capi normaly doesn't know
+    about the status of the extension who started the callback.
+    By default chan-capi assumes 'free', but you can change that
+    with:
+        exten => s,1,capicommand(ccpartybusy|${CCLINKAGEID}|yes)
+    or 
+        exten => s,1,capicommand(ccpartybusy|${CCLINKAGEID}|no)
+
+Call completion on subscriber busy (CCBS):
+    To receive a callback when the dialed and busy party becomes free, aka
+    call completion on subscriber busy, you can do the following:
+        Example:
+        exten => s,1,capicommand(peerlink)  ;to let chan-capi know who is the calling channel.
+        exten => s,2,Dial(CAPI/contr1/123456,60,g)  ;'g' to go-on with the dialplan on busy.
+        exten => s,3,NoOp(${CCLINKAGEID})  ;if this variable now contains a number, CCBS is possible.
+            ;here you can ask the caller if CCBS shall be activated...
+        exten => s,4,capicommand(ccbs|${CCLINKAGEID}|<context>|<exten>|<priority>)
+        exten => s,5,NoOp(${CCBSSTATUS})  ;if CCBS was successfully enabled, it is set to "ACTIVATED".
+    If the remote party becomes 'non-busy', the network initiates the callback which will be
+    sent to the provided context/exten/priority. Of course, this only happens if your local
+    phone is set to 'free' with capicommand(ccpartybusy), which is the default.
+    In this context/exten/priority you should just setup a callfile to initiate an outgoing
+    call from your extension to
+        exten => s,1,Dial(CAPI/ccbs/${CCLINKAGEID}/)
+
+Deactivate CCBS:
+    To deactivate a previously activated CCBS, use following command:
+        Example:
+        exten => s,1,capicommand(ccbsstop|${CCLINKAGEID})
+
+Chat (MeetMe/Conference):
+    If the CAPI card/driver supports it, the caller can be put into a chat-room:
+    (This uses the DSPs onboard a Dialogic DIVA Server Rev.2 card.)
+        exten => s,1,capicommand(chat|<roomname>|<options>|controller)
+		Example:
+            exten => s,1,capicommand(chat|salesmeeting||1,3-6)
 
 
 Using CLIR
@@ -250,6 +323,7 @@ you:
     
 For normal PBX usage you would use the "b" option, always early B3.
 
+
 Overlap sending (a.k.a. real dialtone)
 ======================================
 When you dial an empty number, and have early B3 enabled, with:
@@ -258,6 +332,7 @@ The channel will come up at once and give you the dialtone it gets from the
 local exchange.
 At this point the channel is like a legacy phone, now you can send DTMF digits 
 to dial.    
+
 
 Example context for incoming calls on MSN 12345678:
 ===================================================
@@ -325,6 +400,11 @@ FAXFORMAT     : 0 = SFF.
 FAXPAGES      : Number of pages received.
 FAXID         : The ID of the remote fax maschine.
 
+KEYPAD digits in NT-mode
+========================
+If the device connected to a NT-mode port sends KEYPAD digits
+instead of normal digits, this call is then send to extension
+'Kxxx'. Where 'xxx' stands for the KEYPAD digits sent.
 
 CLI command "capi show channels"
 ================================
@@ -346,6 +426,7 @@ Column description:
               S = SETUP[_ACK] was signaled
   ton       : type of number value
   number    : the caller-number and destination-number
+
 
 Asterisk variables used/set by chan_capi
 ========================================
@@ -373,7 +454,17 @@ CALLINGSUBADDRESS
 
 CALLEDSUBADDRESS
     If set on dial(), the called subaddress will be set to the content.
- 
+
+CCBSSTATUS
+    When using capicommand(ccbs|....), this variable is set to either "ERROR" or
+    "ACTIVATED".
+
+CCLINKAGEID
+    If a Call-Linkage-Id is received for CCBS/CCNR, this variable contains this Id.
+    But you need to use capicommand(peerlink) before dialing a CAPI channel, because
+    of a design problem in Asterisk, chan-capi is not able to set channel variables
+    of the calling channel.
+
 CONNECTEDNUMBER
     Can be set before answering and if set, the content is used for
     IE 'Connected Number' on answering.

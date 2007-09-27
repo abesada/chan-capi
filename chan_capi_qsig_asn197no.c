@@ -1,8 +1,7 @@
 /*
  * (CAPI*)
  *
- * An implementation of Common ISDN API 2.0 for
- * Asterisk / OpenPBX.org
+ * An implementation of Common ISDN API 2.0 for Asterisk
  *
  * Copyright (C) 2005-2007 Cytronics & Melware
  * Copyright (C) 2007 Mario Goegel
@@ -26,7 +25,9 @@
 #include <asterisk/options.h>
 #include "chan_capi20.h"
 #include "chan_capi.h"
+#include "chan_capi_utils.h"
 #include "chan_capi_qsig.h"
+#include "chan_capi_qsig_ecma.h"
 #include "chan_capi_qsig_asn197no.h"
 
 /*
@@ -73,7 +74,7 @@ unsigned int cc_qsig_asn197no_get_name(char *buf, int buflen, unsigned int *bufd
 				if (data[myidx++] == ASN1_OCTETSTRING) {
 					/* should be so */
 					namelength = cc_qsig_asn1_get_string((unsigned char *)buf, buflen, &data[myidx]);
-					myidx += data[myidx-1];		/* is this safe? */
+					myidx += namelength + 1;
 				} else {
 					cc_verbose(1, 1, VERBOSE_PREFIX_4 " Namestruct not ECMA conform (String expected)\n");
 					break;

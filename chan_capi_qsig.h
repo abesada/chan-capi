@@ -20,6 +20,9 @@
 #define QSIG_TYPE_ALCATEL_ECMA	0x01		/* use additional Alcatel ECMA */
 #define QSIG_TYPE_HICOM_ECMAV2	0x02		/* use additional Hicom ECMA V2 */
 
+#define CAPI_QSIG_WAITEVENT_PRPROPOSE 0x01000000
+
+
 #define Q932_PROTOCOL_ROSE			0x11	/* X.219 & X.229 */
 #define Q932_PROTOCOL_CMIP			0x12	/* Q.941 */
 #define Q932_PROTOCOL_ACSE			0x13	/* X.217 & X.227 */
@@ -37,6 +40,9 @@
 #define APDUINTERPRETATION_IGNORE	0x00
 #define APDUINTERPRETATION_CLEARCALL	0x01
 #define APDUINTERPRETATION_REJECT	0x02
+
+/* const char* APDU_STR[] = { "IGNORE APDU", "CLEARCALL-IF-UNKNOWN", "REJECT APDU" }; */
+
 
 		/* ASN.1 Identifier Octet - Data types */
 #define ASN1_TYPE_MASK			0x1f
@@ -86,8 +92,20 @@
 #define CNIP_NAMEUSERPROVIDED	0x00		/* Name is User-provided, unvalidated */
 #define CNIP_NAMEUSERPROVIDEDV	0x01		/* Name is User-provided and validated */
 		
+/* QSIG Operations += 1000 */
 #define CCQSIG__ECMA__NAMEPRES	1000		/* Setting an own constant for ECMA Operation/Namepresentation, others will follow */
-#define CCQSIG__ECMA__LEGINFO2	1011		/* LEG INFORMATION2 */
+#define CCQSIG__ECMA__PRPROPOSE	1004		/* Path Replacement Propose */
+#define CCQSIG__ECMA__CTCOMPLETE 1012		/* Call Transfer Complete */
+#define CCQSIG__ECMA__LEGINFO2	1021		/* LEG INFORMATION2 */
+#define CCQSIG__ECMA__LEGINFO3	1022		/* LEG INFORMATION3 */
+
+
+#define CCQSIG_TIMER_WAIT_PRPROPOSE 1		/* Wait x seconds */
+
+
+#define free_null(x)	{ free(x); x = NULL; }
+
+/* Common QSIG structs */
 
 /*
  * INVOKE Data struct, contains data for further operations
@@ -125,7 +143,6 @@ struct cc_qsig_nfe {
 };
 
 
-
 /*
  * prototypes
  */
@@ -134,12 +151,12 @@ struct cc_qsig_nfe {
  ***  QSIG Core Functions 
  */
 
-extern int cc_qsig_build_facility_struct(unsigned char * buf, unsigned int *idx, int apdu_interpr, struct cc_qsig_nfe *nfe);
-extern int cc_qsig_add_invoke(unsigned char * buf, unsigned int *idx, struct cc_qsig_invokedata *invoke);
+extern int cc_qsig_build_facility_struct(unsigned char * buf, unsigned int *idx, int protocolvar, int apdu_interpr, struct cc_qsig_nfe *nfe);
+extern int cc_qsig_add_invoke(unsigned char * buf, unsigned int *idx, struct cc_qsig_invokedata *invoke, struct capi_pvt *i);
 
 extern unsigned int cc_qsig_asn1_get_string(unsigned char *buf, int buflen, unsigned char *data);
 extern unsigned int cc_qsig_asn1_get_integer(unsigned char *data, int *idx);
-extern unsigned char cc_qsig_asn1_get_oid(unsigned char *data, int *idx);
+extern unsigned char *cc_qsig_asn1_oid2str(unsigned char *data, int size);
 extern unsigned int cc_qsig_asn1_add_string(unsigned char *buf, int *idx, char *data, int datalen);
 extern unsigned int cc_qsig_asn1_add_integer(unsigned char *buf, int *idx, int value);
 
@@ -149,23 +166,30 @@ extern signed int cc_qsig_check_invoke(unsigned char *data, int *idx);
 extern signed int cc_qsig_get_invokeid(unsigned char *data, int *idx, struct cc_qsig_invokedata *invoke);
 extern signed int cc_qsig_fill_invokestruct(unsigned char *data, int *idx, struct cc_qsig_invokedata *invoke, int apduval);
 extern unsigned int cc_qsig_handle_capiind(unsigned char *data, struct capi_pvt *i);
+extern unsigned int cc_qsig_handle_capi_facilityind(unsigned char *data, struct capi_pvt *i);
 extern unsigned int cc_qsig_add_call_setup_data(unsigned char *data, struct capi_pvt *i, struct  ast_channel *c);
+extern unsigned int cc_qsig_add_call_answer_data(unsigned char *data, struct capi_pvt *i, struct  ast_channel *c);
+extern unsigned int cc_qsig_add_call_alert_data(unsigned char *data, struct capi_pvt *i, struct  ast_channel *c);
 extern unsigned int cc_qsig_add_call_facility_data(unsigned char *data, struct capi_pvt *i, int facility);
 
 extern signed int cc_qsig_identifyinvoke(struct cc_qsig_invokedata *invoke, int protocol);
 extern unsigned int cc_qsig_handle_invokeoperation(int invokeident, struct cc_qsig_invokedata *invoke, struct capi_pvt *i);
 
-extern unsigned int cc_qsig_do_facility(unsigned char *fac, struct  ast_channel *c, char *param, unsigned int factype);
+extern unsigned int cc_qsig_do_facility(unsigned char *fac, struct  ast_channel *c, char *param, unsigned int factype, int info1);
 
-/*
- *** ECMA QSIG Functions 
- */
+extern int pbx_capi_qsig_getplci(struct ast_channel *c, char *param);
+extern int pbx_capi_qsig_ssct(struct ast_channel *c, char *param);
+extern int pbx_capi_qsig_ct(struct ast_channel *c, char *param);
+extern int pbx_capi_qsig_callmark(struct ast_channel *c, char *param);
+extern int pbx_capi_qsig_bridge(struct capi_pvt *i0, struct capi_pvt *i1);
+extern int pbx_capi_qsig_sendtext(struct ast_channel *c, const char *text);
 
-extern void cc_qsig_op_ecma_isdn_namepres(struct cc_qsig_invokedata *invoke, struct capi_pvt *i);
-extern int cc_qsig_encode_ecma_name_invoke(unsigned char * buf, unsigned int *idx, struct cc_qsig_invokedata *invoke, struct capi_pvt *i, int nametype);
 
-extern void cc_qsig_op_ecma_isdn_leginfo2(struct cc_qsig_invokedata *invoke, struct capi_pvt *i);
+extern void cc_qsig_interface_init(struct cc_capi_conf *conf, struct capi_pvt *tmp);
+extern void cc_pbx_qsig_conf_interface_value(struct cc_capi_conf *conf, struct ast_variable *v);
+extern void interface_cleanup_qsig(struct capi_pvt *i);
+extern void pbx_capi_qsig_unload_module(struct capi_pvt *i);
+extern void pbx_capi_qsig_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsigned int NCCI, struct capi_pvt *i);
 
-extern void cc_qsig_encode_ecma_sscalltransfer(unsigned char * buf, unsigned int *idx, struct cc_qsig_invokedata *invoke, struct capi_pvt *i, char *param);
 
 #endif
