@@ -37,8 +37,8 @@
 #include "chan_capi_supplementary.h"
 #include "chan_capi_chat.h"
 
-/* #define CC_VERSION "x.y.z" */
-#define CC_VERSION "$Revision$"
+#define CC_VERSION "1.1.0"
+/* #define CC_VERSION "$Revision$" */
 
 /*
  * personal stuff
