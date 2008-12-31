@@ -50,7 +50,7 @@ This chan_capi version includes:
 - Reject call waiting (ACO)
 - DID for Point to Point mode (a.k.a overlap receiving)
 - Rx/Tx gains using positive linar value (rxgain=1.0, txgain=1.0 means no change) 
-- (Inter)national dialing prefix (for callerid) configurable in capi.conf
+- (Inter)national/subscriber dialing prefix (for callerid) configurable in capi.conf
 - CLI command "capi info" shows B channel status of chan_capi
 - Catch all MSN (incomingmsn=*)
 - Some configuration enhancements (msn=123,124,125)
@@ -102,6 +102,12 @@ The Dial string
          This is needed to give additional commands like CCBS after Hangup.
          To really hangup the CAPI connection, use either capicommand(hangup)
          or wait for chan_capi/network timeout (about 20 seconds).
+   'G' : early Line-Interconnect / bridge: Use Line-Interconnect as soon as
+         both b-channels are up. Both channels must be of type CAPI and
+         the incoming call may need 'capicommand(progress)' to enable early-B3
+         on it as well as dial option 'b' for the outgoing channel.
+         Before Dial(), the capicommand(peerlink) must be used to signal the
+         dialed channel its peer.
 
   If the <interface-name> is used in dialstring, be sure the name (specified
   in capi.conf) does not start with 'contr' or 'g'.
@@ -290,6 +296,12 @@ Chat (MeetMe/Conference):
     Possible options:
     'm' = The first caller will get music-on-hold until second caller arrives.
 
+Progress / early-B3 on incoming calls:
+    Activate early-B3 on incoming channels to signal progress tones
+    when in NT-mode or if the Telco-line supports this.
+        Example:
+        exten => s,1,capicommand(progress)
+
 
 Using CLIR
 ==========
@@ -362,8 +374,10 @@ The parameter <filename> is mandatory and the parameters <stationid>,
 By default, if fax reception was not successful, the file is deleted. If you want even
 partly received or broken fax files, use 'k' for "keep bad fax" in the <options>:
   capicommand(receivefax|/tmp/${UNIQUEID}|+123456789||k)
+
 To enable fax tone detection and redirect to extension 'fax', use config variable
-'faxdetect' in capi.conf.
+'faxdetect' in capi.conf. This can be limited to the first 'n' seconds of a connection
+using the setting 'faxdetecttime' in capi.conf.
 
 Example of use :
 line number 123, play something, if a fax tone is detected, handle it
@@ -447,6 +461,9 @@ BCHANNELINFO
 CALLEDTON
     The 'type of number' value of the called number is saved in this variable on
     incomming call.
+
+CALLERTON
+    The 'type of number' value to overwrite for the caller number on outgoing call.
 
 _CALLERHOLDID
     If a call is put on hold (ISDN-HOLD), the reference id is saved in this variable.

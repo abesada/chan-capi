@@ -162,6 +162,7 @@ typedef struct fax3proto3 B3_PROTO_FAXG3;
 
 #define CAPI_NATIONAL_PREF               "0"
 #define CAPI_INTERNAT_PREF              "00"
+#define CAPI_SUBSCRIBER_PREF            ""
 
 #define ECHO_TX_COUNT                   5 /* 5 x 20ms = 100ms */
 #define ECHO_EFFECTIVE_TX_COUNT         3 /* 2 x 20ms = 40ms == 40-100ms  ... ignore first 40ms */
@@ -245,8 +246,7 @@ struct cc_capi_gains {
 #define CAPI_ISDN_STATE_EC            0x00002000
 #define CAPI_ISDN_STATE_DTMF          0x00004000
 #define CAPI_ISDN_STATE_B3_SELECT     0x00008000
-#define CAPI_ISDN_STATE_STAYONLINE    0x00010000
-#define CAPI_ISDN_STATE_ISDNPROGRESS  0x00020000
+#define CAPI_ISDN_STATE_ISDNPROGRESS  0x00010000
 #define CAPI_ISDN_STATE_3PTY          0x10000000
 #define CAPI_ISDN_STATE_PBX_DONT      0x40000000
 #define CAPI_ISDN_STATE_PBX           0x80000000
@@ -261,6 +261,10 @@ struct cc_capi_gains {
 #define CAPI_WAITEVENT_ANSWER_FINISH  0x00030000
 #define CAPI_WAITEVENT_HOLD_IND       0x00040000
 #define CAPI_WAITEVENT_ECT_IND        0x00050000
+
+/* Features and settings of current connection */
+#define CAPI_FSETTING_STAYONLINE      0x00000001
+#define CAPI_FSETTING_EARLY_BRIDGE    0x00000002
 
 /* Private qsig data for capi device */
 struct cc_qsig_data {
@@ -399,11 +403,16 @@ struct capi_pvt {
 	/* Common ISDN Profile (CIP) */
 	int cip;
 	unsigned short transfercapability;
+
+	/* Features and settings of current connection */
+	unsigned int fsetting;
 	
 	/* if not null, receiving a fax */
 	FILE *fFax;
 	/* Fax status */
 	unsigned int FaxState;
+	/* Window for fax detection */
+	unsigned int faxdetecttime;
 
 	/* handle for CCBS/CCNR callback */
 	unsigned int ccbsnrhandle;
@@ -500,6 +509,7 @@ struct cc_capi_conf {
 	int qsigfeat;
 	struct cc_capi_qsig_conf qsigconf;
 	unsigned int faxsetting;
+	unsigned int faxdetecttime;
 	ast_group_t callgroup;
 	ast_group_t pickupgroup;
 	ast_group_t group;
@@ -558,6 +568,7 @@ struct cc_capi_controller {
 #define CAPI_ETSI_DISCONNECT                    0x45
 
 /* ETSI 300 102-1 Numbering Plans */
+#define CAPI_ETSI_NPLAN_SUBSCRIBER              0x40
 #define CAPI_ETSI_NPLAN_NATIONAL                0x20
 #define CAPI_ETSI_NPLAN_INTERNAT                0x10
 

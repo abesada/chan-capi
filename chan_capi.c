@@ -160,6 +160,7 @@ static int interface_task;
 
 static char capi_national_prefix[AST_MAX_EXTENSION];
 static char capi_international_prefix[AST_MAX_EXTENSION];
+static char capi_subscriber_prefix[AST_MAX_EXTENSION];
 
 static char default_language[MAX_LANGUAGE] = "";
 
@@ -892,6 +893,7 @@ static void interface_cleanup(struct capi_pvt *i)
 
 	i->isdnstate = 0;
 	i->cause = 0;
+	i->fsetting = 0;
 
 	i->whentohangup = 0;
 	i->whentoqueuehangup = 0;
@@ -1060,7 +1062,7 @@ void capi_activehangup(struct capi_pvt *i, int state)
 		return;
 	}
 	
-	if ((i->isdnstate & CAPI_ISDN_STATE_STAYONLINE)) {
+	if ((i->fsetting & CAPI_FSETTING_STAYONLINE)) {
 		/* user has requested to leave channel online for further actions
 		   like CCBS */
 		cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: disconnect deferred, stay-online mode PLCI=%#x\n",
@@ -1216,9 +1218,14 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 			use_defaultcid = 1;
 			break;
 		case 's':	/* stay online */
-			if ((i->isdnstate & CAPI_ISDN_STATE_STAYONLINE))
+			if ((i->fsetting & CAPI_FSETTING_STAYONLINE))
 				cc_log(LOG_WARNING, "'stay-online' already set in '%s'\n", idest);
-			i->isdnstate |= CAPI_ISDN_STATE_STAYONLINE;
+			i->fsetting |= CAPI_FSETTING_STAYONLINE;
+			break;
+		case 'G':	/* early bridge */
+			if ((i->fsetting & CAPI_FSETTING_EARLY_BRIDGE))
+				cc_log(LOG_WARNING, "'early-bridge' already set in '%s'\n", idest);
+			i->fsetting |= CAPI_FSETTING_EARLY_BRIDGE;
 			break;
 		case 'q':	/* disable QSIG */
 			cc_verbose(4, 0, VERBOSE_PREFIX_4 "%s: QSIG extensions for this call disabled\n",
@@ -1556,15 +1563,6 @@ static int line_interconnect(struct capi_pvt *i0, struct capi_pvt *i1, int start
 	    (i1->isdnstate & CAPI_ISDN_STATE_DISCONNECT))
 		return -1;
 
-	if ((!(i0->isdnstate & CAPI_ISDN_STATE_B3_UP)) || 
-	    (!(i1->isdnstate & CAPI_ISDN_STATE_B3_UP))) {
-		cc_verbose(3, 1, VERBOSE_PREFIX_2
-			"%s:%s line interconnect aborted, at least "
-			"one channel is not connected.\n",
-			i0->vname, i1->vname);
-		return -1;
-	}
-
 	if (start) {
 		/* connect */
 		capi_sendf(i1, 0, CAPI_FACILITY_REQ, i0->PLCI, get_capi_MessageNumber(),
@@ -1788,6 +1786,44 @@ static int pbx_capi_bridge_transfer(
 }
 
 /*
+ * activate / deactivate b-channel bridge
+ */
+static int capi_bridge(int start, struct capi_pvt *i0, struct capi_pvt *i1, int flags)
+{
+	int ret = 0;
+
+	if (start) {
+		if ((i0->isdnstate & CAPI_ISDN_STATE_LI) ||
+		    (i1->isdnstate & CAPI_ISDN_STATE_LI)) {
+			/* already in bridge */
+			cc_verbose(4, 1, VERBOSE_PREFIX_3 "%s/%s: already in bridge.\n",
+				i0->vname, i1->vname);
+			return 0;
+		}
+		if (!(flags & AST_BRIDGE_DTMF_CHANNEL_0))
+			capi_detect_dtmf(i0, 0);
+
+		if (!(flags & AST_BRIDGE_DTMF_CHANNEL_1))
+			capi_detect_dtmf(i1, 0);
+
+		capi_echo_canceller(i0, EC_FUNCTION_DISABLE);
+		capi_echo_canceller(i1, EC_FUNCTION_DISABLE);
+		cc_verbose(4, 1, VERBOSE_PREFIX_3 "%s/%s: activating bridge.\n",
+			i0->vname, i1->vname);
+		ret = line_interconnect(i0, i1, 1);
+	} else {
+		cc_verbose(4, 1, VERBOSE_PREFIX_3 "%s/%s: deactivating bridge.\n",
+			i0->vname, i1->vname);
+		line_interconnect(i0, i1, 0);
+		capi_detect_dtmf(i0, 1);
+		capi_detect_dtmf(i1, 1);
+		capi_echo_canceller(i0, EC_FUNCTION_ENABLE);
+		capi_echo_canceller(i1, EC_FUNCTION_ENABLE);
+	}
+	return ret;
+}
+
+/*
  * native bridging / line interconnect
  */
 static CC_BRIDGE_RETURN pbx_capi_bridge(
@@ -1832,18 +1868,8 @@ static CC_BRIDGE_RETURN pbx_capi_bridge(
 	capi_wait_for_b3_up(i0);
 	capi_wait_for_b3_up(i1);
 	
-	if (!(flags & AST_BRIDGE_DTMF_CHANNEL_0))
-		capi_detect_dtmf(i0, 0);
-
-	if (!(flags & AST_BRIDGE_DTMF_CHANNEL_1))
-		capi_detect_dtmf(i1, 0);
-
-	capi_echo_canceller(i0, EC_FUNCTION_DISABLE);
-	capi_echo_canceller(i1, EC_FUNCTION_DISABLE);
-
-	if (line_interconnect(i0, i1, 1)) {
-		ret = AST_BRIDGE_FAILED;
-		goto return_from_bridge;
+	if (capi_bridge(1, i0, i1, flags)) {
+		return AST_BRIDGE_FAILED;
 	}
 
 	for (;;) {
@@ -1880,18 +1906,7 @@ static CC_BRIDGE_RETURN pbx_capi_bridge(
 		priority = !priority;
 	}
 
-	line_interconnect(i0, i1, 0);
-
-return_from_bridge:
-
-	if (!(flags & AST_BRIDGE_DTMF_CHANNEL_0))
-		capi_detect_dtmf(i0, 1);
-
-	if (!(flags & AST_BRIDGE_DTMF_CHANNEL_1))
-		capi_detect_dtmf(i1, 1);
-
-	capi_echo_canceller(i0, EC_FUNCTION_ENABLE);
-	capi_echo_canceller(i1, EC_FUNCTION_ENABLE);
+	capi_bridge(0, i0, i1, 0);
 
 	return ret;
 }
@@ -1955,10 +1970,17 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 
 	if (i->doDTMF > 0) {
 		i->vad = ast_dsp_new();
+#ifdef CC_AST_HAS_DSP_SET_DIGITMODE
+		ast_dsp_set_features(i->vad, DSP_FEATURE_DIGIT_DETECT);
+		if (i->doDTMF > 1) {
+			ast_dsp_set_digitmode(i->vad, DSP_DIGITMODE_DTMF | DSP_DIGITMODE_RELAXDTMF);
+		}
+#else
 		ast_dsp_set_features(i->vad, DSP_FEATURE_DTMF_DETECT);
 		if (i->doDTMF > 1) {
 			ast_dsp_digitmode(i->vad, DSP_DIGITMODE_DTMF | DSP_DIGITMODE_RELAXDTMF);
 		}
+#endif
 	}
 
 	CC_CHANNEL_PVT(tmp) = i;
@@ -2412,6 +2434,17 @@ static void capi_handle_dtmf_fax(struct capi_pvt *i)
 			i->vname);
 		return;
 	}
+	if ((i->faxdetecttime > 0) && (c->cdr)) {
+		struct timeval now;
+		gettimeofday(&now, NULL);
+		if ((c->cdr->start.tv_sec + i->faxdetecttime) < now.tv_sec) {
+			cc_verbose(3, 0, VERBOSE_PREFIX_3
+				"%s: Fax detected after %ld seconds, limit %u - ignored\n",
+				i->vname, (long) (now.tv_sec - c->cdr->start.tv_sec),
+				i->faxdetecttime);
+			return;
+		}
+	}
 	
 	if (!strcmp(c->exten, "fax")) {
 		cc_log(LOG_DEBUG, "Already in a fax extension, not redirecting\n");
@@ -2620,12 +2653,14 @@ static void capidev_handle_did_digits(_cmsg *CMSG, unsigned int PLCI, unsigned i
 	update_channel_name(i);	
 	
 	if (i->owner->pbx != NULL) {
-		/* we are already in pbx, so we send the digits as dtmf */
-		for (a = 0; a < strlen(did); a++) {
-			fr.frametype = AST_FRAME_DTMF;
-			fr.subclass = did[a];
-			local_queue_frame(i, &fr);
-		} 
+		if (did) {
+			/* we are already in pbx, so we send the digits as dtmf */
+			for (a = 0; a < strlen(did); a++) {
+				fr.frametype = AST_FRAME_DTMF;
+				fr.subclass = did[a];
+				local_queue_frame(i, &fr);
+			} 
+		}
 		return;
 	}
 
@@ -2675,9 +2710,13 @@ static void capidev_handle_info_disconnect(_cmsg *CMSG, unsigned int PLCI, unsig
 		cc_verbose(4, 1, VERBOSE_PREFIX_3 "%s: Disconnect case 1\n",
 			i->vname);
 		if (i->state == CAPI_STATE_CONNECTED) {
+			if (i->FaxState & CAPI_FAX_STATE_ACTIVE) {
+				/* in fax mode, we wait for DISCONNECT_B3_IND */
+				return;
+			}
 			capi_queue_cause_control(i, 0);
 		} else {
-			if ((i->isdnstate & CAPI_ISDN_STATE_STAYONLINE)) {
+			if ((i->fsetting & CAPI_FSETTING_STAYONLINE)) {
 				cc_verbose(3, 1, VERBOSE_PREFIX_2 "%s: stay-online hangup frame queued.\n",
 					i->vname);
 				i->whentoqueuehangup = time(NULL) + 1;
@@ -2915,6 +2954,8 @@ static void capidev_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsig
 				p2 = capi_national_prefix;
 			} else if (val == CAPI_ETSI_NPLAN_INTERNAT) {
 				p2 = capi_international_prefix;
+			} else if (val == CAPI_ETSI_NPLAN_SUBSCRIBER) {
+				p2 = capi_subscriber_prefix;
 			}
 		}
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: info element REDIRECTION NUMBER '(%s)%s'\n",
@@ -3385,10 +3426,6 @@ static void capidev_handle_connect_b3_active_indication(_cmsg *CMSG, unsigned in
 
 	return_on_no_interface("CONNECT_ACTIVE_B3_IND");
 
-	if (i->channeltype != CAPI_CHANNELTYPE_NULL) {
-		capi_controllers[i->controller]->nfreebchannels--;
-	}
-
 	if (i->state == CAPI_STATE_DISCONNECTING) {
 		cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: CONNECT_B3_ACTIVE_IND during disconnect for NCCI %#x\n",
 			i->vname, NCCI);
@@ -3426,6 +3463,20 @@ static void capidev_handle_connect_b3_active_indication(_cmsg *CMSG, unsigned in
 	} else {
 		capi_echo_canceller(i, EC_FUNCTION_ENABLE);
 		capi_detect_dtmf(i, 1);
+	}
+
+	if (i->fsetting & CAPI_FSETTING_EARLY_BRIDGE) {
+		if ((i->peer != NULL) && (i->peer->tech == &capi_tech)) {
+			struct capi_pvt *i1;
+			i1 = CC_CHANNEL_PVT(i->peer);
+			if ((capi_controllers[i->controller]->lineinterconnect) && 
+			    (capi_controllers[i1->controller]->lineinterconnect) &&
+			    (i->bridge) && (i1->bridge)) {
+				cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: activate early bridge to %s\n",
+					i->vname, i1->vname);
+				capi_bridge(1, i, i1, 0);
+			}
+		}
 	}
 
 	if (i->state == CAPI_STATE_CONNECTED) {
@@ -3478,7 +3529,7 @@ static void capidev_handle_disconnect_b3_indication(_cmsg *CMSG, unsigned int PL
 	}
 
 	if ((i->state == CAPI_STATE_DISCONNECTING)) {
-		if (!(i->isdnstate & CAPI_ISDN_STATE_STAYONLINE)) {
+		if (!(i->fsetting & CAPI_FSETTING_STAYONLINE)) {
 			/* active disconnect */
 			capi_send_disconnect(PLCI, NULL);
 		}
@@ -3506,6 +3557,10 @@ static void capidev_handle_connect_b3_indication(_cmsg *CMSG, unsigned int PLCI,
 
 	i->NCCI = NCCI;
 	i->B3count = 0;
+
+	if (i->channeltype != CAPI_CHANNELTYPE_NULL) {
+		capi_controllers[i->controller]->nfreebchannels--;
+	}
 
 	return;
 }
@@ -3685,6 +3740,9 @@ static void capidev_handle_connect_indication(_cmsg *CMSG, unsigned int PLCI, un
 				else if ((callernplan & 0x70) == CAPI_ETSI_NPLAN_INTERNAT)
 					snprintf(i->cid, (sizeof(i->cid)-1), "%s%s%s",
 						i->prefix, capi_international_prefix, CID);
+				else if ((callernplan & 0x70) == CAPI_ETSI_NPLAN_SUBSCRIBER)
+					snprintf(i->cid, (sizeof(i->cid)-1), "%s%s%s",
+						i->prefix, capi_subscriber_prefix, CID);
 				else
 					snprintf(i->cid, (sizeof(i->cid)-1), "%s%s",
 						i->prefix, CID);
@@ -4025,6 +4083,9 @@ static void capidev_handle_msg(_cmsg *CMSG)
 		if(i == NULL) break;
 		if (wInfo == 0) {
 			i->NCCI = NCCI;
+			if (i->channeltype != CAPI_CHANNELTYPE_NULL) {
+				capi_controllers[i->controller]->nfreebchannels--;
+			}
 		} else {
 			i->isdnstate &= ~(CAPI_ISDN_STATE_B3_UP | CAPI_ISDN_STATE_B3_PEND);
 		}
@@ -4536,7 +4597,7 @@ static void capi_disconnect(struct capi_pvt *i)
 {
 	cc_mutex_lock(&i->lock);
 
-	i->isdnstate &= ~CAPI_ISDN_STATE_STAYONLINE;
+	i->fsetting &= ~CAPI_FSETTING_STAYONLINE;
 	if ((i->isdnstate & CAPI_ISDN_STATE_B3_UP)) {
 		cc_disconnect_b3(i, 0);
 	} else {
@@ -4571,19 +4632,16 @@ static int pbx_capi_realhangup(struct ast_channel *c, char *param)
 
 /*
  * set early-B3 (progress) for incoming connections
- * (only for NT mode)
+ * (mainly for NT mode)
  */
 static int pbx_capi_signal_progress(struct ast_channel *c, char *param)
 {
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
-	unsigned char fac[] = "\x04\x1e\x02\x82\x88"; /* In-Band info available */
+	unsigned char fac[] = "\x04\x1e\x02\x82\x88"; /* In-Band info available (for NT-mode) */
 
-	if ((i->state != CAPI_STATE_DID) && (i->state != CAPI_STATE_INCALL)) {
+	if ((i->state != CAPI_STATE_DID) && (i->state != CAPI_STATE_INCALL) &&
+		(i->state != CAPI_STATE_ALERTING)) {
 		cc_log(LOG_DEBUG, "wrong channel state to signal PROGRESS\n");
-		return 0;
-	}
-	if (!(i->ntmode)) {
-		cc_log(LOG_WARNING, "PROGRESS sending for non NT-mode not possible\n");
 		return 0;
 	}
 	if ((i->isdnstate & CAPI_ISDN_STATE_B3_UP)) {
@@ -4596,15 +4654,22 @@ static int pbx_capi_signal_progress(struct ast_channel *c, char *param)
 			i->vname);
 		return 0;
 	}
+	if (!(i->ntmode)) {
+		if (i->state != CAPI_STATE_ALERTING) {
+			pbx_capi_alert(c);
+		}
+	}
 	i->isdnstate |= CAPI_ISDN_STATE_B3_PEND;
 
 	cc_select_b(i, NULL);
 
-	/* send facility for Progress 'In-Band info available' */
-	capi_sendf(NULL, 0, CAPI_INFO_REQ, i->PLCI, get_capi_MessageNumber(),
-		"()(()()()s())",
-		fac
-	);
+	if ((i->ntmode)) {
+		/* send facility for Progress 'In-Band info available' */
+		capi_sendf(NULL, 0, CAPI_INFO_REQ, i->PLCI, get_capi_MessageNumber(),
+			"()(()()()s())",
+			fac
+		);
+	}
 
 	return 0;
 }
@@ -5254,6 +5319,7 @@ int mkif(struct cc_capi_conf *conf)
 		tmp->ecSelector = conf->ecSelector;
 		tmp->bridge = conf->bridge;
 		tmp->FaxState = conf->faxsetting;
+		tmp->faxdetecttime = conf->faxdetecttime;
 		
 		tmp->smoother = ast_smoother_new(CAPI_MAX_B3_BLOCK_SIZE);
 
@@ -6126,6 +6192,7 @@ static int conf_interface(struct cc_capi_conf *conf, struct ast_variable *v)
 			else
 				conf->faxsetting &= ~(CAPI_FAX_DETECT_OUTGOING | CAPI_FAX_DETECT_INCOMING);
 		} else
+		CONF_INTEGER(conf->faxdetecttime, "faxdetecttime")
 		if (!strcasecmp(v->name, "echocancel")) {
 			if (ast_true(v->value)) {
 				conf->echocancel = 1;
@@ -6197,6 +6264,7 @@ static int capi_eval_config(struct ast_config *cfg)
 	/* prefix defaults */
 	cc_copy_string(capi_national_prefix, CAPI_NATIONAL_PREF, sizeof(capi_national_prefix));
 	cc_copy_string(capi_international_prefix, CAPI_INTERNAT_PREF, sizeof(capi_international_prefix));
+	cc_copy_string(capi_subscriber_prefix, CAPI_SUBSCRIBER_PREF, sizeof(capi_subscriber_prefix));
 
 #ifdef CC_AST_HAS_VERSION_1_4
 	/* Copy the default jb config over global_jbconf */
@@ -6218,6 +6286,8 @@ static int capi_eval_config(struct ast_config *cfg)
 			cc_copy_string(capi_national_prefix, v->value, sizeof(capi_national_prefix));
 		} else if (!strcasecmp(v->name, "internationalprefix")) {
 			cc_copy_string(capi_international_prefix, v->value, sizeof(capi_international_prefix));
+		} else if (!strcasecmp(v->name, "subscriberprefix")) {
+			cc_copy_string(capi_subscriber_prefix, v->value, sizeof(capi_subscriber_prefix));
 		} else if (!strcasecmp(v->name, "language")) {
 			cc_copy_string(default_language, v->value, sizeof(default_language));
 		} else if (!strcasecmp(v->name, "rxgain")) {
