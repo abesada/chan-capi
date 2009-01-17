@@ -1,6 +1,6 @@
 chan_capi a Common ISDN API 2.0 implementation for Asterisk
 
- Copyright (C) 2005-2007 Cytronics & Melware
+ Copyright (C) 2005-2009 Cytronics & Melware
  Armin Schindler <armin@melware.de>
  
  Reworked, but based on the work of
@@ -302,6 +302,11 @@ Progress / early-B3 on incoming calls:
         Example:
         exten => s,1,capicommand(progress)
 
+Get CAPI application ID:
+    To store the CAPI application ID in an asterisk dialplan variable, use:
+        Example:
+            exten => s,1,capicommand(getid,CAPI_ID)
+            exten => s,2,NoOp(CAPI appl-id is ${CAPI_ID})
 
 Using CLIR
 ==========
