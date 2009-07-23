@@ -23,8 +23,10 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <math.h>
 #include <sys/types.h>
 
+#include "chan_capi_platform.h"
 #include "xlaw.h"
 #include "chan_capi20.h"
 #include "chan_capi.h"
@@ -36,6 +38,7 @@
 #include "chan_capi_utils.h"
 #include "chan_capi_supplementary.h"
 #include "chan_capi_chat.h"
+#include "chan_capi_command.h"
 
 /* #define CC_VERSION "x.y.z" */
 #define CC_VERSION "$Revision$"
@@ -46,6 +49,16 @@
 #undef   CAPI_APPLID_UNUSED
 #define  CAPI_APPLID_UNUSED 0xffffffff
 unsigned capi_ApplID = CAPI_APPLID_UNUSED;
+
+#define CAPI_PLCI_VAR_NAME     "CAPIPLCI"
+#define CAPI_ECT_PLCI_VAR_NAME "CAPIECTPLCI"
+#define CAPI_DETECTED_TONE_NAME "CAPIDETECTEDTONE"
+
+typedef struct _diva_supported_tones {
+	unsigned char tone;
+	const char* name;
+} diva_supported_tones_t;
+static const char* pbx_capi_map_detected_tone(unsigned char tone);
 
 static const char tdesc[] = "Common ISDN API Driver (" CC_VERSION ")";
 static const char channeltype[] = CC_MESSAGE_BIGNAME;
@@ -76,7 +89,7 @@ static char *commandtdesc = CC_MESSAGE_BIGNAME " command interface.\n"
 "\"retrieve|${MYHOLDVAR}\" gets back the held call\n"
 "\"ect|${MYHOLDVAR})\" explicit call transfer of call on hold\n"
 "\"3pty_begin|${MYHOLDVAR})\" Three-Party-Conference (3PTY) with active and held call\n"
-"\"receivefax|filename|stationID|headline\" receive a " CC_MESSAGE_BIGNAME " fax\n"
+"\"receivefax|filename|stationID|headline|options\" receive a " CC_MESSAGE_BIGNAME " fax\n"
 "\"sendfax|filename.sff|stationID|headline\" send a " CC_MESSAGE_BIGNAME " fax\n"
 "\"qsig_ssct|cidsrc|ciddst\" QSIG single step call transfer\n"
 "\"qsig_ct|cidsrc|ciddst|marker|waitconnect\" QSIG call transfer\n"
@@ -87,7 +100,7 @@ static char *commandtdesc = CC_MESSAGE_BIGNAME " command interface.\n"
 "FAXREASONTEXT :FAXREASON as text\n"
 "FAXRATE       :baud rate of fax connection\n"
 "FAXRESOLUTION :0=standard, 1=high\n"
-"FAXFORMAT     :0=SFF\n"
+"FAXFORMAT     :0=SFF, 8=native\n"
 "FAXPAGES      :Number of pages received\n"
 "FAXID         :ID of the remote fax machine\n"
 "Asterisk variables used/set by chan_capi:\n"
@@ -166,6 +179,8 @@ static char default_language[MAX_LANGUAGE] = "";
 
 int capi_capability = AST_FORMAT_ALAW;
 
+static int null_plci_dtmf_support = 1;
+
 #ifdef CC_AST_HAS_VERSION_1_4
 /* Global jitterbuffer configuration - by default, jb is disabled */
 static struct ast_jb_conf default_jbconf =
@@ -187,6 +202,9 @@ static int pbx_capi_indicate(struct ast_channel *c, int condition, const void *d
 #else
 static int pbx_capi_indicate(struct ast_channel *c, int condition);
 #endif
+static struct capi_pvt* get_active_plci (struct ast_channel *c);
+static _cstruct diva_get_b1_conf (struct capi_pvt *i);
+static void clear_channel_fax_loop (struct ast_channel *c,  struct capi_pvt *i);
 
 /*
  * B protocol settings
@@ -205,7 +223,7 @@ static struct {
 		NULL,
 		NULL
 	},
-	{ 0x04, 0x04, 0x04,	/* 1 */
+	{ 0x04, 0x04, 0x05,	/* 1 */
 		NULL,
 		NULL,
 		NULL
@@ -215,6 +233,11 @@ static struct {
 		/* (_cstruct) "\x04\x01\x00\x00\x02", */
 		(_cstruct) "\x06\x01\x00\x58\x02\x32\x00",
 		(_cstruct) "\x00"
+	},
+	{ 0x1f, 1, 0,	/* 3 */
+		NULL,
+		NULL,
+		NULL
 	}
 };
 
@@ -519,7 +542,8 @@ static void capi_echo_canceller(struct capi_pvt *i, int function)
 	if ((i->isdnstate & CAPI_ISDN_STATE_DISCONNECT))
 		return;
 
-	if (i->channeltype == CAPI_CHANNELTYPE_NULL) {
+	if ((i->channeltype == CAPI_CHANNELTYPE_NULL) &&
+			(i->line_plci == NULL)) {
 		return;
 	}
 
@@ -539,6 +563,18 @@ static void capi_echo_canceller(struct capi_pvt *i, int function)
 	if ((i->ecSelector == FACILITYSELECTOR_ECHO_CANCEL) &&
 	    (capi_controllers[i->controller]->echocancel)) {
 		ecAvail = 1;
+	}
+
+	if ((i->channeltype == CAPI_CHANNELTYPE_NULL) &&
+			(i->line_plci == NULL)) {
+		return;
+	}
+
+	if ((i->channeltype == CAPI_CHANNELTYPE_NULL) && (capi_controllers[i->controller]->ecPath & EC_ECHOCANCEL_PATH_IP) == 0) {
+		return;
+	}
+	if ((i->channeltype != CAPI_CHANNELTYPE_NULL) && (capi_controllers[i->controller]->ecPath & EC_ECHOCANCEL_PATH_IFC) == 0) {
+		return;
 	}
 
 	/* If echo cancellation is not requested or supported, don't attempt to enable it */
@@ -573,6 +609,112 @@ static void capi_echo_canceller(struct capi_pvt *i, int function)
 	return;
 }
 
+static int capi_check_diva_tone_function_allowed(struct capi_pvt *i)
+{
+	int ecAvail = 0;
+
+	if ((i->isdnstate & CAPI_ISDN_STATE_DISCONNECT))
+		return -1;
+
+	if ((i->channeltype == CAPI_CHANNELTYPE_NULL) &&
+			(i->line_plci == NULL)) {
+		return -1;
+	}
+
+	/* check for old echo-cancel configuration */
+	if ((i->ecSelector != FACILITYSELECTOR_ECHO_CANCEL) &&
+	    (capi_controllers[i->controller]->broadband)) {
+		ecAvail = 1;
+	}
+	if ((i->ecSelector == FACILITYSELECTOR_ECHO_CANCEL) &&
+	    (capi_controllers[i->controller]->echocancel)) {
+		ecAvail = 1;
+	}
+
+	if ((ecAvail == 0) ||
+		(capi_controllers[i->controller]->divaExtendedFeaturesAvailable == 0)) {
+		return -1;
+	}
+
+	if (capi_tcap_is_digital(i->transfercapability)) {
+		cc_verbose(3, 1, VERBOSE_PREFIX_2 "%s: No audio features in digital mode (PLCI=%#x)\n",
+			i->vname, i->PLCI);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * diva audio features
+ */
+static void capi_diva_audio_features(struct capi_pvt *i)
+{
+	if (capi_check_diva_tone_function_allowed(i) != 0)
+		return;
+
+	cc_verbose(3, 0, VERBOSE_PREFIX_2 "%s: Setting up audio features (PLCI=%#x, function=%04x, rx=%u, tx=%u)\n",
+			i->vname, i->PLCI, i->divaAudioFlags, i->divaDigitalRxGain, i->divaDigitalTxGain);
+
+	capi_sendf (i, 0, CAPI_MANUFACTURER_REQ, i->PLCI, get_capi_MessageNumber(),
+			"dw(b(bwww))",
+			_DI_MANU_ID,
+			_DI_DSP_CTRL,
+			0x1c,
+			0x0b,
+			i->divaAudioFlags,
+			i->divaDigitalTxGain,
+			i->divaDigitalRxGain);
+}
+
+static void capi_diva_clamping(struct capi_pvt *i, unsigned int duration)
+{
+	if (capi_check_diva_tone_function_allowed(i) != 0)
+		return;
+
+	if (duration != 0) {
+		cc_verbose(3, 0, VERBOSE_PREFIX_2 "%s: Setting DTMF clamping ON for %u mSec (PLCI=%#x)\n", i->vname, duration, i->PLCI);
+		capi_sendf (i, 0, CAPI_FACILITY_REQ, i->PLCI, get_capi_MessageNumber(), "w(www())", 1, 244, duration, duration);
+	} else {
+		cc_verbose(3, 0, VERBOSE_PREFIX_2 "%s: Setting DTMF clamping OFF (PLCI=%#x)\n", i->vname, i->PLCI);
+		capi_sendf (i, 0, CAPI_FACILITY_REQ, i->PLCI, get_capi_MessageNumber(), "w(www())", 1, 245, 0, 0);
+	}
+}
+
+static void capi_diva_tone_processing_function(struct capi_pvt *i, unsigned char function)
+{
+	if (capi_check_diva_tone_function_allowed(i) != 0)
+		return;
+
+	cc_verbose(3, 0, VERBOSE_PREFIX_2 "%s: Apply tone processing function %u (PLCI=%#x)\n", i->vname, function, i->PLCI);
+	capi_sendf (i, 0, CAPI_FACILITY_REQ, i->PLCI, get_capi_MessageNumber(), "w(www())", 1, function, 0, 0);
+}
+
+static void capi_diva_send_tone_function(struct capi_pvt *i, unsigned char tone)
+{
+	if (capi_check_diva_tone_function_allowed(i) != 0)
+		return;
+
+	capi_sendf (i, 0, CAPI_FACILITY_REQ, i->PLCI, get_capi_MessageNumber(), "w(www(b)())",
+		FACILITYSELECTOR_DTMF, 252, /* send tone */ 0, 0, tone);
+}
+
+static void capi_diva_pitch_control_command(struct capi_pvt *i, int enable, unsigned short rxpitch, unsigned short txpitch)
+{
+	if (capi_check_diva_tone_function_allowed(i) != 0)
+		return;
+
+	capi_sendf (i, 0, CAPI_MANUFACTURER_REQ, i->PLCI, get_capi_MessageNumber(),
+		"dw(b(bwww))",
+		_DI_MANU_ID,
+		_DI_DSP_CTRL,
+		0x1c,
+		0x0a,
+		enable == 0 ? 0x0000 : 0x0001,
+		enable == 0 ? 0 : rxpitch,
+		enable == 0 ? 0 : txpitch);
+}
+
 /*
  * turn on/off DTMF detection
  */
@@ -583,7 +725,8 @@ static int capi_detect_dtmf(struct capi_pvt *i, int flag)
 	if ((i->isdnstate & CAPI_ISDN_STATE_DISCONNECT))
 		return 0;
 
-	if (i->channeltype == CAPI_CHANNELTYPE_NULL) {
+	if ((i->channeltype == CAPI_CHANNELTYPE_NULL) &&
+		(((i->line_plci == NULL) && (null_plci_dtmf_support == 0)) || (i->resource_plci_type == CAPI_RESOURCE_PLCI_LINE))) {
 		return 0;
 	}
 
@@ -610,7 +753,7 @@ static int capi_detect_dtmf(struct capi_pvt *i, int flag)
 
 	error = capi_sendf(i, 0, CAPI_FACILITY_REQ, i->PLCI, get_capi_MessageNumber(),
 		"w(www()())",
-		FACILITYSELECTOR_DTMF,
+		((i->channeltype != CAPI_CHANNELTYPE_NULL) || (i->line_plci != 0)) ?  FACILITYSELECTOR_DTMF : PRIV_SELECTOR_DTMF_ONDATA,
 		(flag == 1) ? 1:2,  /* start/stop DTMF listen */
 		CAPI_DTMF_DURATION,
 		CAPI_DTMF_DURATION
@@ -657,9 +800,13 @@ static int local_queue_frame(struct capi_pvt *i, struct ast_frame *f)
 	}
 
 	if (i->writerfd == -1) {
-		cc_log(LOG_ERROR, "No writerfd in local_queue_frame for %s\n",
-			i->vname);
-		return -1;
+		if (i->resource_plci_type == 0) {
+			cc_log(LOG_ERROR, "No writerfd in local_queue_frame for %s\n",
+				i->vname);
+			return -1;
+		} else {
+			return (0);
+		}
 	}
 
 	if (f->frametype != AST_FRAME_VOICE)
@@ -673,8 +820,8 @@ static int local_queue_frame(struct capi_pvt *i, struct ast_frame *f)
 	}
 
 	if (write(i->writerfd, wbuf, wbuflen) != wbuflen) {
-		cc_log(LOG_ERROR, "Could not write to pipe for %s\n",
-			i->vname);
+		cc_log(LOG_ERROR, "Could not write to pipe for %s fd:%d errno:%d\n",
+			i->vname, i->writerfd, errno);
 	}
 	return 0;
 }
@@ -765,7 +912,6 @@ static int capi_send_dtmf_digits(struct capi_pvt *i, char digit)
 
 	if ((capi_controllers[i->controller]->dtmf == 0) || (i->doDTMF > 0)) {
 		/* let * fake it */
-		cc_mutex_unlock(&i->lock);
 		return -1;
 	}
 
@@ -882,6 +1028,8 @@ static void interface_cleanup(struct capi_pvt *i)
 
 	cc_verbose(2, 1, VERBOSE_PREFIX_2 "%s: Interface cleanup PLCI=%#x\n",
 		i->vname, i->PLCI);
+
+	pbx_capi_voicecommand_cleanup(i);
 
 	if (i->readerfd != -1) {
 		close(i->readerfd);
@@ -1018,16 +1166,12 @@ static void send_progress(struct capi_pvt *i)
 /*
  * send disconnect_req
  */
-static void capi_send_disconnect(unsigned int PLCI, struct capi_pvt *i)
+static void capi_send_disconnect(unsigned int PLCI)
 {
 	if (PLCI == 0) {
 		return;
 	}
-	if (i) {
-		capi_sendf(i, 1, CAPI_DISCONNECT_REQ, PLCI, get_capi_MessageNumber(), "()");
-	} else {
-		capi_sendf(NULL, 0, CAPI_DISCONNECT_REQ, PLCI, get_capi_MessageNumber(), "()");
-	}
+	capi_sendf(NULL, 0, CAPI_DISCONNECT_REQ, PLCI, get_capi_MessageNumber(), "()");
 }
 
 /*
@@ -1091,7 +1235,7 @@ void capi_activehangup(struct capi_pvt *i, int state)
 			/* CONNECT_CONF not received yet? */
 			capi_wait_conf(i, CAPI_CONNECT_CONF);
 		}
-		capi_send_disconnect(i->PLCI, i);
+		capi_send_disconnect(i->PLCI);
 	}
 	return;
 }
@@ -1175,6 +1319,7 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 	int CLIR;
 	int callernplan = 0;
 	int use_defaultcid = 0;
+	_cword cip;
 	const char *ton, *p;
 	char *osa = NULL;
 	char *dsa = NULL;
@@ -1254,9 +1399,9 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 
 	/* if this is a CCBS/CCNR callback call */
 	if (i->ccbsnrhandle) {
-		_cword cip = (_cword)tcap2cip(i->transfercapability);
 		_cword rbref;
 
+		cip = (_cword)tcap2cip(i->transfercapability);
 		i->doOverlap = 0;
 		rbref = capi_ccbsnr_take_ref(i->ccbsnrhandle);
 
@@ -1272,7 +1417,7 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 			b_protocol_table[i->bproto].b1protocol,
 			b_protocol_table[i->bproto].b2protocol,
 			b_protocol_table[i->bproto].b3protocol,
-			b_protocol_table[i->bproto].b1configuration,
+			diva_get_b1_conf(i),
 			b_protocol_table[i->bproto].b2configuration,
 			b_protocol_table[i->bproto].b3configuration
 			/* */ /* BC */
@@ -1312,6 +1457,13 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 		dsa = calledsubaddress;
 	}
 
+	if ((p = pbx_builtin_getvar_helper(c, "CAPI_CIP"))) {
+		cip = (_cword)atoi(p);
+		i->transfercapability = cip2tcap(cip);
+	} else {
+		cip = tcap2cip(i->transfercapability);
+	}
+
 	if (capi_tcap_is_digital(i->transfercapability)) {
 		i->bproto = CC_BPROTO_TRANSPARENT;
 		cc_verbose(4, 0, VERBOSE_PREFIX_2 "%s: is digital call, set proto to TRANSPARENT\n",
@@ -1329,7 +1481,13 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 		called[0] = strlen(dest) + 1;
 		sending_complete = "\x02\x01\x00";
 	}
-	called[1] = 0x80;
+
+	if ((p = pbx_builtin_getvar_helper(c, "CALLEDTON"))) {
+		unsigned char ton = (unsigned char)atoi(p);
+		called[1] = ton | 0x80;
+	} else {
+		called[1] = 0x80;
+	}
 	strncpy(&called[2], dest, sizeof(called) - 3);
 
 	if (c->cid.cid_num) {
@@ -1357,7 +1515,7 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 
 	error = capi_sendf(NULL, 0, CAPI_CONNECT_REQ, i->controller, i->MessageNumber,
 		"wssss(wwwsss())()()()((w)()()ss)",
-		tcap2cip(i->transfercapability), /* CIP value */
+		cip, /* CIP value */
 		called, /* called party number */
 		calling, /* calling party number */
 		dsa, /* called party subaddress */
@@ -1366,7 +1524,7 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 		b_protocol_table[i->bproto].b1protocol,
 		b_protocol_table[i->bproto].b2protocol,
 		b_protocol_table[i->bproto].b3protocol,
-		b_protocol_table[i->bproto].b1configuration,
+		diva_get_b1_conf(i),
 		b_protocol_table[i->bproto].b2configuration,
 		b_protocol_table[i->bproto].b3configuration,
 		 /* BC */
@@ -1390,6 +1548,42 @@ static int pbx_capi_call(struct ast_channel *c, char *idest, int timeout)
 	return 0;
 }
 
+static _cstruct diva_get_b1_conf (struct capi_pvt *i) {
+	_cstruct b1conf = b_protocol_table[i->bproto].b1configuration;
+
+	if (i->bproto == CC_BPROTO_VOCODER) {
+		switch(i->codec) {
+		case AST_FORMAT_ALAW:
+			b1conf = (_cstruct)"\x06\x08\x04\x03\x00\xa0\x00";
+			break;
+		case AST_FORMAT_ULAW:
+			b1conf = (_cstruct)"\x06\x00\x04\x03\x00\xa0\x00";
+			break;
+		case AST_FORMAT_GSM:
+			b1conf = (_cstruct)"\x06\x03\x04\x0f\x00\xa0\x00";
+			break;
+		case AST_FORMAT_G723_1:
+			b1conf = (_cstruct)"\x06\x04\x04\x01\x00\xa0\x00";
+			break;
+		case AST_FORMAT_G726:
+			b1conf = (_cstruct)"\x06\x02\x04\x0f\x00\xa0\x00";
+			break;
+		case AST_FORMAT_ILBC: /* 30 mSec 240 samples */
+			b1conf = (_cstruct)"\x06\x1b\x04\x03\x00\xf0\x00";
+			break;
+		case AST_FORMAT_G729A:
+			b1conf = (_cstruct)"\x06\x12\x04\x0f\x00\xa0\x00";
+			break;
+		default:
+			cc_log(LOG_ERROR, "%s: format %s(%d) invalid.\n",
+				i->vname, ast_getformatname(i->codec), i->codec);
+			break;
+		}
+	}
+
+	return (b1conf);
+}
+
 /*
  * answer a capi call
  */
@@ -1400,6 +1594,7 @@ static int capi_send_answer(struct ast_channel *c, _cstruct b3conf)
 	const char *dnid;
 	const char *connectednumber;
 	unsigned char *facilityarray = NULL;
+	_cstruct b1conf;
     
 	if (i->state == CAPI_STATE_DISCONNECTED) {
 		cc_verbose(3, 0, VERBOSE_PREFIX_2 "%s: Not answering disconnected call.\n",
@@ -1430,6 +1625,8 @@ static int capi_send_answer(struct ast_channel *c, _cstruct b3conf)
 		b3conf = b_protocol_table[i->bproto].b3configuration;
 	}
 
+	b1conf = diva_get_b1_conf(i);
+
 	cc_verbose(3, 0, VERBOSE_PREFIX_2 "%s: Answering for %s\n",
 		i->vname, dnid);
 		
@@ -1448,7 +1645,7 @@ static int capi_send_answer(struct ast_channel *c, _cstruct b3conf)
 		b_protocol_table[i->bproto].b1protocol,
 		b_protocol_table[i->bproto].b2protocol,
 		b_protocol_table[i->bproto].b3protocol,
-		b_protocol_table[i->bproto].b1configuration,
+		b1conf,
 		b_protocol_table[i->bproto].b2configuration,
 		b3conf,
 		capi_set_global_configuration(i),
@@ -1476,7 +1673,7 @@ static int pbx_capi_answer(struct ast_channel *c)
 	struct capi_pvt *i = CC_CHANNEL_PVT(c);
 	int ret;
 
-	i->bproto = CC_BPROTO_TRANSPARENT;
+	i->bproto = ((i->bproto == CC_BPROTO_VOCODER) && (i->codec != 0)) ? i->bproto : CC_BPROTO_TRANSPARENT;
 
 	if (i->rtp) {
 		if (!capi_tcap_is_digital(i->transfercapability))
@@ -1548,7 +1745,7 @@ static void cc_select_b(struct capi_pvt *i, _cstruct b3conf)
 		b_protocol_table[i->bproto].b1protocol,
 		b_protocol_table[i->bproto].b2protocol,
 		b_protocol_table[i->bproto].b3protocol,
-		b_protocol_table[i->bproto].b1configuration,
+		diva_get_b1_conf(i),
 		b_protocol_table[i->bproto].b2configuration,
 		b3conf,
 		capi_set_global_configuration(i)
@@ -1969,6 +2166,16 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 	i->B3count = 0;
 	memset(i->txavg, 0, ECHO_TX_COUNT);
 
+	i->divaAudioFlags            = 0;
+	i->divaDigitalRxGain         = 0;
+	i->divaDigitalRxGainDB       = 0;
+	i->divaDigitalTxGain         = 0;
+	i->divaDigitalTxGainDB       = 0;
+	i->rxPitch                   = 8000;
+	i->txPitch                   = 8000;
+	i->special_tone_extension[0] = 0;
+	pbx_capi_voicecommand_cleanup(i);
+
 	if (i->doDTMF > 0) {
 		i->vad = ast_dsp_new();
 #ifdef CC_AST_HAS_DSP_SET_DIGITMODE
@@ -1990,7 +2197,9 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 	tmp->pickupgroup = i->pickupgroup;
 	tmp->nativeformats = capi_capability;
 	i->bproto = CC_BPROTO_TRANSPARENT;
+
 	if ((i->rtpcodec = (capi_controllers[i->controller]->rtpcodec & i->capability))) {
+#if 0 /* VOCODER */
 		if (capi_alloc_rtp(i)) {
 			/* error on rtp alloc */
 			i->rtpcodec = 0;
@@ -1999,6 +2208,10 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 			tmp->nativeformats = i->rtpcodec;
 			i->bproto = CC_BPROTO_RTP;
 		}
+#else
+		tmp->nativeformats = i->rtpcodec;
+		i->bproto = CC_BPROTO_VOCODER;
+#endif
 	}
 	fmt = ast_best_codec(tmp->nativeformats);
 	i->codec = fmt;
@@ -2013,7 +2226,7 @@ static struct ast_channel *capi_new(struct capi_pvt *i, int state)
 		i->vname, ast_getformatname(fmt),
 		ast_getformatname_multiple(alloca(80), 80,
 		tmp->nativeformats),
-		(i->rtp) ? " (RTP)" : "");
+		(i->bproto == CC_BPROTO_VOCODER) ? "VOCODER" : ((i->rtp) ? " (RTP)" : ""));
 
 	if (!ast_strlen_zero(i->cid)) {
 		if (tmp->cid.cid_num) {
@@ -2166,15 +2379,26 @@ pbx_capi_request(const char *type, int format, void *data, int *cause)
 
 /*
  * fill out fax conf struct
+ *
+ * b3_protocol_options:
+ * [Bit 0] : Enable high resolution
+ * [Bit 1] : Accept incoming fax-polling requests
+ * [Bit 10]: Enable JPEG negotiation (continuous-tone colour mode according to T.4 Annex E) (see note 1)
+ * [Bit 11]: Enable JBIG colour and gray-scale negotiation according to T.43 (see note 1)
+ * [Bit 12]: Do not use JBIG progressive bi-level image compression
+ * [Bit 13]: Do not use MR compression
+ * [Bit 14]: Do not use MMR compression
+ * [Bit 15]: Do not use ECM
+ *
  */
-static void setup_b3_fax_config(B3_PROTO_FAXG3 *b3conf, int fax_format, char *stationid, char *headline)
+static void setup_b3_fax_config(B3_PROTO_FAXG3 *b3conf, int fax_format, char *stationid, char *headline, unsigned short b3_protocol_options)
 {
 	int len1;
 	int len2;
 
-	cc_verbose(3, 1, VERBOSE_PREFIX_3 "Setup fax b3conf fmt=%d, stationid='%s' headline='%s'\n",
-		fax_format, stationid, headline);
-	b3conf->resolution = 0;
+	cc_verbose(3, 1, VERBOSE_PREFIX_3 "Setup fax b3conf fmt=%d, stationid='%s' headline='%s' options=%04x\n",
+		fax_format, stationid, headline, b3_protocol_options);
+	b3conf->resolution = b3_protocol_options;
 	b3conf->format = (unsigned short)fax_format;
 	len1 = strlen(stationid);
 	b3conf->Infos[0] = (unsigned char)len1;
@@ -2189,10 +2413,8 @@ static void setup_b3_fax_config(B3_PROTO_FAXG3 *b3conf, int fax_format, char *st
 /*
  * change b protocol to fax
  */
-static void capi_change_bchan_fax(struct ast_channel *c, B3_PROTO_FAXG3 *b3conf) 
+static void capi_change_bchan_fax(struct capi_pvt *i, B3_PROTO_FAXG3 *b3conf) 
 {
-	struct capi_pvt *i = CC_CHANNEL_PVT(c);
-
 	i->isdnstate |= CAPI_ISDN_STATE_B3_SELECT;
 	cc_disconnect_b3(i, 1);
 	cc_select_b(i, (_cstruct)b3conf);
@@ -2204,15 +2426,23 @@ static void capi_change_bchan_fax(struct ast_channel *c, B3_PROTO_FAXG3 *b3conf)
  */
 static int pbx_capi_receive_fax(struct ast_channel *c, char *data)
 {
-	struct capi_pvt *i = CC_CHANNEL_PVT(c);
+	struct capi_pvt *i = get_active_plci(c);
 	int res = 0;
 	int keepbadfax = 0;
 	char *filename, *stationid, *headline, *options;
 	B3_PROTO_FAXG3 b3conf;
 	char buffer[CAPI_MAX_STRING];
+	unsigned short b3_protocol_options = 0;
+	int extended_resolution = 0;
+
+	if ((i == NULL) || ((i->channeltype == CAPI_CHANNELTYPE_NULL) && (i->line_plci == NULL))) {
+		cc_log(LOG_WARNING, CC_MESSAGE_NAME " receivefax requires resource PLCI\n");
+		return -1;
+	}
 
 	if (!data) { /* no data implies no filename or anything is present */
 		cc_log(LOG_WARNING, CC_MESSAGE_NAME " receivefax requires a filename\n");
+		capi_remove_nullif(i);
 		return -1;
 	}
 
@@ -2240,6 +2470,48 @@ static int pbx_capi_receive_fax(struct ast_channel *c, char *data)
 				"file won't be deleted.\n");
 			keepbadfax = 1;
 			break;
+		case 'f':	/* use Fine resolution */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: Allow Fine resolution\n");
+			b3_protocol_options |= 0x0001;
+			break;
+		case 'u':	/* use Fine resolution */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: Allow Super/Ultra fine resolution\n");
+			b3_protocol_options |= 0x0001;
+			extended_resolution = 1;
+			break;
+		case 'j':	/* enable JPEG encoding */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: enable JPEG coding\n");
+			b3_protocol_options |= 0x0400;
+			break;
+		case 'b':	/* enable T.43 encoding */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: enable T.43 coding\n");
+			b3_protocol_options |= 0x0800;
+			break;
+		case 't':	/* diasble T.85 encoding */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: Do not use T.85 coding\n");
+			b3_protocol_options |= 0x1000;
+			break;
+		case 'e':	/* disable ECM encoding */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: Do not use ECM\n");
+			b3_protocol_options |= 0x8000;
+			break;
+		case 'm':	/* disable MMR encoding */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: do not use MMR (T.6) coding\n");
+			b3_protocol_options |= 0x4000;
+			break;
+		case 'd':	/* disable MR encoding */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: do not use MR (2D) coding\n");
+			b3_protocol_options |= 0x2000;
+			break;
+
 		default:
 			cc_log(LOG_WARNING, "Unknown option '%c' for receivefax.\n",
 				*options);
@@ -2252,11 +2524,21 @@ static int pbx_capi_receive_fax(struct ast_channel *c, char *data)
 	i->FaxState &= ~CAPI_FAX_STATE_CONN;
 	if ((i->fFax = fopen(filename, "wb")) == NULL) {
 		cc_log(LOG_WARNING, "can't create fax output file (%s)\n", strerror(errno));
+		capi_remove_nullif(i);
 		return -1;
 	}
 
+	if (capi_controllers[i->controller]->divaExtendedFeaturesAvailable != 0 && extended_resolution != 0) {
+		/*
+			Per PLCI control is available only starting with Diva 9.0 SU1
+			Without per PLCI control setting is applied to controller
+		*/
+		capi_sendf (NULL, 0, CAPI_MANUFACTURER_REQ, i->PLCI, get_capi_MessageNumber(),
+			"dw(d)", _DI_MANU_ID, _DI_OPTIONS_REQUEST, 0x00000040L);
+	}
+
 	i->FaxState |= CAPI_FAX_STATE_ACTIVE;
-	setup_b3_fax_config(&b3conf, FAX_SFF_FORMAT, stationid, headline);
+	setup_b3_fax_config(&b3conf, FAX_SFF_FORMAT, stationid, headline, b3_protocol_options);
 
 	i->bproto = CC_BPROTO_FAXG3;
 
@@ -2267,22 +2549,30 @@ static int pbx_capi_receive_fax(struct ast_channel *c, char *data)
 		capi_send_answer(c, (_cstruct)&b3conf);
 		break;
 	case CAPI_STATE_CONNECTED:
-		capi_change_bchan_fax(c, &b3conf);
+		if (i->channeltype == CAPI_CHANNELTYPE_NULL) {
+			capi_wait_for_b3_up(i);
+		}
+		capi_change_bchan_fax(i, &b3conf);
 		break;
 	default:
 		i->FaxState &= ~CAPI_FAX_STATE_ACTIVE;
 		cc_log(LOG_WARNING, CC_MESSAGE_NAME " receive fax in wrong state (%d)\n",
 			i->state);
+		capi_remove_nullif(i);
 		return -1;
 	}
 
-	while (capi_tell_fax_finish(i)) {
-		if (ast_safe_sleep_conditional(c, 1000, capi_tell_fax_finish, i) != 0) {
-			/* we got a hangup */
-			cc_verbose(3, 1,
-				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: hangup.\n");
-			break;
+	if (i->channeltype != CAPI_CHANNELTYPE_NULL) {
+		while (capi_tell_fax_finish(i)) {
+			if (ast_safe_sleep_conditional(c, 1000, capi_tell_fax_finish, i) != 0) {
+				/* we got a hangup */
+				cc_verbose(3, 1,
+					VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: hangup.\n");
+				break;
+			}
 		}
+	} else {
+		clear_channel_fax_loop (c, i);
 	}
 
 	cc_mutex_lock(&i->lock);
@@ -2318,7 +2608,82 @@ static int pbx_capi_receive_fax(struct ast_channel *c, char *data)
 	snprintf(buffer, CAPI_MAX_STRING-1, "%d", res);
 	pbx_builtin_setvar_helper(c, "FAXSTATUS", buffer);
 	
+	capi_remove_nullif(i);
+
 	return 0;
+}
+
+static void clear_channel_fax_loop(struct ast_channel *c,  struct capi_pvt *i)
+{
+	struct ast_frame *f;
+	int ms;
+	int exception;
+	int ready_fd;
+	int waitfd;
+	int nfds = 1;
+	struct ast_channel *rchan;
+	struct ast_channel *chan = c;
+
+	ast_indicate(chan, -1);
+
+	waitfd = i->readerfd;
+	ast_set_read_format(chan, capi_capability);
+	ast_set_write_format(chan, capi_capability);
+
+	while (capi_tell_fax_finish(i)) {
+		ready_fd = 0;
+		ms = 10;
+		errno = 0;
+		exception = 0;
+
+		rchan = ast_waitfor_nandfds(&chan, 1, &waitfd, nfds, &exception, &ready_fd, &ms);
+
+		if (rchan) {
+			f = ast_read(chan);
+			if (!f) {
+				cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: clear channel fax: no frame, hangup.\n",
+					i->vname);
+				break;
+			}
+			if ((f->frametype == AST_FRAME_CONTROL) && (f->subclass == AST_CONTROL_HANGUP)) {
+				cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: clear channel fax: hangup frame.\n",
+					i->vname);
+				ast_frfree(f);
+				break;
+			} else if (f->frametype == AST_FRAME_VOICE) {
+				cc_verbose(5, 1, VERBOSE_PREFIX_3 "%s: clear channel fax: voice frame.\n",
+					i->vname);
+				capi_write_frame(i, f);
+			} else if (f->frametype == AST_FRAME_NULL) {
+				/* ignore NULL frame */
+				cc_verbose(5, 1, VERBOSE_PREFIX_3 "%s: cler channel fax: NULL frame, ignoring.\n",
+					i->vname);
+			} else {
+				cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: cler channel fax: unhandled frame %d/%d.\n",
+					i->vname, f->frametype, f->subclass);
+			}
+			ast_frfree(f);
+		} else if (ready_fd == i->readerfd) {
+			if (exception) {
+				cc_verbose(1, 0, VERBOSE_PREFIX_3 "%s: cler channel fax: exception on readerfd\n",
+					i->vname);
+				break;
+			}
+			f = capi_read_pipeframe(i);
+			if (f->frametype == AST_FRAME_VOICE) {
+				ast_write(chan, f);
+			}
+			/* ignore other nullplci frames */
+		} else {
+			if ((ready_fd < 0) && ms) { 
+				if (errno == 0 || errno == EINTR)
+					continue;
+				cc_log(LOG_WARNING, "%s: Wait failed (%s).\n",
+					chan->name, strerror(errno));
+				break;
+			}
+		}
+	}
 }
 
 /*
@@ -2326,25 +2691,37 @@ static int pbx_capi_receive_fax(struct ast_channel *c, char *data)
  */
 static int pbx_capi_send_fax(struct ast_channel *c, char *data)
 {
-	struct capi_pvt *i = CC_CHANNEL_PVT(c);
+	struct capi_pvt *i = get_active_plci (c);
 	int res = 0;
-	char *filename, *stationid, *headline;
+	char *filename, *stationid, *headline, *options;
 	B3_PROTO_FAXG3 b3conf;
 	char buffer[CAPI_MAX_STRING];
+	int file_format;
+	unsigned short b3_protocol_options = 0;
+	int extended_resolution = 0;
+
+	if ((i == NULL) || ((i->channeltype == CAPI_CHANNELTYPE_NULL) && (i->line_plci == NULL))) {
+		cc_log(LOG_WARNING, CC_MESSAGE_NAME " receivefax requires resource PLCI\n");
+		return -1;
+	}
 
 	if (!data) { /* no data implies no filename or anything is present */
 		cc_log(LOG_WARNING, CC_MESSAGE_NAME " sendfax requires a filename\n");
+		capi_remove_nullif(i);
 		return -1;
 	}
 
 	filename = strsep(&data, "|");
 	stationid = strsep(&data, "|");
-	headline = data;
+	headline = strsep(&data, "|");
+	options = data;
 
 	if (!stationid)
 		stationid = emptyid;
 	if (!headline)
 		headline = emptyid;
+	if (!options)
+		options = emptyid;
 
 	cc_verbose(3, 1, VERBOSE_PREFIX_3 CC_MESSAGE_NAME " sendfax: '%s' '%s' '%s'\n",
 		filename, stationid, headline);
@@ -2353,11 +2730,94 @@ static int pbx_capi_send_fax(struct ast_channel *c, char *data)
 
 	if ((i->fFax = fopen(filename, "rb")) == NULL) {
 		cc_log(LOG_WARNING, "can't open fax file (%s)\n", strerror(errno));
+		capi_remove_nullif(i);
 		return -1;
 	}
 
-	i->FaxState |= (CAPI_FAX_STATE_ACTIVE | CAPI_FAX_STATE_SENDMODE);
-	setup_b3_fax_config(&b3conf, FAX_SFF_FORMAT, stationid, headline);
+	/*
+		Get file format
+	*/
+	{
+		unsigned char tmp[2] = { 0, 0 };
+
+		if (fread(tmp, 1, 2, i->fFax) != 2) {
+			cc_log(LOG_WARNING, "can't read fax file (%s)\n", strerror(errno));
+			fclose(i->fFax);
+			i->fFax = 0;
+			capi_remove_nullif(i);
+			return -1;
+		}
+
+		if ((tmp[0] == 0x53) && (tmp[1] == 0x66)) { /* SFF */
+			file_format = FAX_SFF_FORMAT;
+		} else if ((tmp[0] == 0xff) && (tmp[1] == 0xd8)) { /* JPEG */
+			file_format = FAX_NATIVE_FILE_TRANSFER_FORMAT;
+			b3_protocol_options |= 0x0400;
+		} else if ((tmp[0] == 0xff) && (tmp[1] == 0xa8)) { /* T.43 */
+			file_format = FAX_NATIVE_FILE_TRANSFER_FORMAT;
+			b3_protocol_options |= 0x0800;
+		} else { /* TXT */
+			file_format = FAX_ASCII_FORMAT;
+		}
+	}
+
+	rewind(i->fFax);
+
+	/* parse the options */
+	while ((options) && (*options)) {
+		switch (*options) {
+		case 'f':	/* use Fine resolution */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: Use Fine resolution\n");
+			b3_protocol_options |= 0x0001;
+			break;
+		case 'u':	/* use Fine resolution */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: Allow Super/Ultra fine resolution\n");
+			b3_protocol_options |= 0x0001;
+			extended_resolution = 1;
+			break;
+		case 'j':	/* enable JPEG encoding */
+		case 't':	/* diasble T.85 encoding */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: Do not use T.85 coding\n");
+			b3_protocol_options |= 0x1000;
+			break;
+		case 'e':	/* disable ECM encoding */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: Do not use EC\nM");
+			b3_protocol_options |= 0x8000;
+			break;
+		case 'm':	/* disable MMR encoding */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: do not use MMR (T.6) coding\n");
+			b3_protocol_options |= 0x4000;
+			break;
+		case 'd':	/* disable MR encoding */
+			cc_verbose(3, 1,
+				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " receivefax: do not use MR (2D) coding\n");
+			b3_protocol_options |= 0x2000;
+			break;
+		default:
+			cc_log(LOG_WARNING, "Unknown option '%c' for receivefax.\n",
+				*options);
+		}
+		options++;
+	}
+
+	if (capi_controllers[i->controller]->divaExtendedFeaturesAvailable != 0 && extended_resolution != 0) {
+		/*
+			Per PLCI control is available only starting with Diva 9.0 SU1
+			Without per PLCI control setting is applied to controller
+		*/
+		capi_sendf (NULL, 0, CAPI_MANUFACTURER_REQ, i->PLCI, get_capi_MessageNumber(),
+			"dw(d)", _DI_MANU_ID, _DI_OPTIONS_REQUEST, 0x00000040L);
+	}
+
+	if (i->channeltype != CAPI_CHANNELTYPE_NULL) {
+		i->FaxState |= (CAPI_FAX_STATE_ACTIVE | CAPI_FAX_STATE_SENDMODE);
+	}
+	setup_b3_fax_config(&b3conf, file_format, stationid, headline, b3_protocol_options);
 
 	i->bproto = CC_BPROTO_FAXG3;
 
@@ -2368,21 +2828,31 @@ static int pbx_capi_send_fax(struct ast_channel *c, char *data)
 		capi_send_answer(c, (_cstruct)&b3conf);
 		break;
 	case CAPI_STATE_CONNECTED:
-		capi_change_bchan_fax(c, &b3conf);
+		if (i->channeltype == CAPI_CHANNELTYPE_NULL) {
+			capi_wait_for_b3_up(i);
+			i->FaxState |= (CAPI_FAX_STATE_ACTIVE | CAPI_FAX_STATE_SENDMODE);
+		}
+		capi_change_bchan_fax(i, &b3conf);
 		break;
 	default:
 		i->FaxState &= ~CAPI_FAX_STATE_ACTIVE;
 		cc_log(LOG_WARNING, CC_MESSAGE_NAME " send fax in wrong state (%d)\n",
 			i->state);
+		capi_remove_nullif(i);
 		return -1;
 	}
-	while (capi_tell_fax_finish(i)) {
-		if (ast_safe_sleep_conditional(c, 1000, capi_tell_fax_finish, i) != 0) {
-			/* we got a hangup */
-			cc_verbose(3, 1,
-				VERBOSE_PREFIX_3 CC_MESSAGE_NAME " sendfax: hangup.\n");
-			break;
+
+	if (i->channeltype != CAPI_CHANNELTYPE_NULL) {
+		while (capi_tell_fax_finish(i)) {
+			if (ast_safe_sleep_conditional(c, 1000, capi_tell_fax_finish, i) != 0) {
+				/* we got a hangup */
+				cc_verbose(3, 1,
+					VERBOSE_PREFIX_3 CC_MESSAGE_NAME " sendfax: hangup.\n");
+				break;
+			}
 		}
+	} else {
+		clear_channel_fax_loop (c, i);
 	}
 
 	cc_mutex_lock(&i->lock);
@@ -2407,7 +2877,30 @@ static int pbx_capi_send_fax(struct ast_channel *c, char *data)
 	}
 	snprintf(buffer, CAPI_MAX_STRING-1, "%d", res);
 	pbx_builtin_setvar_helper(c, "FAXSTATUS", buffer);
-	
+
+	if (i->channeltype == CAPI_CHANNELTYPE_NULL) {
+		struct timespec abstime;
+
+		cc_mutex_lock(&i->lock);
+		/* wait for the B3 layer to go down */
+		if ((i->isdnstate & (CAPI_ISDN_STATE_B3_UP | CAPI_ISDN_STATE_B3_PEND))) {
+			i->waitevent = CAPI_WAITEVENT_B3_DOWN;
+			abstime.tv_sec = time(NULL) + 2;
+			abstime.tv_nsec = 0;
+			cc_verbose(4, 1, "%s: wait for b3 down.\n",
+				i->vname);
+			if (ast_cond_timedwait(&i->event_trigger, &i->lock, &abstime) != 0) {
+				cc_log(LOG_WARNING, "%s: timed out waiting for b3 down.\n",
+					i->vname);
+			} else {
+				cc_verbose(4, 1, "%s: cond signal received for b3 down.\n",
+					i->vname);
+			}
+		}
+		cc_mutex_unlock(&i->lock);
+	}
+	capi_remove_nullif(i);
+
 	return 0;
 }
 
@@ -2702,7 +3195,7 @@ static void capidev_handle_info_disconnect(_cmsg *CMSG, unsigned int PLCI, unsig
 			i->vname);
 		/* the caller onhold hung up (or ECTed away) */
 		/* send a disconnect_req , we cannot hangup the channel here!!! */
-		capi_send_disconnect(PLCI, NULL);
+		capi_send_disconnect(PLCI);
 		return;
 	}
 
@@ -2747,7 +3240,7 @@ static void capidev_handle_info_disconnect(_cmsg *CMSG, unsigned int PLCI, unsig
 			i->vname);
 		if (i->FaxState & CAPI_FAX_STATE_ACTIVE) {
 			/* in fax mode, we just hangup */
-			capi_send_disconnect(i->PLCI, NULL);
+			capi_send_disconnect(i->PLCI);
 			return;
 		}
 		capi_queue_cause_control(i, 0);
@@ -3127,6 +3620,8 @@ static int handle_facility_indication_dtmf(
 		dtmflen = read_capi_word(FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG) + 1);
 		FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG) += 3;
 	}
+
+
 	while (dtmflen) {
 		dtmf = (FACILITY_IND_FACILITYINDICATIONPARAMETER(CMSG))[dtmfpos];
 		cc_verbose(1, 1, VERBOSE_PREFIX_4 "%s: c_dtmf = %c\n",
@@ -3135,9 +3630,132 @@ static int handle_facility_indication_dtmf(
 			if ((dtmf == 'X') || (dtmf == 'Y')) {
 				capi_handle_dtmf_fax(i);
 			} else {
-				fr.frametype = AST_FRAME_DTMF;
-				fr.subclass = dtmf;
-				local_queue_frame(i, &fr);
+				int ignore_digit = 0;
+
+				if (capi_controllers[i->controller]->divaExtendedFeaturesAvailable != 0) {
+					switch ((unsigned char)dtmf) {
+					case 0x23: /* DTMF '#' */
+					case 0x2a: /* DTMF '*' */
+					case '0':  /* DTMF '0' */
+					case '1':  /* DTMF '1' */
+					case '2':  /* DTMF '2' */
+					case '3':  /* DTMF '3' */
+					case '4':  /* DTMF '4' */
+					case '5':  /* DTMF '5' */
+					case '6':  /* DTMF '6' */
+					case '7':  /* DTMF '7' */
+					case '8':  /* DTMF '8' */
+					case '9':  /* DTMF '9' */
+					case 0x41: /* DTMF 'A' */
+					case 0x42: /* DTMF 'B' */
+					case 0x43: /* DTMF 'C' */
+					case 0x44: /* DTMF 'D' */
+						break;
+
+					/* Dial pulse listen active: Signals in order of detection */
+					/* MF listen active: Signals in order of detection */
+					case 0xE0: /* Dial pulse digit '1' detected */
+					case 0xF1: /* MF '1' detected */
+						dtmf = '1';
+						break;
+					case 0xE1: /* Dial pulse digit '2' detected */
+					case 0xF2: /* MF '2' detected */
+						dtmf = '2';
+						break;
+					case 0xE2: /* Dial pulse digit '3' detected */
+					case 0xF3: /* MF '3' detected */
+						dtmf = '3';
+						break;
+					case 0xE3: /* Dial pulse digit '4' detected */
+					case 0xF4: /* MF '4' detected */
+						dtmf = '4';
+						break;
+					case 0xE4: /* Dial pulse digit '5' detected */
+					case 0xF5: /* MF '5' detected */
+						dtmf = '5';
+						break;
+					case 0xE5: /* Dial pulse digit '6' detected */
+					case 0xF6: /* MF '6' detected */
+						dtmf = '6';
+						break;
+					case 0xE6: /* Dial pulse digit '7' detected */
+					case 0xF7: /* MF '7' detected */
+						dtmf = '7';
+						break;
+					case 0xE7: /* Dial pulse digit '8' detected */
+					case 0xF8: /* MF '8' detected */
+						dtmf = '8';
+						break;
+					case 0xE8: /* Dial pulse digit '9' detected */
+					case 0xF9: /* MF '9' detected */
+						dtmf = '9';
+						break;
+					case 0xE9: /* Dial pulse digit '0' detected */
+					case 0xFA: /* MF '0' detected */
+						dtmf = '0';
+						break;
+
+					case 0x80: /* End of signal detected */
+					case 0x81: /* Unidentified tone detected */
+					case 0xEA: /* Dial pulse reserved */
+					case 0xF0: /* recognition of falling edge of MF tone */
+					case 0xEB: /* Dial pulse reserved */
+					case 0xEC: /* Dial pulse reserved */
+					case 0xED: /* Dial pulse reserved */
+					case 0xEF: /* Dial pulse reserved */
+						ignore_digit = 1;
+						break;
+
+					case 0xFB: /* MF  K1 detected */
+						dtmf = 'A';
+						break;
+					case 0xFC: /* MF  K2 detected */
+						dtmf = 'B';
+						break;
+					case 0xFD: /* MF  KP detected */
+						dtmf = 'C';
+						break;
+					case 0xFE: /* MF  S1 detected */
+						dtmf = 'D';
+						break;
+					case 0xFF: /* MF  ST detected */
+						dtmf = '*';
+						break;
+
+					default: 
+					  {
+						const char* special_tone_name = pbx_capi_map_detected_tone(dtmf);
+						if ((special_tone_name != 0) && (i->owner != 0)) {
+							int n = 0;
+							char buffer[32];
+							cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: map detected '%s' %02x tone to '%s'\n",
+										i->vname, special_tone_name, (unsigned char)dtmf,
+										i->special_tone_extension);
+							ignore_digit = 1;
+							snprintf (buffer, sizeof(buffer)-1, "%u", (unsigned char)dtmf);
+							buffer[sizeof(buffer)-1] = 0;
+
+							pbx_builtin_setvar_helper(i->owner, CAPI_DETECTED_TONE_NAME, buffer);
+							pbx_builtin_setvar_helper(i->owner, CAPI_DETECTED_TONE_NAME"VISUAL",
+								special_tone_name);
+
+							while (i->special_tone_extension[n] != 0) {
+								fr.frametype = AST_FRAME_DTMF;
+								fr.subclass = i->special_tone_extension[n++];
+								local_queue_frame(i, &fr);
+							}
+						}
+					  }
+					  break;
+					}
+				}
+				if (ignore_digit == 0) {
+					if (pbx_capi_voicecommand_process_digit(i, 0, dtmf) == 0) {
+						fr.frametype = AST_FRAME_DTMF;
+						fr.subclass = dtmf;
+						local_queue_frame(i, &fr);
+					}
+				}
 			}
 		}
 		dtmflen--;
@@ -3159,6 +3777,7 @@ static void capidev_handle_facility_indication(_cmsg *CMSG, unsigned int PLCI, u
 		resp_done = handle_facility_indication_line_interconnect(CMSG, PLCI, NCCI, i);
 		break;
 	case FACILITYSELECTOR_DTMF:
+	case PRIV_SELECTOR_DTMF_ONDATA:
 		return_on_no_interface("FACILITY_IND DTMF");
 		resp_done = handle_facility_indication_dtmf(CMSG, PLCI, NCCI, i);
 		break;
@@ -3240,44 +3859,48 @@ static void capidev_handle_data_b3_indication(_cmsg *CMSG, unsigned int PLCI, un
 		i->B3q += b3len;
 	}
 
-	if ((i->doES == 1) && (!capi_tcap_is_digital(i->transfercapability))) {
-		for (j = 0; j < b3len; j++) {
-			*(b3buf + j) = capi_reversebits[*(b3buf + j)]; 
-			if (capi_capability == AST_FORMAT_ULAW) {
-				rxavg += abs(capiULAW2INT[ capi_reversebits[*(b3buf + j)]]);
-			} else {
-				rxavg += abs(capiALAW2INT[ capi_reversebits[*(b3buf + j)]]);
-			}
-		}
-		rxavg = rxavg / j;
-		for (j = 0; j < ECHO_EFFECTIVE_TX_COUNT; j++) {
-			txavg += i->txavg[j];
-		}
-		txavg = txavg / j;
-			    
-		if ( (txavg / ECHO_TXRX_RATIO) > rxavg) {
-			if (capi_capability == AST_FORMAT_ULAW) {
-				memset(b3buf, 255, b3len);
-			} else {
-				memset(b3buf, 85, b3len);
-			}
-			cc_verbose(6, 1, VERBOSE_PREFIX_3 "%s: SUPPRESSING ECHO rx=%d, tx=%d\n",
-					i->vname, rxavg, txavg);
-		}
-	} else {
-		if ((i->rxgain == 1.0) || (capi_tcap_is_digital(i->transfercapability))) {
+	if (i->bproto != CC_BPROTO_VOCODER) {
+		if ((i->doES == 1) && (!capi_tcap_is_digital(i->transfercapability))) {
 			for (j = 0; j < b3len; j++) {
-				*(b3buf + j) = capi_reversebits[*(b3buf + j)];
+				*(b3buf + j) = capi_reversebits[*(b3buf + j)]; 
+				if (capi_capability == AST_FORMAT_ULAW) {
+					rxavg += abs(capiULAW2INT[ capi_reversebits[*(b3buf + j)]]);
+				} else {
+					rxavg += abs(capiALAW2INT[ capi_reversebits[*(b3buf + j)]]);
+				}
+			}
+			rxavg = rxavg / j;
+			for (j = 0; j < ECHO_EFFECTIVE_TX_COUNT; j++) {
+				txavg += i->txavg[j];
+			}
+			txavg = txavg / j;
+				    
+			if ( (txavg / ECHO_TXRX_RATIO) > rxavg) {
+				if (capi_capability == AST_FORMAT_ULAW) {
+					memset(b3buf, 255, b3len);
+				} else {
+					memset(b3buf, 85, b3len);
+				}
+				cc_verbose(6, 1, VERBOSE_PREFIX_3 "%s: SUPPRESSING ECHO rx=%d, tx=%d\n",
+						i->vname, rxavg, txavg);
 			}
 		} else {
-			for (j = 0; j < b3len; j++) {
-				*(b3buf + j) = capi_reversebits[i->g.rxgains[*(b3buf + j)]];
+			if ((i->rxgain == 1.0) || (capi_tcap_is_digital(i->transfercapability))) {
+				for (j = 0; j < b3len; j++) {
+					*(b3buf + j) = capi_reversebits[*(b3buf + j)];
+				}
+			} else {
+				for (j = 0; j < b3len; j++) {
+					*(b3buf + j) = capi_reversebits[i->g.rxgains[*(b3buf + j)]];
+				}
 			}
 		}
+		fr.subclass = capi_capability;
+	} else {
+		fr.subclass = i->codec;
 	}
 
 	fr.frametype = AST_FRAME_VOICE;
-	fr.subclass = capi_capability;
 	fr.FRAME_DATA_PTR = b3buf;
 	fr.datalen = b3len;
 	fr.samples = b3len;
@@ -3399,13 +4022,16 @@ static void capidev_handle_connect_active_indication(_cmsg *CMSG, unsigned int P
 		if (i->outgoing == 1) {
 			/* outgoing call */
 			if (i->channeltype == CAPI_CHANNELTYPE_NULL) {
-				/* NULL-PLCI needs a virtual connection */
-				capi_sendf(NULL, 0, CAPI_FACILITY_REQ, PLCI, get_capi_MessageNumber(),
-					"w(w(d()))",
-					FACILITYSELECTOR_LINE_INTERCONNECT,
-					0x0001, /* CONNECT */
-					0x0000000c /* mask */
-				);
+				if (i->resource_plci_type != CAPI_RESOURCE_PLCI_LINE) {
+					/* NULL-PLCI needs a virtual connection */
+					capi_sendf(NULL, 0, CAPI_FACILITY_REQ, PLCI, get_capi_MessageNumber(),
+						"w(w(d()))",
+						FACILITYSELECTOR_LINE_INTERCONNECT,
+						0x0001, /* CONNECT */
+						(i->line_plci == NULL) ? 0x00000030 : 0x00000000 /* mask */
+					);
+
+				}
 			}
 			cc_start_b3(i);
 		} else {
@@ -3517,10 +4143,21 @@ static void capidev_handle_disconnect_b3_indication(_cmsg *CMSG, unsigned int PL
 		if (ncpi) {
 			snprintf(buffer, CAPI_MAX_STRING-1, "%d", read_capi_word(&ncpi[1]));
 			pbx_builtin_setvar_helper(i->owner, "FAXRATE", buffer);
-			snprintf(buffer, CAPI_MAX_STRING-1, "%d", read_capi_word(&ncpi[3]));
+			snprintf(buffer, CAPI_MAX_STRING-1, "%d", read_capi_word(&ncpi[3]) & 1);
 			pbx_builtin_setvar_helper(i->owner, "FAXRESOLUTION", buffer);
 			snprintf(buffer, CAPI_MAX_STRING-1, "%d", read_capi_word(&ncpi[5]));
 			pbx_builtin_setvar_helper(i->owner, "FAXFORMAT", buffer);
+			strcpy (buffer, "0");
+			if (read_capi_word(&ncpi[5]) == 8) {
+				unsigned short options = read_capi_word(&ncpi[3]);
+
+				if (options & 0x0400) {
+					strcpy (buffer, "1");
+				} else if (options & 0x0800) {
+					strcpy (buffer, "2");
+				}
+			}
+			pbx_builtin_setvar_helper(i->owner, "FAXCFFFORMAT", buffer);
 			snprintf(buffer, CAPI_MAX_STRING-1, "%d", read_capi_word(&ncpi[7]));
 			pbx_builtin_setvar_helper(i->owner, "FAXPAGES", buffer);
 			memcpy(buffer, &ncpi[10], ncpi[9]);
@@ -3532,11 +4169,11 @@ static void capidev_handle_disconnect_b3_indication(_cmsg *CMSG, unsigned int PL
 	if ((i->state == CAPI_STATE_DISCONNECTING)) {
 		if (!(i->fsetting & CAPI_FSETTING_STAYONLINE)) {
 			/* active disconnect */
-			capi_send_disconnect(PLCI, NULL);
+			capi_send_disconnect(PLCI);
 		}
 	} else if ((!(i->isdnstate & CAPI_ISDN_STATE_B3_SELECT)) &&
 	           (i->FaxState & CAPI_FAX_STATE_SENDMODE)) {
-		capi_send_disconnect(PLCI, NULL);
+		capi_send_disconnect(PLCI);
 	}
 
 	if (i->channeltype != CAPI_CHANNELTYPE_NULL) {
@@ -3783,6 +4420,8 @@ static void capidev_handle_connect_indication(_cmsg *CMSG, unsigned int PLCI, un
 			pbx_builtin_setvar_helper(i->owner, "BCHANNELINFO", bchannelinfo);
 			sprintf(buffer, "%d", callednplan);
 			pbx_builtin_setvar_helper(i->owner, "CALLEDTON", buffer);
+			sprintf(buffer, "%d", i->cip);
+			pbx_builtin_setvar_helper(i->owner, "CAPI_CIP", buffer);
 			/*
 			pbx_builtin_setvar_helper(i->owner, "CALLINGSUBADDRESS",
 				CONNECT_IND_CALLINGPARTYSUBADDRESS(CMSG));
@@ -3840,6 +4479,18 @@ static void capidev_handle_facility_confirmation(_cmsg *CMSG, unsigned int PLCI,
 	if (*i == NULL)
 		return;
 
+	if ((selector == PRIV_SELECTOR_DTMF_ONDATA) && (i[0]->channeltype == CAPI_CHANNELTYPE_NULL) && (i[0]->line_plci == NULL)) {
+		if (FACILITY_CONF_INFO(CMSG)) {
+			if (FACILITY_CONF_INFO(CMSG) == 0x300b) {
+				null_plci_dtmf_support = 0;
+				cc_log(LOG_WARNING, "no support for DTMF detection on NULL PLCI in this CAPI version. Please update CAPI driver.\n");
+			}
+			return;
+		}
+		cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: NULL PLCI DTMF conf(PLCI=%#x)\n",
+			(*i)->vname, PLCI);
+		return;
+	}
 	if (selector == FACILITYSELECTOR_DTMF) {
 		cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: DTMF conf(PLCI=%#x)\n",
 			(*i)->vname, PLCI);
@@ -4146,6 +4797,26 @@ static void capidev_handle_msg(_cmsg *CMSG)
 		wInfo = INFO_CONF_INFO(CMSG);
 		break;
 
+	case CAPI_P_CONF(MANUFACTURER):
+		if (CMSG->ManuID == _DI_MANU_ID) {
+			switch (CMSG->Class & 0xffff) {
+			case _DI_OPTIONS_REQUEST:
+			case _DI_DSP_CTRL:
+				wInfo = (unsigned short)(CMSG->Class >> 16);
+				break;
+			case _DI_ASSIGN_PLCI:
+				wInfo = (unsigned short)(CMSG->Class >> 16);
+				capidev_handle_connection_conf(&i, PLCI, wInfo, wMsgNum);
+				break;
+
+			default:
+				cc_log(LOG_ERROR, CC_MESSAGE_BIGNAME ": unknown manufacturer command: %04x",
+					CMSG->Class & 0xffff);
+				break;
+			}
+			break;
+		}
+
 	default:
 		cc_log(LOG_ERROR, CC_MESSAGE_BIGNAME ": Command=%s,0x%04x",
 			capi_command_to_string(wCmd), wCmd);
@@ -4170,6 +4841,19 @@ static void capidev_handle_msg(_cmsg *CMSG)
 	}
 
 	return;
+}
+
+
+static struct capi_pvt* get_active_plci (struct ast_channel *c) {
+	struct capi_pvt* i;
+
+	if (c->tech == &capi_tech) {
+		i = CC_CHANNEL_PVT(c);
+	} else {
+		i = pbx_check_resource_plci(c);
+	}
+
+	return (i);
 }
 
 /*
@@ -4369,6 +5053,7 @@ static int pbx_capi_ect(struct ast_channel *c, char *param)
 	unsigned int plci = 0;
 	unsigned int ectplci;
 	char *holdid;
+	int explicit_peer_plci = 0;
 
 	if ((id = pbx_builtin_getvar_helper(c, "CALLERHOLDID"))) {
 		plci = (unsigned int)strtoul(id, NULL, 0);
@@ -4380,6 +5065,21 @@ static int pbx_capi_ect(struct ast_channel *c, char *param)
 		plci = (unsigned int)strtoul(holdid, NULL, 0);
 	}
 
+	if (plci == 0) {
+		if ((id = pbx_builtin_getvar_helper(c, CAPI_ECT_PLCI_VAR_NAME))) {
+			plci = (unsigned int)strtoul(id, NULL, 0);
+		}
+		if (plci == 0) {
+			cc_log(LOG_WARNING, "%s: No id for ECT !\n", i->vname);
+			return -1;
+		} else {
+			explicit_peer_plci = 1;
+			cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: using explicit ect PLCI=%#x for PLCI=%x\n",
+				i->vname, plci, i->PLCI);
+			cc_log(LOG_WARNING,  "%s: using explicit PLCI=%#x\n", i->vname, plci);
+		}
+	}
+
 	if (!plci) {
 		cc_log(LOG_WARNING, "%s: No id for ECT !\n", i->vname);
 		return -1;
@@ -4387,24 +5087,35 @@ static int pbx_capi_ect(struct ast_channel *c, char *param)
 
 	cc_mutex_lock(&iflock);
 	for (ii = capi_iflist; ii; ii = ii->next) {
-		if (ii->onholdPLCI == plci)
+		if (((explicit_peer_plci != 0) && (ii->PLCI == plci)) || (ii->onholdPLCI == plci))
 			break;
 	}
 	cc_mutex_unlock(&iflock);
 
 	if (!ii) {
-		cc_log(LOG_WARNING, "%s: 0x%x is not on hold !\n",
-			i->vname, plci);
+		cc_log(LOG_WARNING, "%s: 0x%x is not %s !\n",
+			i->vname, plci, (explicit_peer_plci == 0) ? "on hold" : "found");
 		return -1;
 	}
 
 	ectplci = plci;
-	if ((param) && (*param == 'x')) {
-		ectplci = i->PLCI;
+
+	if ((param != 0) && (*param != 0)) {
+		cc_log(LOG_NOTICE, "%s: ECT param '%s'\n", i->name, param);
+	} else {
+		cc_log(LOG_NOTICE, "%s: no ECT param \n", i->name);
 	}
 
-	cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: using PLCI=%#x for ECT\n",
-		i->vname, ectplci);
+	if (explicit_peer_plci == 0) {
+		if ((param) && (*param == 'x')) {
+			ectplci = i->PLCI;
+		}
+	} else {
+		plci = i->PLCI;
+	}
+
+	cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: using %sPLCI=%#x for ECT\n",
+		i->vname, (explicit_peer_plci == 0) ? "" : "explicit ", ectplci);
 
 	if (!(capi_controllers[i->controller]->ECT)) {
 		cc_log(LOG_WARNING, "%s: ECT for %s not supported by controller.\n",
@@ -4412,13 +5123,14 @@ static int pbx_capi_ect(struct ast_channel *c, char *param)
 		return -1;
 	}
 
-	if (!(ii->isdnstate & CAPI_ISDN_STATE_HOLD)) {
+	if ((explicit_peer_plci == 0) && (!(ii->isdnstate & CAPI_ISDN_STATE_HOLD))) {
 		cc_log(LOG_WARNING, "%s: PLCI %#x (%s) is not on hold for ECT\n",
 			i->vname, plci, ii->vname);
 		return -1;
 	}
 
-	cc_disconnect_b3(i, 1);
+	if (explicit_peer_plci == 0)
+		cc_disconnect_b3(i, 1);
 
 	if (i->state != CAPI_STATE_CONNECTED) {
 		cc_log(LOG_WARNING, "%s: destination not connected for ECT\n",
@@ -4442,8 +5154,8 @@ static int pbx_capi_ect(struct ast_channel *c, char *param)
 	
 	cc_mutex_unlock(&ii->lock);
 
-	cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: sent ECT for PLCI=%#x to PLCI=%#x\n",
-		i->vname, plci, ectplci);
+	cc_verbose(2, 1, VERBOSE_PREFIX_4 "%s: sent ECT for %sPLCI=%#x to PLCI=%#x\n",
+		i->vname, (explicit_peer_plci == 0) ? "" : "explicit ", plci, ectplci);
 
 	return 0;
 }
@@ -4538,7 +5250,15 @@ static int pbx_capi_malicious(struct ast_channel *c, char *param)
  */
 static int pbx_capi_echocancel(struct ast_channel *c, char *param)
 {
-	struct capi_pvt *i = CC_CHANNEL_PVT(c);
+	struct capi_pvt *i = get_active_plci (c);
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
 
 	if (!param) {
 		cc_log(LOG_WARNING, "Parameter for echocancel missing.\n");
@@ -4556,6 +5276,712 @@ static int pbx_capi_echocancel(struct ast_channel *c, char *param)
 	}
 	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: echocancel switched %s\n",
 		i->vname, i->doEC ? "ON":"OFF");
+	return 0;
+}
+
+/*
+ * noise suppressor
+ */
+static int pbx_capi_noisesuppressor(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	if (param == NULL) {
+		cc_log(LOG_WARNING, "Parameter for noise suppressor missing.\n");
+		return -1;
+	}
+
+	if (ast_true(param)) {
+		i->divaAudioFlags |= 0x0080;
+		capi_diva_audio_features(i);
+	} else if (ast_false(param)) {
+		i->divaAudioFlags &= ~0x0080;
+		capi_diva_audio_features(i);
+	} else {
+		cc_log(LOG_WARNING, "Parameter for noise suppressor invalid.\n");
+		return -1;
+	}
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: noise suppressor switched %s\n",
+		i->vname, (i->divaAudioFlags & 0x0080) != 0 ? "ON":"OFF");
+
+	return 0;
+}
+
+/*
+ * +6dB to -14dB in 0.1dB increments coded in the range 0xFF74 0x003C
+ */
+static unsigned short dbGain2DivaGain(float dbGain)
+{
+	float newGain;
+
+	if (dbGain < -126)
+		return 0x100;
+	if (dbGain == -126)
+		return 0x101;
+	if (dbGain == 0)
+		return 0x8000;
+	if (dbGain >= 6)
+		return 0x8600;
+
+	newGain = 0x8000 + (dbGain * 256.0);
+
+	return ((unsigned short)floorf(newGain));
+}
+
+static int pbx_capi_rxdgain(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+	float dbGain;
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	if (param == NULL) {
+		cc_log(LOG_WARNING, "Parameter for rx gain missing.\n");
+		return -1;
+	}
+
+	dbGain = atof(param);
+
+	cc_mutex_lock(&i->lock);
+	i->divaDigitalRxGainDB = dbGain;
+	i->divaDigitalRxGain   = dbGain2DivaGain (dbGain);
+	cc_mutex_unlock(&i->lock);
+
+	capi_diva_audio_features(i);
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: rx gain %f : %04x\n",
+		i->vname, dbGain, i->divaDigitalRxGain);
+
+	return 0;
+}
+
+static int pbx_capi_incrxdgain(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+	float dbGainInc;
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	if (param == NULL) {
+		cc_log(LOG_WARNING, "Parameter for nncremental rx gain missing.\n");
+		return -1;
+	}
+
+	cc_mutex_lock(&i->lock);
+	dbGainInc = atof(param);
+	i->divaDigitalRxGainDB += dbGainInc;
+	i->divaDigitalRxGain = dbGain2DivaGain(i->divaDigitalRxGainDB);
+	cc_mutex_unlock(&i->lock);
+
+	capi_diva_audio_features(i);
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: inc rx gain %f : %04x\n",
+		i->vname, i->divaDigitalRxGainDB, i->divaDigitalRxGain);
+
+	return 0;
+}
+
+static int pbx_capi_txdgain(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+	float dbGain;
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	if (param == NULL) {
+		cc_log(LOG_WARNING, "Parameter for tx gain missing.\n");
+		return -1;
+	}
+
+	cc_mutex_lock(&i->lock);
+	dbGain = atof(param);
+	i->divaDigitalTxGainDB = dbGain;
+	i->divaDigitalTxGain = dbGain2DivaGain(dbGain);
+	cc_mutex_unlock(&i->lock);
+
+	capi_diva_audio_features(i);
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: tx gain %f : %04x\n",
+		i->vname, dbGain, i->divaDigitalTxGain);
+
+	return 0;
+}
+
+static int pbx_capi_inctxdgain(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+	float dbGainInc;
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	if ((param == 0) || (*param == 0)) {
+		cc_log(LOG_WARNING, "Parameter for incremental tx gain missing.\n");
+		return -1;
+	}
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: inc tx gain %s:%f\n",
+		i->vname, param,  atof(param));
+
+	cc_mutex_lock(&i->lock);
+	dbGainInc = atof(param);
+	i->divaDigitalTxGainDB += dbGainInc;
+	i->divaDigitalTxGain = dbGain2DivaGain(i->divaDigitalTxGainDB);
+	cc_mutex_unlock(&i->lock);
+
+	capi_diva_audio_features(i);
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: inc tx gain %f : %04x\n",
+		i->vname, i->divaDigitalTxGainDB, i->divaDigitalTxGain);
+
+	return 0;
+}
+
+static int pbx_capi_rxagc(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	if (!param) {
+		cc_log(LOG_WARNING, "Parameter for rx agc missing.\n");
+		return -1;
+	}
+
+	if (ast_true(param)) {
+		i->divaAudioFlags |= 0x0008;
+		capi_diva_audio_features(i);
+	} else if (ast_false(param)) {
+		i->divaAudioFlags &= ~0x0008;
+		capi_diva_audio_features(i);
+	} else {
+		cc_log(LOG_WARNING, "Parameter for rx agc invalid.\n");
+		return -1;
+	}
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: rx AGC switched %s\n",
+		i->vname, (i->divaAudioFlags & 0x0008) != 0 ? "ON":"OFF");
+
+	return 0;
+}
+
+static int pbx_capi_txagc(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	if (!param) {
+		cc_log(LOG_WARNING, "Parameter for tx agc missing.\n");
+		return -1;
+	}
+
+	if (ast_true(param)) {
+		i->divaAudioFlags |= 0x0004;
+		capi_diva_audio_features(i);
+	} else if (ast_false(param)) {
+		i->divaAudioFlags &= ~0x0004;
+		capi_diva_audio_features(i);
+	} else {
+		cc_log(LOG_WARNING, "Parameter for noise suppressor invalid.\n");
+		return -1;
+	}
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: tx AGC switched %s\n",
+		i->vname, (i->divaAudioFlags & 0x0004) != 0 ? "ON":"OFF");
+
+	return 0;
+}
+
+static int pbx_capi_getplci(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = CC_CHANNEL_PVT(c);
+
+	if ((i != 0) && (i->owner != 0)) {
+		char buffer[128];
+
+		snprintf(buffer, sizeof(buffer)-1, "%d", i->PLCI);
+		buffer[sizeof(buffer)-1] = 0;
+		pbx_builtin_setvar_helper(c, "CAPIPLCI", buffer);
+	}
+
+	return 0;
+}
+
+/*
+ * DTMF suppression
+ */
+static int pbx_capi_clamping(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+	int duration = 0;
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	if (param != NULL) {
+		duration = atoi(param);
+		if (duration != 0 && duration < 10)
+			duration = 10;
+		if (duration > 200)
+			duration = 200;
+	}
+
+	capi_diva_clamping(i, (unsigned short)duration);
+
+	return 0;
+}
+
+
+static int pbx_capi_mftonedetection(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+	unsigned char function;
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	if (!param) {
+		cc_log(LOG_WARNING, "Parameter for MF tone detection missing.\n");
+		return -1;
+	}
+
+	if (ast_true(param)) {
+		function = 253; /* Start MF listen on B channel data */
+	} else if (ast_false(param)) {
+		function = 254; /* Stop MF listen */
+	} else {
+		cc_log(LOG_WARNING, "Parameter for MF tone detection invalid.\n");
+		return -1;
+	}
+
+	capi_diva_tone_processing_function(i, function);
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: MF tone detection switched %s\n",
+		i->vname, function == 253 ? "ON":"OFF");
+
+	return 0;
+}
+
+static int pbx_capi_pulsedetection(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+	unsigned char function;
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	if (!param) {
+		cc_log(LOG_WARNING, "Parameter for Pulse detection missing.\n");
+		return -1;
+	}
+
+	if (ast_true(param)) {
+		function = 246; /* Start dial pulse detector */
+	} else if (ast_false(param)) {
+		function = 247; /* Stop dial pulse detector */
+	} else {
+		cc_log(LOG_WARNING, "Parameter for Pulse detection invalid.\n");
+		return -1;
+	}
+
+	capi_diva_tone_processing_function(i, function);
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: Pulse detection switched %s\n",
+		i->vname, function == 253 ? "ON":"OFF");
+
+	return 0;
+}
+
+static int pbx_capi_sendtone(struct ast_channel *c, char *param)
+{
+	static diva_supported_tones_t diva_tx_tones[] = {
+		{ 0x82, "Dial tone" },
+		{ 0x83, "PABX internal dial tone" },
+		{ 0x84, "Special dial tone (stutter dial tone)" },
+		{ 0x85, "Second dial tone" },
+		{ 0x86, "Ringing tone" },
+		{ 0x87, "Special ringing tone" },
+		{ 0x88, "Busy tone" },
+		{ 0x89, "Congestion tone (reorder tone)" },
+		{ 0x8A, "Special information tone" },
+		{ 0x8B, "Comfort tone" },
+		{ 0x8C, "Hold tone" },
+		{ 0x8D, "Record tone" },
+		{ 0x8E, "Caller waiting tone" },
+		{ 0x8F, "Call waiting tone" },
+		{ 0x90, "Pay tone" },
+		{ 0x91, "Positive indication tone" },
+		{ 0x92, "Negative indication tone" },
+		{ 0x93, "Warning tone" },
+		{ 0x94, "Intrusion tone" },
+		{ 0x95, "Calling card service tone" },
+		{ 0x96, "Payphone recognition tone" },
+		{ 0x97, "CPE alerting signal" },
+		{ 0x98, "Off hook warning tone" },
+		{ 0xA0, "Special information tone 0" },
+		{ 0xA1, "Special information tone 1" },
+		{ 0xA2, "Special information tone 2" },
+		{ 0xA3, "Special information tone 3" },
+		{ 0xA4, "Special information tone (operator intercept)" },
+		{ 0xA5, "Special information tone (vacant circuit)" },
+		{ 0xA6, "Special information tone (reorder)" },
+		{ 0xA7, "Special information tone (no circuit found)" },
+		{ 0xBF, "Intercept tone" },
+		{ 0xC0, "Modem calling tone" },
+		{ 0xC1, "FAX calling tone" },
+		{ 0xC2, "Answer tone" },
+		{ 0xC3, "Answer tone with phase reversals" },
+		{ 0xC4, "ANSam" },
+		{ 0xC5, "ANSam with phase reversals" },
+		{ 0xC6, "2225 Hz (Bell 103 answer mode)" },
+		{ 0xC7, "FAX flags" },
+		{ 0xC8, "G2 FAX group ID" },
+		{ 0xCA, "Answering Machine Tone (390 Hz)" },
+		{ 0xCB, "Tone Alerting Signal (for Caller ID in PSTN)" },
+	};
+	struct capi_pvt *i = get_active_plci (c);
+	unsigned char tone;
+	unsigned int n;
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	if ((!param) || (*param == 0)) {
+		cc_log(LOG_WARNING, "Parameter for tone generation missing.\n");
+		return -1;
+	}
+
+	tone = (unsigned char)strtol(param, 0, 0);
+
+	for (n = 0; n < sizeof(diva_tx_tones)/sizeof(diva_tx_tones[0]) && diva_tx_tones[n].tone != tone; n++);
+	if (n >= sizeof(diva_tx_tones)/sizeof(diva_tx_tones[0])) {
+		cc_log(LOG_WARNING, "Unsupported tone %02x\n", tone);
+		return -1;
+	}
+
+	capi_diva_send_tone_function(i, tone);
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: started transmission of '%s' %02x tone\n",
+		i->vname, diva_tx_tones[n].name, diva_tx_tones[n].tone);
+
+	return 0;
+}
+
+static int pbx_capi_stoptone(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	capi_diva_send_tone_function(i, 0x80);
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: stopped transmission of tones\n",
+		i->vname);
+
+	return 0;
+}
+
+static const char* pbx_capi_map_detected_tone (unsigned char tone)
+{
+	static diva_supported_tones_t diva_detected_tones[] = {
+/*		{ 0x80, "End of signal detected" }, */
+/*		{ 0x81, "Unidentified tone detected" }, */
+		{ 0x82, "Dial tone detected" },
+		{ 0x83, "PABX internal dial tone detected" },
+		{ 0x84, "Special dial tone (stutter dial tone) detected" },
+		{ 0x85, "Second dial tone detected" },
+		{ 0x86, "Ringing tone detected" },
+		{ 0x87, "Special ringing tone detected" },
+		{ 0x88, "Busy tone detected" },
+		{ 0x89, "Congestion tone (reorder tone) detected" },
+		{ 0x8A, "Special information tone detected" },
+		{ 0x8B, "Comfort tone detected" },
+		{ 0x8C, "Hold tone detected" },
+		{ 0x8D, "Record tone detected" },
+		{ 0x8E, "Caller waiting tone detected" },
+		{ 0x8F, "Call waiting tone detected" },
+		{ 0x90, "Pay tone detected" },
+		{ 0x91, "Positive indication tone detected" },
+		{ 0x92, "Negative indication tone detected" },
+		{ 0x93, "Warning tone detected" },
+		{ 0x94, "Intrusion tone detected" },
+		{ 0x95, "Calling card service tone detected" },
+		{ 0x96, "Payphone recognition tone detected" },
+		{ 0x97, "CPE alerting signal detected" },
+		{ 0x98, "Off hook warning tone detected" },
+		{ 0xA0, "Special information tone 0" },
+		{ 0xA1, "Special information tone 1" },
+		{ 0xA2, "Special information tone 2" },
+		{ 0xA3, "Special information tone 3" },
+		{ 0xA4, "Special information tone (operator intercept)" },
+		{ 0xA5, "Special information tone (vacant circuit)" },
+		{ 0xA6, "Special information tone (reorder)" },
+		{ 0xA7, "Special information tone (no circuit found)" },
+		{ 0xBF, "Intercept tone detected" },
+		{ 0xC0, "Modem calling tone detected" },
+		{ 0xC1, "FAX calling tone detected" },
+		{ 0xC2, "Answer tone detected" },
+		{ 0xC3, "Answer tone with phase reversals detected" },
+		{ 0xC4, "ANSam detected" },
+		{ 0xC5, "ANSam with phase reversals detected" },
+		{ 0xC6, "2225 Hz (Bell 103 answer mode) detected" },
+		{ 0xC7, "FAX flags detected" },
+		{ 0xC8, "G2 FAX group ID detected" },
+		{ 0xC9, "Human speech detected" },
+		{ 0xCA, "Answering Machine Tone (390 Hz) detected" },
+		{ 0xCB, "Tone Alerting Signal detected (for Caller ID in PSTN)" }
+	};
+	int n;
+
+	for (n = 0; n < sizeof(diva_detected_tones)/sizeof(diva_detected_tones[0]); n++) {
+		if (diva_detected_tones[n].tone == tone) {
+			return (diva_detected_tones[n].name);
+		}
+	}
+
+	return 0;
+}
+
+static int pbx_capi_starttonedetection(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	if ((param == 0) || (*param == 0)) {
+		cc_log(LOG_WARNING, "Parameter for starttonedetection missing.\n");
+		return (-1);
+	}
+	if ((strlen(param)) > (sizeof(i->special_tone_extension)-1)) {
+		cc_log(LOG_WARNING, "Parameter for starttonedetection too long.\n");
+		return (-1);
+	}
+
+	cc_mutex_lock(&i->lock);
+	strcpy(i->special_tone_extension, param);
+	cc_mutex_unlock(&i->lock);
+
+	capi_diva_tone_processing_function(i, 250 /* Start tone detector */);
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: Tone detection switched ON\n",
+		i->vname);
+
+	return 0;
+}
+
+static int pbx_capi_stoptonedetection(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	cc_mutex_lock(&i->lock);
+	i->special_tone_extension[0] = 0;
+	cc_mutex_unlock(&i->lock);
+
+	capi_diva_tone_processing_function(i, 251 /* Stop tone detector */);
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: Tone detection switched OFF\n",
+		i->vname);
+
+	return 0;
+}
+
+static int pbx_capi_pitchcontrol(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+	unsigned short rxpitch = 0, txpitch = 0;
+	int enabled = 1;
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	if ((param != NULL) && (*param != 0)) {
+		char* p = NULL;
+
+		txpitch = rxpitch = (unsigned short)strtol(param, &p, 0);
+		if (p == param) {
+			rxpitch = 0;
+		}
+
+		if ((rxpitch != 0) && (p != 0) && (*p != 0)) {
+			param = p + 1;
+			txpitch = (unsigned short)strtol(param, &p, 0);
+			if (p == param) {
+				txpitch = 0;
+			}
+		}
+
+		if ((rxpitch == 0) || (txpitch == 0)) {
+			cc_log(LOG_WARNING, "Wrong parameter for pitch control.\n");
+			return (-1);
+		}
+
+		rxpitch = (rxpitch < 1250) ? 1250 : rxpitch;
+		txpitch = (txpitch < 1250) ? 1250 : txpitch;
+
+		rxpitch = (rxpitch > 51200) ? 51200 : rxpitch;
+		txpitch = (txpitch > 51200) ? 51200 : txpitch;
+
+		cc_mutex_lock(&i->lock);
+		i->rxPitch = rxpitch;
+		i->txPitch = txpitch;
+		cc_mutex_unlock(&i->lock);
+	} else {
+		cc_mutex_lock(&i->lock);
+		i->rxPitch = 8000;
+		i->txPitch = 8000;
+		cc_mutex_unlock(&i->lock);
+		enabled = 0;
+	}
+
+	capi_diva_pitch_control_command(i, enabled, rxpitch, txpitch);
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: Pitch control Rx:%u Tx:%u\n",
+		i->vname, rxpitch, txpitch);
+
+	return 0;
+}
+
+static int pbx_capi_incpitchcontrol(struct ast_channel *c, char *param)
+{
+	struct capi_pvt *i = get_active_plci (c);
+	signed short rxpitchinc = 0, txpitchinc = 0;
+	int rxPitch = i->rxPitch, txPitch = i->txPitch;
+	char* p = NULL;
+
+	if (i == NULL) {
+		/*
+			Ignore command silently to ensure same context can be used to process
+			all types of calls or in case of fallback to NULL PLCI
+			*/
+		return (0);
+	}
+
+	if ((param == NULL) || (*param == 0)) {
+		cc_log(LOG_WARNING, "Parameter for incremental pitch control missing.\n");
+		return -1;
+	}
+
+	rxpitchinc = (signed short)atoi(param);
+	p = strchr(param, '|');
+	if (p == NULL) {
+		txpitchinc = rxpitchinc;
+	} else {
+		txpitchinc = (signed short)atoi(&p[1]);
+	}
+
+	if ((rxpitchinc == 0) && (txpitchinc == 0)) {
+		cc_log(LOG_WARNING, "Wrong parameter for incremental pitch control.\n");
+		return -1;
+	}
+
+	rxPitch += rxpitchinc;
+	txPitch += txpitchinc;
+
+	rxPitch = (rxPitch < 1250) ? 1250 : rxPitch;
+	txPitch = (txPitch < 1250) ? 1250 : txPitch;
+
+	rxPitch = (rxPitch > 51200) ? 51200 : rxPitch;
+	txPitch = (txPitch > 51200) ? 51200 : txPitch;
+
+	capi_diva_pitch_control_command(i, 1, (unsigned short)rxPitch, (unsigned short)txPitch);
+
+	cc_mutex_lock(&i->lock);
+	i->rxPitch = (unsigned short)rxPitch;
+	i->txPitch = (unsigned short)txPitch;
+	cc_mutex_unlock(&i->lock);
+
+	cc_verbose(2, 0, VERBOSE_PREFIX_4 "%s: Pitch control Rx:%u Tx:%u\n",
+		i->vname, rxPitch, txPitch);
+
 	return 0;
 }
 
@@ -4620,7 +6046,7 @@ static void capi_disconnect(struct capi_pvt *i)
 	if ((i->isdnstate & CAPI_ISDN_STATE_B3_UP)) {
 		cc_disconnect_b3(i, 0);
 	} else {
-		capi_send_disconnect(i->PLCI, NULL);
+		capi_send_disconnect(i->PLCI);
 	}
 	
 	cc_mutex_unlock(&i->lock);
@@ -4775,34 +6201,75 @@ static int pbx_capi_3pty_begin(struct ast_channel *c, char *param)
  */
 static struct capicommands_s {
 	char *cmdname;
-	int (*cmd)(struct ast_channel *, char *);
+	pbx_capi_command_proc_t cmd;
 	int capionly;
+	int resourceplcisupported;
 } capicommands[] = {
-	{ "getid",        pbx_capi_get_id,          0 },
-	{ "peerlink",     pbx_capi_peer_link,       0 },
-	{ "progress",     pbx_capi_signal_progress, 1 },
-	{ "deflect",      pbx_capi_call_deflect,    1 },
-	{ "receivefax",   pbx_capi_receive_fax,     1 },
-	{ "sendfax",      pbx_capi_send_fax,        1 },
-	{ "echosquelch",  pbx_capi_echosquelch,     1 },
-	{ "echocancel",   pbx_capi_echocancel,      1 },
-	{ "malicious",    pbx_capi_malicious,       1 },
-	{ "hold",         pbx_capi_hold,            1 },
-	{ "holdtype",     pbx_capi_holdtype,        1 },
-	{ "retrieve",     pbx_capi_retrieve,        0 },
-	{ "ect",          pbx_capi_ect,             1 },
-	{ "3pty_begin",   pbx_capi_3pty_begin,      1 },
-	{ "ccbs",         pbx_capi_ccbs,            0 },
-	{ "ccbsstop",     pbx_capi_ccbsstop,        0 },
-	{ "ccpartybusy",  pbx_capi_ccpartybusy,     0 },
-	{ "chat",         pbx_capi_chat,            0 },
-	{ "hangup",       pbx_capi_realhangup,      0 },
- 	{ "qsig_ssct",	  pbx_capi_qsig_ssct,	    1 },
-  	{ "qsig_ct",      pbx_capi_qsig_ct,         1 },
-   	{ "qsig_callmark",pbx_capi_qsig_callmark,   1 },
-	{ "qsig_getplci", pbx_capi_qsig_getplci,    1 },
+	{ "getid",        pbx_capi_get_id,          0, 0 },
+	{ "peerlink",     pbx_capi_peer_link,       0, 0 },
+	{ "progress",     pbx_capi_signal_progress, 1, 0 },
+	{ "deflect",      pbx_capi_call_deflect,    1, 0 },
+	{ "receivefax",   pbx_capi_receive_fax,     1, 1 },
+	{ "sendfax",      pbx_capi_send_fax,        1, 1 },
+	{ "echosquelch",  pbx_capi_echosquelch,     1, 0 },
+	{ "echocancel",   pbx_capi_echocancel,      1, 1 },
+
+	{ "noisesuppressor", pbx_capi_noisesuppressor,     1, 1 },
+	{ "rxagc",           pbx_capi_rxagc,               1, 1 },
+	{ "txagc",           pbx_capi_txagc,               1, 1 },
+	{ "rxdgain",         pbx_capi_rxdgain,             1, 1 },
+	{ "incrxdgain",      pbx_capi_incrxdgain,          1, 1 },
+	{ "txdgain",         pbx_capi_txdgain,             1, 1 },
+	{ "inctxdgain",      pbx_capi_inctxdgain,          1, 1 },
+	{ "clamping",        pbx_capi_clamping,            1, 1 },
+	{ "mftonedetection", pbx_capi_mftonedetection,     1, 1 },
+	{ "pulsedetection",  pbx_capi_pulsedetection,      1, 1 },
+	{ "sendtone",        pbx_capi_sendtone,            1, 1 },
+	{ "stoptone",        pbx_capi_stoptone,            1, 1 },
+	{ "starttonedetection", pbx_capi_starttonedetection, 1, 1 },
+	{ "stoptonedetection",  pbx_capi_stoptonedetection,  1, 1 },
+	{ "pitchcontrol",    pbx_capi_pitchcontrol,        1, 1 },
+	{ "incpitchcontrol", pbx_capi_incpitchcontrol,     1, 1 },
+
+	{ "vc",              pbx_capi_voicecommand,              1, 1 },
+	{ "vctransparency",  pbx_capi_voicecommand_transparency, 1, 1 },
+
+	{ "getplci",         pbx_capi_getplci,             1, 0 },
+
+	{ "malicious",    pbx_capi_malicious,       1, 0 },
+	{ "hold",         pbx_capi_hold,            1, 0 },
+	{ "holdtype",     pbx_capi_holdtype,        1, 0 },
+	{ "retrieve",     pbx_capi_retrieve,        0, 0 },
+	{ "ect",          pbx_capi_ect,             1, 0 },
+	{ "3pty_begin",   pbx_capi_3pty_begin,      1, 0 },
+	{ "ccbs",         pbx_capi_ccbs,            0, 0 },
+	{ "ccbsstop",     pbx_capi_ccbsstop,        0, 0 },
+	{ "ccpartybusy",  pbx_capi_ccpartybusy,     0, 0 },
+	{ "chat",         pbx_capi_chat,            0, 0 },
+	{ "chat_command", pbx_capi_chat_command,    0, 0 },
+	{ "chat_mute",    pbx_capi_chat_mute,       0, 0 },
+	{ "chat_play",    pbx_capi_chat_play,       0, 0 },
+	{ "resource",         pbx_capi_chat_associate_resource_plci, 0, 0 },
+	{ "hangup",       pbx_capi_realhangup,      0, 0 },
+ 	{ "qsig_ssct",	  pbx_capi_qsig_ssct,	    1, 0 },
+  	{ "qsig_ct",      pbx_capi_qsig_ct,         1, 0 },
+   	{ "qsig_callmark",pbx_capi_qsig_callmark,   1, 0 },
+	{ "qsig_getplci", pbx_capi_qsig_getplci,    1, 0 },
   	{ NULL, NULL, 0 }
 };
+
+pbx_capi_command_proc_t pbx_capi_lockup_command_by_name(const char* name)
+{
+	int i;
+
+	for (i = 0; capicommands[i].cmdname != 0; i++) {
+		if (strcmp(capicommands[i].cmdname, name) == 0) {
+			return (capicommands[i].cmd);
+		}
+	}
+
+	return 0;
+}
 
 /*
  * capi command interface
@@ -4845,7 +6312,7 @@ static int pbx_capicommand_exec(struct ast_channel *chan, void *data)
 	}
 	if (!capicmd->cmd) {
 #ifdef CC_AST_HAS_VERSION_1_4
-	ast_module_user_remove(u);
+		ast_module_user_remove(u);
 #else
 		LOCAL_USER_REMOVE(u);
 #endif
@@ -4854,15 +6321,23 @@ static int pbx_capicommand_exec(struct ast_channel *chan, void *data)
 		return -1;
 	}
 
-	if ((capicmd->capionly) && (chan->tech != &capi_tech)) {
+	if (chan->tech != &capi_tech) {
+		if (capicmd->capionly != 0) {
+			struct capi_pvt* resource_plci = pbx_check_resource_plci (chan);
+
+			if ((capicmd->resourceplcisupported == 0) ||
+					(resource_plci == NULL) ||
+					(resource_plci->line_plci == NULL)) {
 #ifdef CC_AST_HAS_VERSION_1_4
-	ast_module_user_remove(u);
+				ast_module_user_remove(u);
 #else
-		LOCAL_USER_REMOVE(u);
+				LOCAL_USER_REMOVE(u);
 #endif
-		cc_log(LOG_WARNING, "This capicommand works on " CC_MESSAGE_NAME
-			" channels only, check your extensions.conf!\n");
-		return -1;
+				cc_log(LOG_WARNING, "This capicommand works on " CC_MESSAGE_NAME
+					" channels only, check your extensions.conf!\n");
+				return -1;
+			}
+		}
 	}
 
 	res = (capicmd->cmd)(chan, params);
@@ -4872,7 +6347,7 @@ static int pbx_capicommand_exec(struct ast_channel *chan, void *data)
 #else
 	LOCAL_USER_REMOVE(u);
 #endif
-	return(res);
+	return res;
 }
 
 /*
@@ -5319,6 +6794,7 @@ int mkif(struct cc_capi_conf *conf)
 		}
 
 		capi_controllers[unit]->used = 1;
+		capi_controllers[unit]->ecPath = conf->echocancelpath;
 
 		tmp->controller = unit;
 		tmp->doEC = conf->echocancel;
@@ -5473,6 +6949,8 @@ static char *show_bproto(int bproto)
 		return " fax ";
 	case CC_BPROTO_RTP:
 		return " rtp ";
+	case CC_BPROTO_VOCODER:
+		return " vocoder ";
 	}
 	return " ??? ";
 }
@@ -5999,6 +7477,8 @@ static int cc_init_capi(void)
 			cp->broadband = 1;
 		}
 
+		cp->ecPath = EC_ECHOCANCEL_PATH_IFC;
+
 #if (CAPI_OS_HINT == 1)
 		if (profile.dwGlobalOptions & CAPI_PROFILE_ECHO_CANCELLATION) {
 #else
@@ -6086,6 +7566,11 @@ static int cc_post_init_capi(void)
 			} else {
 				cc_verbose(2, 0, VERBOSE_PREFIX_3 "listening on contr%d CIPmask = %#x\n",
 					controller, ALL_SERVICES);
+				if (capi_ManufacturerAllowOnController(controller) == 0) {
+					capi_controllers[controller]->divaExtendedFeaturesAvailable = 1;
+					cc_verbose(2, 0, VERBOSE_PREFIX_3 "enable extended voice features on contr%d\n",
+						controller);
+				}
 			}
 		} else {
 			cc_log(LOG_NOTICE, "Unused contr%d\n",controller);
@@ -6240,6 +7725,13 @@ static int conf_interface(struct cc_capi_conf *conf, struct ast_variable *v)
 			continue;
 		} else
 		CONF_TRUE(conf->ecnlp, "echocancelnlp", 1)
+		if (!strcasecmp(v->name, "echocancelpath")) {
+			conf->echocancelpath  = atoi(v->value);
+			conf->echocancelpath &= EC_ECHOCANCEL_PATH_BITS;
+			if (conf->echocancelpath == 0)
+				conf->echocancelpath = EC_ECHOCANCEL_PATH_BITS;
+		}
+
 		if (!strcasecmp(v->name, "echotail")) {
 			conf->ectail = atoi(v->value);
 			if (conf->ectail > 255) {
@@ -6344,6 +7836,7 @@ static int capi_eval_config(struct ast_config *cfg)
 		conf.ecoption = EC_OPTION_DISABLE_G165;
 		conf.ectail = EC_DEFAULT_TAIL;
 		conf.ecSelector = FACILITYSELECTOR_ECHO_CANCEL;
+		conf.echocancelpath = EC_ECHOCANCEL_PATH_IFC;
 		cc_copy_string(conf.name, cat, sizeof(conf.name));
 		cc_copy_string(conf.language, default_language, sizeof(conf.language));
 #ifdef CC_AST_HAS_VERSION_1_4

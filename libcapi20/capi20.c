@@ -25,6 +25,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
+
+#include "capi20_platform.h"
  
 #include "capi20.h"
 
@@ -311,9 +313,17 @@ static void write_capi_trace(int send, unsigned char *buf, int length, int datam
 	}
 }
 
-unsigned capi20_isinstalled (void)
+static inline unsigned capi20_isinstalled_internal(void)
 {
-	if (capi_fd >= 0)
+	if (likely(capi_fd >= 0))
+		return CapiNoError;
+
+	return (capi20_isinstalled());
+}
+
+unsigned capi20_isinstalled(void)
+{
+	if (likely(capi_fd >= 0))
 		return CapiNoError;
 
 	/*----- open managment link -----*/
@@ -696,10 +706,10 @@ capi20_put_message (unsigned ApplID, unsigned char *Msg)
 	int fd;
 	int datareq = 0;
 
-	if (capi20_isinstalled() != CapiNoError)
+	if (capi20_isinstalled_internal() != CapiNoError)
 		return CapiRegNotInstalled;
 
-	if (!validapplid(ApplID))
+	if (unlikely(!validapplid(ApplID)))
 		return CapiIllAppNr;
 
 	fd = applid2fd(ApplID);
@@ -797,10 +807,10 @@ capi20_get_message (unsigned ApplID, unsigned char **Buf)
 	size_t bufsiz;
 	int rc, fd;
 
-	if (capi20_isinstalled() != CapiNoError)
+	if (capi20_isinstalled_internal() != CapiNoError)
 		return CapiRegNotInstalled;
 
-	if (!validapplid(ApplID))
+	if (unlikely(!validapplid(ApplID)))
 		return CapiIllAppNr;
 
 	fd = applid2fd(ApplID);
@@ -823,7 +833,7 @@ capi20_get_message (unsigned ApplID, unsigned char **Buf)
 				CAPIMSG_U32(rcvbuf, 8));
 			capimsg_setu16(rcvbuf, 18, offset); /* patch datahandle */
 			if (sizeof(void *) == 4) {
-				u_int32_t data = (u_int32_t)rcvbuf + CAPIMSG_LEN(rcvbuf);
+				u_int32_t data = (u_int32_t)(unsigned long)rcvbuf + CAPIMSG_LEN(rcvbuf);
 				rcvbuf[12] = data & 0xff;
 				rcvbuf[13] = (data >> 8) & 0xff;
 				rcvbuf[14] = (data >> 16) & 0xff;
@@ -1009,10 +1019,10 @@ capi20_waitformessage(unsigned ApplID, struct timeval *TimeOut)
 
 	FD_ZERO(&rfds);
 
-	if (capi20_isinstalled() != CapiNoError)
+	if (capi20_isinstalled_internal() != CapiNoError)
 		return CapiRegNotInstalled;
 
-	if (!validapplid(ApplID))
+	if (unlikely(!validapplid(ApplID)))
 		return CapiIllAppNr;
   
 	fd = applid2fd(ApplID);

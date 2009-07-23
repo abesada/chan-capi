@@ -40,6 +40,7 @@
 #include "asterisk/abstract_jb.h"
 #endif
 #include "asterisk/musiconhold.h"
+#include "dlist.h"
  
 #ifndef _PBX_CAPI_H
 #define _PBX_CAPI_H
@@ -138,6 +139,7 @@ static inline unsigned int read_capi_dword(void *m)
 #define CC_BPROTO_TRANSPARENT   0
 #define CC_BPROTO_FAXG3         1
 #define CC_BPROTO_RTP           2
+#define CC_BPROTO_VOCODER       3
 
 /* FAX Resolutions */
 #define FAX_STANDARD_RESOLUTION         0
@@ -152,6 +154,7 @@ static inline unsigned int read_capi_dword(void *m)
 #define FAX_ASCII_FORMAT                5
 #define FAX_EXTENDED_ASCII_FORMAT       6
 #define FAX_BINARY_FILE_TRANSFER_FORMAT 7
+#define FAX_NATIVE_FILE_TRANSFER_FORMAT 8
 
 /* Fax struct */
 struct fax3proto3 {
@@ -178,6 +181,7 @@ typedef struct fax3proto3 B3_PROTO_FAXG3;
 #define FACILITYSELECTOR_SUPPLEMENTARY     0x0003
 #define FACILITYSELECTOR_LINE_INTERCONNECT 0x0005
 #define FACILITYSELECTOR_ECHO_CANCEL       0x0008
+#define PRIV_SELECTOR_DTMF_ONDATA          0x00fa
 #define FACILITYSELECTOR_FAX_OVER_IP       0x00fd
 #define FACILITYSELECTOR_VOICE_OVER_IP     0x00fe
 
@@ -190,6 +194,13 @@ typedef struct fax3proto3 B3_PROTO_FAXG3;
 #define EC_OPTION_DISABLE_G165          (1<<2)
 #define EC_OPTION_DISABLE_G164_OR_G165  (1<<1 | 1<<2)
 #define EC_DEFAULT_TAIL                 0 /* maximum */
+
+/*
+	EC path mask
+	*/
+#define EC_ECHOCANCEL_PATH_IFC          1 /* Default, activate EC for E.1/T.1/S0 only */
+#define EC_ECHOCANCEL_PATH_IP           2 /* Activate EC for IP */
+#define EC_ECHOCANCEL_PATH_BITS         (EC_ECHOCANCEL_PATH_IFC | EC_ECHOCANCEL_PATH_IP)
 
 #define CC_HOLDTYPE_LOCAL               0
 #define CC_HOLDTYPE_HOLD                1
@@ -260,6 +271,10 @@ struct cc_capi_gains {
 #define CAPI_CHANNELTYPE_B            0
 #define CAPI_CHANNELTYPE_D            1
 #define CAPI_CHANNELTYPE_NULL         2
+
+#define CAPI_RESOURCE_PLCI_NULL       0
+#define CAPI_RESOURCE_PLCI_DATA       1
+#define CAPI_RESOURCE_PLCI_LINE       2
 
 /* the lower word is reserved for capi commands */
 #define CAPI_WAITEVENT_B3_UP          0x00010000
@@ -437,6 +452,21 @@ struct capi_pvt {
 	float rxmin;
 	float txmin;
 
+	unsigned short divaAudioFlags;
+	unsigned short divaDigitalRxGain;
+	float divaDigitalRxGainDB;
+	unsigned short divaDigitalTxGain;
+	float divaDigitalTxGainDB;
+	unsigned short rxPitch;
+	unsigned short txPitch;
+	char special_tone_extension[AST_MAX_EXTENSION+1];
+
+	char   channel_command_digits[AST_MAX_EXTENSION+1];
+	time_t channel_command_timestamp;
+	int channel_command_digit;
+	int command_pass_digits;
+	diva_entity_queue_t channel_command_q;
+
 #ifdef CC_AST_HAS_VERSION_1_4
 	struct ast_jb_conf jbconf;
 	char mohinterpret[MAX_MUSICCLASS];
@@ -466,6 +496,14 @@ struct capi_pvt {
 	/* Q.SIG features */
 	int qsigfeat;
 	struct cc_qsig_data qsig_data;
+
+	/* Resource PLCI data */
+	int resource_plci_type; /* NULL PLCI, DATA, LINE */
+
+	/* Resource PLCI line if data */
+	struct capi_pvt *line_plci;
+	/* Resource PLCI data data if line */
+	struct capi_pvt *data_plci;
 	
 	/*! Next channel in list */
 	struct capi_pvt *next;
@@ -528,6 +566,7 @@ struct cc_capi_conf {
 	struct ast_jb_conf jbconf;
 	char mohinterpret[MAX_MUSICCLASS];
 #endif
+	int echocancelpath;
 };
 
 struct cc_capi_controller {
@@ -559,6 +598,9 @@ struct cc_capi_controller {
 	int CONF;
 	/* RTP */
 	int rtpcodec;
+
+	int divaExtendedFeaturesAvailable;
+	int ecPath;
 };
 
 
@@ -629,5 +671,15 @@ extern void capi_gains(struct cc_capi_gains *g, float rxgain, float txgain);
 #ifdef CC_AST_HAS_VERSION_1_6
 extern char chatinfo_usage[];
 #endif
+
+typedef int (*pbx_capi_command_proc_t)(struct ast_channel *, char *);
+pbx_capi_command_proc_t pbx_capi_lockup_command_by_name(const char* name);
+
+/* DIVA specific MANUFACTURER definitions */
+#define _DI_MANU_ID         0x44444944
+#define _DI_ASSIGN_PLCI     0x0001
+#define _DI_DSP_CTRL        0x0003
+#define _DI_OPTIONS_REQUEST 0x0009
+
 
 #endif

@@ -16,7 +16,9 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <string.h>
 #include <sys/types.h>
+#include "chan_capi_platform.h"
 #include "xlaw.h"
 #include "chan_capi20.h"
 #include "chan_capi.h"
@@ -45,9 +47,9 @@ static struct peerlink_s {
 } peerlinkchannel[CAPI_MAX_PEERLINKCHANNELS];
 
 /*
- * helper for <pbx>_verbose with different verbose settings
+ * helper for <pbx>_verbose
  */
-void cc_verbose(int o_v, int c_d, char *text, ...)
+void cc_verbose_internal(char *text, ...)
 {
 	char line[4096];
 	va_list ap;
@@ -55,6 +57,7 @@ void cc_verbose(int o_v, int c_d, char *text, ...)
 	va_start(ap, text);
 	vsnprintf(line, sizeof(line), text, ap);
 	va_end(ap);
+	line[sizeof(line)-1]=0;
 
 #if 0
 	{
@@ -66,13 +69,9 @@ void cc_verbose(int o_v, int c_d, char *text, ...)
 	}
 #endif
 
-	if ((o_v == 0) || (option_verbose > o_v)) {
-		if ((!c_d) || ((c_d) && (capidebug))) {	
-			cc_mutex_lock(&verbose_lock);
-			cc_pbx_verbose(line);
-			cc_mutex_unlock(&verbose_lock);	
-		}
-	}
+	cc_mutex_lock(&verbose_lock);
+	cc_pbx_verbose(line);
+	cc_mutex_unlock(&verbose_lock);	
 }
 
 /*
@@ -88,10 +87,17 @@ void capi_remove_nullif(struct capi_pvt *i)
 		return;
 	}
 
+	cc_mutex_lock(&i->lock);
+	if (i->line_plci != 0) {
+		ii = i->line_plci;
+		i->line_plci = 0;
+		capi_remove_nullif(ii);
+	}
+	cc_mutex_unlock(&i->lock);
+
 	if (i->PLCI != 0) {
 		/* if the interface is in use, hangup first */
 		cc_mutex_lock(&i->lock);
-
 		state = i->state;
 		i->state = CAPI_STATE_DISCONNECTING;
 		capi_activehangup(i, state);
@@ -126,6 +132,16 @@ void capi_remove_nullif(struct capi_pvt *i)
 	cc_mutex_unlock(&nullif_lock);
 }
 
+int capi_verify_resource_plci(const struct capi_pvt *i) {
+	const struct capi_pvt *ii;
+
+	cc_mutex_lock(&nullif_lock);
+	for (ii = nulliflist; ii != 0 && ii != i; ii = ii->next);
+	cc_mutex_unlock(&nullif_lock);
+
+	return ((ii == i) ? 0 : -1);
+}
+
 /*
  * create new null-interface
  */
@@ -135,14 +151,14 @@ struct capi_pvt *capi_mknullif(struct ast_channel *c, unsigned long long control
 	unsigned int controller = 1;
 	int contrcount;
 	int channelcount = 0xffff;
-	int maxcontr = (CAPI_MAX_CONTROLLERS > sizeof(controllermask)) ?
-		sizeof(controllermask) : CAPI_MAX_CONTROLLERS;
+	int maxcontr = (CAPI_MAX_CONTROLLERS > (sizeof(controllermask)*8)) ?
+		(sizeof(controllermask)*8) : CAPI_MAX_CONTROLLERS;
 
 	cc_verbose(3, 1, VERBOSE_PREFIX_4 "capi_mknullif: find controller for mask 0x%lx\n",
 		controllermask);
 	/* find the next controller of mask with least plcis used */	
 	for (contrcount = 0; contrcount < maxcontr; contrcount++) {
-		if ((controllermask & (1 << contrcount))) {
+		if ((controllermask & (1ULL << contrcount)) != 0) {
 			if (controller_nullplcis[contrcount] < channelcount) {
 				channelcount = controller_nullplcis[contrcount];
 				controller = contrcount + 1;
@@ -213,6 +229,137 @@ struct capi_pvt *capi_mknullif(struct ast_channel *c, unsigned long long control
 	return tmp;
 }
 
+struct capi_pvt *capi_mkresourceif(struct ast_channel *c, unsigned long long controllermask, struct capi_pvt *data_plci_ifc) {
+	struct capi_pvt *data_ifc /*, *line_ifc */;
+	unsigned int controller = 1;
+
+	if (data_plci_ifc == 0) {
+		int contrcount;
+		int channelcount = 0xffff;
+		int maxcontr = (CAPI_MAX_CONTROLLERS > (sizeof(controllermask)*8)) ?
+			(sizeof(controllermask)*8) : CAPI_MAX_CONTROLLERS;
+
+		cc_verbose(3, 1, VERBOSE_PREFIX_4 "capi_mkresourceif: find controller for mask 0x%lx\n",
+			controllermask);
+
+		/* find the next controller of mask with least plcis used */	
+		for (contrcount = 0; contrcount < maxcontr; contrcount++) {
+			if ((controllermask & (1ULL << contrcount)) != 0) {
+				if (controller_nullplcis[contrcount] < channelcount) {
+					channelcount = controller_nullplcis[contrcount];
+					controller = contrcount + 1;
+				}
+			}
+		}
+	} else {
+		controller = data_plci_ifc->controller;
+	}
+
+	data_ifc = malloc(sizeof(struct capi_pvt));
+	if (data_ifc == 0) {
+		return NULL;
+	}
+	memset(data_ifc, 0, sizeof(struct capi_pvt));
+	
+	cc_mutex_init(&data_ifc->lock);
+	ast_cond_init(&data_ifc->event_trigger, NULL);
+	
+	snprintf(data_ifc->name, sizeof(data_ifc->name) - 1, "%s-%sPLCI", c->name, (data_plci_ifc == 0) ? "DATA" : "LINE");
+	snprintf(data_ifc->vname, sizeof(data_ifc->vname) - 1, "%s", data_ifc->name);
+
+	data_ifc->channeltype = CAPI_CHANNELTYPE_NULL;
+	data_ifc->resource_plci_type = (data_plci_ifc == 0) ? CAPI_RESOURCE_PLCI_DATA : CAPI_RESOURCE_PLCI_LINE;
+
+	data_ifc->used = c;
+	data_ifc->peer = c;
+
+	data_ifc->cip = CAPI_CIPI_SPEECH;
+	data_ifc->transfercapability = PRI_TRANS_CAP_SPEECH;
+	data_ifc->controller = controller;
+	data_ifc->doEC = 1;
+	data_ifc->doEC_global = 1;
+	data_ifc->ecOption = EC_OPTION_DISABLE_NEVER;
+	data_ifc->ecTail = EC_DEFAULT_TAIL;
+	data_ifc->isdnmode = CAPI_ISDNMODE_MSN;
+	data_ifc->ecSelector = FACILITYSELECTOR_ECHO_CANCEL;
+	data_ifc->capability = capi_capability;
+
+	data_ifc->rxgain = 1.0;
+	data_ifc->txgain = 1.0;
+	capi_gains(&data_ifc->g, 1.0, 1.0);
+
+	if (data_plci_ifc == 0) {
+		if (!(capi_create_reader_writer_pipe(data_ifc))) {
+			free(data_ifc);
+			return NULL;
+		}
+	} else {
+		data_ifc->readerfd = -1;
+		data_ifc->writerfd = -1;
+	}
+
+	data_ifc->bproto = CC_BPROTO_TRANSPARENT;	
+	data_ifc->doB3 = CAPI_B3_DONT;
+	data_ifc->smoother = ast_smoother_new(CAPI_MAX_B3_BLOCK_SIZE);
+	data_ifc->isdnstate |= CAPI_ISDN_STATE_PBX;
+		
+	cc_mutex_lock(&nullif_lock);
+	data_ifc->next = nulliflist; /* prepend */
+	nulliflist = data_ifc;
+	controller_nullplcis[data_ifc->controller - 1]++;
+	cc_mutex_unlock(&nullif_lock);
+
+	/* connect to driver */
+	data_ifc->outgoing = 1;
+	data_ifc->state = CAPI_STATE_CONNECTPENDING;
+	data_ifc->MessageNumber = get_capi_MessageNumber();
+
+	cc_mutex_lock(&data_ifc->lock);
+	capi_sendf(data_ifc,
+		1,
+		CAPI_MANUFACTURER_REQ,
+		controller,
+		data_ifc->MessageNumber,
+		"dw(wbb(www()()()()))",
+		_DI_MANU_ID,
+		_DI_ASSIGN_PLCI,
+		(data_plci_ifc == 0) ? 4 : 5, /* data */
+		(data_plci_ifc == 0) ? 0 : (unsigned char)(data_plci_ifc->PLCI >> 8), /* bchannel */
+		1, /* connect */
+		1, 1, 0);
+	cc_mutex_unlock(&data_ifc->lock);
+
+	if (data_plci_ifc != 0) {
+		if (data_ifc->PLCI == 0) {
+			cc_log(LOG_WARNING, "%s: failed to create\n", data_ifc->vname);
+			capi_remove_nullif(data_ifc);
+			data_ifc = 0;
+		} else {
+			cc_mutex_lock(&data_plci_ifc->lock);
+			data_plci_ifc->line_plci = data_ifc;
+			capi_sendf(data_plci_ifc, 1, CAPI_FACILITY_REQ, data_plci_ifc->PLCI, get_capi_MessageNumber(),
+				"w(w(d()))",
+				FACILITYSELECTOR_LINE_INTERCONNECT,
+				0x0001, /* CONNECT */
+				0x00000000 /* mask */
+			);
+			cc_mutex_unlock(&data_plci_ifc->lock);
+
+			data_ifc->data_plci      = data_plci_ifc;
+
+			data_ifc->writerfd = data_plci_ifc->writerfd;
+			data_plci_ifc->writerfd = -1;
+		}
+	}
+
+	if (data_ifc != 0) {
+		cc_verbose(3, 1, VERBOSE_PREFIX_4 "%s: created %s-resource-interface on controller %d.\n",
+			data_ifc->vname, (data_plci_ifc == 0) ? "data" : "line", data_ifc->controller);
+	}
+
+	return data_ifc;
+}
+
 /*
  * get a new capi message number atomically
  */
@@ -232,7 +379,7 @@ _cword get_capi_MessageNumber(void)
 
 	cc_mutex_unlock(&messagenumber_lock);
 
-	return(mn);
+	return mn;
 }
 
 /*
@@ -242,7 +389,7 @@ struct capi_pvt *capi_find_interface_by_plci(unsigned int plci)
 {
 	struct capi_pvt *i;
 
-	if (plci == 0)
+	if (unlikely(plci == 0))
 		return NULL;
 
 	for (i = capi_iflist; i; i = i->next) {
@@ -315,9 +462,12 @@ MESSAGE_EXCHANGE_ERROR capi_wait_conf(struct capi_pvt *i, unsigned short wCmd)
 /*
  * log an error in sending capi message
  */
-static void log_capi_error_message(MESSAGE_EXCHANGE_ERROR err, _cmsg *CMSG)
+static void log_capi_error_message(MESSAGE_EXCHANGE_ERROR err, unsigned char* msg)
 {
 	if (err) {
+		_cmsg _CMSG, *CMSG = &_CMSG;
+
+		capi_message2cmsg(CMSG, msg);
 		cc_log(LOG_ERROR, "CAPI error sending %s (NCCI=%#x) (error=%#x %s)\n",
 			capi_cmsg2str(CMSG), (unsigned int)HEADER_CID(CMSG),
 			err, capi_info_string((unsigned int)err));
@@ -353,8 +503,10 @@ static MESSAGE_EXCHANGE_ERROR _capi_put_msg(unsigned char *msg)
 		return -1;
 	} 
 
-	capi_message2cmsg(&CMSG, msg);
-	log_capi_message(&CMSG);
+	if (cc_verbose_check(4, 1) != 0) {
+		capi_message2cmsg(&CMSG, msg);
+		log_capi_message(&CMSG);
+	}
 
 	error = capi20_put_message(capi_ApplID, msg);
 	
@@ -363,7 +515,7 @@ static MESSAGE_EXCHANGE_ERROR _capi_put_msg(unsigned char *msg)
 		return -1;
 	}
 
-	log_capi_error_message(error, &CMSG);
+	log_capi_error_message(error, msg);
 
 	return error;
 }
@@ -425,8 +577,6 @@ MESSAGE_EXCHANGE_ERROR capi_sendf(
 	capi_prestruct_t *s;
 	unsigned char msg[2048];
 
-	memset(msg, 0, sizeof(msg));
-
 	write_capi_word(&msg[2], capi_ApplID);
 	msg[4] = (unsigned char)((command >> 8) & 0xff);
 	msg[5] = (unsigned char)(command & 0xff);
@@ -438,9 +588,9 @@ MESSAGE_EXCHANGE_ERROR capi_sendf(
 
 	va_start(ap, format);
 	for (i = 0; format[i]; i++) {
-		if (((p - (&msg[0])) + 12) >= sizeof(msg)) {
+		if (unlikely(((p - (&msg[0])) + 12) >= sizeof(msg))) {
 			cc_log(LOG_ERROR, "capi_sendf: message too big (%d)\n",
-				(p - (&msg[0])));
+				(int)(p - (&msg[0])));
 			return 0x1004;
 		}
 		switch(format[i]) {
@@ -532,7 +682,7 @@ MESSAGE_EXCHANGE_ERROR capi_sendf(
 		ret = capi_wait_conf(capii, (command & 0xff00) | CAPI_CONF);
 	}
 
-	return (ret);
+	return ret;
 }
 
 /*
@@ -891,7 +1041,6 @@ void show_capi_info(struct capi_pvt *i, _cword info)
 	
 	cc_verbose(3, 0, VERBOSE_PREFIX_4 "%s: CAPI INFO 0x%04x: %s\n",
 		name, info, p);
-	return;
 }
 
 /*
@@ -928,6 +1077,50 @@ unsigned capi_ListenOnController(unsigned int CIPmask, unsigned controller)
 		error = 0x100F;
 
  done:
+	return error;
+}
+
+/*
+ * Activate access to vendor specific extensions
+ */
+unsigned capi_ManufacturerAllowOnController(unsigned controller)
+{
+	MESSAGE_EXCHANGE_ERROR error;
+	int waitcount = 50;
+	unsigned char manbuf[CAPI_MANUFACTURER_LEN];
+	_cmsg CMSG;
+
+	if (capi20_get_manufacturer(controller, manbuf) == NULL) {
+		error = CapiRegOSResourceErr;
+		goto done;
+	}
+	if ((strstr((char *)manbuf, "Eicon") == 0) &&
+	    (strstr((char *)manbuf, "Dialogic") == 0)) {
+		error = 0x100F;
+		goto done;
+	}
+
+	error = capi_sendf (NULL, 0, CAPI_MANUFACTURER_REQ, controller, get_capi_MessageNumber(),
+		"dw(d)", _DI_MANU_ID, _DI_OPTIONS_REQUEST, 0x00000020L);
+
+	if (error)
+		goto done;
+
+	while (waitcount) {
+		error = capidev_check_wait_get_cmsg(&CMSG);
+
+		if (IS_MANUFACTURER_CONF(&CMSG) && (CMSG.ManuID == _DI_MANU_ID) &&
+			((CMSG.Class & 0xffff) == _DI_OPTIONS_REQUEST)) {
+			error = (MESSAGE_EXCHANGE_ERROR)(CMSG.Class >> 16);
+			break;
+		}
+		usleep(30000);
+		waitcount--;
+	}
+	if (!waitcount)
+		error = 0x100F;
+
+done:
 	return error;
 }
 
@@ -1122,7 +1315,7 @@ struct ast_frame *capi_read_pipeframe(struct capi_pvt *i)
 	if ((f->frametype == AST_FRAME_VOICE) && (f->datalen > 0)) {
 		if (f->datalen > sizeof(i->frame_data)) {
 			cc_log(LOG_ERROR, "f.datalen(%d) greater than space of frame_data(%d)\n",
-				f->datalen, sizeof(i->frame_data));
+				f->datalen, (int)sizeof(i->frame_data));
 			f->datalen = sizeof(i->frame_data);
 		}
 		readsize = read(i->readerfd, i->frame_data + AST_FRIENDLY_OFFSET, f->datalen);
@@ -1146,13 +1339,24 @@ int capi_write_frame(struct capi_pvt *i, struct ast_frame *f)
 	int txavg=0;
 	int ret = 0;
 
-	if (!i) {
+	if (unlikely(!i)) {
 		cc_log(LOG_ERROR, "channel has no interface\n");
 		return -1;
 	}
+
+	{
+		struct capi_pvt *ii = i;
+
+		cc_mutex_lock(&ii->lock);
+
+		if (i->line_plci != 0)
+			i = i->line_plci;
+
+		cc_mutex_unlock(&ii->lock);
+	}
 	 
-	if ((!(i->isdnstate & CAPI_ISDN_STATE_B3_UP)) || (!i->NCCI) ||
-	    ((i->isdnstate & (CAPI_ISDN_STATE_B3_CHANGE | CAPI_ISDN_STATE_LI)))) {
+	if (unlikely((!(i->isdnstate & CAPI_ISDN_STATE_B3_UP)) || (!i->NCCI) ||
+	    ((i->isdnstate & (CAPI_ISDN_STATE_B3_CHANGE | CAPI_ISDN_STATE_LI))))) {
 		return 0;
 	}
 
@@ -1160,38 +1364,59 @@ int capi_write_frame(struct capi_pvt *i, struct ast_frame *f)
 		return 0;
 	}
 
-	if (f->frametype == AST_FRAME_NULL) {
+	if (unlikely(f->frametype == AST_FRAME_NULL)) {
 		return 0;
 	}
-	if (f->frametype == AST_FRAME_DTMF) {
+	if (unlikely(f->frametype == AST_FRAME_DTMF)) {
 		cc_log(LOG_ERROR, "dtmf frame should be written\n");
 		return 0;
 	}
-	if (f->frametype != AST_FRAME_VOICE) {
+	if (unlikely(f->frametype != AST_FRAME_VOICE)) {
 		cc_log(LOG_ERROR,"not a voice frame\n");
 		return 0;
 	}
-	if (i->FaxState & CAPI_FAX_STATE_ACTIVE) {
+	if (unlikely(i->FaxState & CAPI_FAX_STATE_ACTIVE)) {
 		cc_verbose(3, 1, VERBOSE_PREFIX_2 "%s: write on fax activity?\n",
 			i->vname);
 		return 0;
 	}
-	if ((!f->FRAME_DATA_PTR) || (!f->datalen)) {
+	if (unlikely((!f->FRAME_DATA_PTR) || (!f->datalen))) {
 		cc_log(LOG_DEBUG, "No data for FRAME_VOICE %s\n", i->vname);
 		return 0;
 	}
 	if (i->isdnstate & CAPI_ISDN_STATE_RTP) {
-		if ((!(f->subclass & i->codec)) &&
-		    (f->subclass != capi_capability)) {
+		if (unlikely((!(f->subclass & i->codec)) &&
+		    (f->subclass != capi_capability))) {
 			cc_log(LOG_ERROR, "don't know how to write subclass %s(%d)\n",
 				ast_getformatname(f->subclass), f->subclass);
 			return 0;
 		}
 		return capi_write_rtp(i, f);
 	}
-	if (i->B3count >= CAPI_MAX_B3_BLOCKS) {
+	if (unlikely(i->B3count >= CAPI_MAX_B3_BLOCKS)) {
 		cc_verbose(3, 1, VERBOSE_PREFIX_4 "%s: B3count is full, dropping packet.\n",
 			i->vname);
+		return 0;
+	}
+
+	if (i->bproto == CC_BPROTO_VOCODER) {
+		buf = &(i->send_buffer[(i->send_buffer_handle % CAPI_MAX_B3_BLOCKS) *
+			(CAPI_MAX_B3_BLOCK_SIZE + AST_FRIENDLY_OFFSET)]);
+		i->send_buffer_handle++;
+
+		memcpy (buf, f->FRAME_DATA_PTR, f->datalen);
+
+		error = capi_sendf(NULL, 0, CAPI_DATA_B3_REQ, i->NCCI, get_capi_MessageNumber(),
+			"dwww", buf, f->datalen, i->send_buffer_handle, 0);
+		if (likely(error == 0)) {
+			cc_mutex_lock(&i->lock);
+			i->B3count++;
+			i->B3q -= f->datalen;
+			if (i->B3q < 0)
+				i->B3q = 0;
+			cc_mutex_unlock(&i->lock);
+		}
+
 		return 0;
 	}
 
@@ -1242,7 +1467,7 @@ int capi_write_frame(struct capi_pvt *i, struct ast_frame *f)
 				i->vname, i->NCCI);
 		}
 
-		if (!error) {
+		if (likely(!error)) {
 			cc_mutex_lock(&i->lock);
 			i->B3count++;
 			i->B3q -= fsmooth->datalen;

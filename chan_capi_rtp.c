@@ -19,6 +19,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 
+#include "chan_capi_platform.h"
 #include "chan_capi20.h"
 #include "chan_capi.h"
 #include "chan_capi_rtp.h"
@@ -389,6 +390,10 @@ void voice_over_ip_profile(struct cc_capi_controller *cp)
 	if (payload1 & 0x00040000) {
 		cp->rtpcodec |= AST_FORMAT_G729A;
 		cc_verbose(3, 0, "G.729");
+	}
+	if (payload1 & (1U << 27)) {
+		cp->rtpcodec |= AST_FORMAT_ILBC;
+		cc_verbose(3, 0, "iLBC");
 	}
 	cc_verbose(3, 0, "\n");
 }
