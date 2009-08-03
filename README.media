@@ -684,7 +684,7 @@ stoptonedetection
 
       Tone identifier:
         0x82 - Dial tone detected
-	0x83 - PABX internal dial tone detected
+        0x83 - PABX internal dial tone detected
         0x84 - Special dial tone (stutter dial tone) detected
         0x85 - Second dial tone detected
         0x86 - Ringing tone detected
@@ -874,6 +874,7 @@ capicommand(chat|<roomname>|<options>|controller)
   roomname - conference room name
   options
       m - The first caller will get music-on-hold until the second caller arrives
+      h<sec> - Hangup after <sec> seconds if caller is alone in conference.
       l - The caller is listener (passive) conference member and cannot be unmuted by 'chat_mute' command
       o - The caller is conference operator and cannot be muted by 'chat_mute' command
   controller - CAPI controller
@@ -884,6 +885,7 @@ exten => s,n,capicommand(chat|test|m|1,3)
 exten => s,n,capicommand(chat|test|m|1-4)
 exten => s,n,capicommand(chat|test|m|1-4,7)
 exten => s,n,capicommand(chat|test|m|1-4,7-10)
+exten => s,n,capicommand(chat|test|mh300|1-4)
 
 IVR example:
 /////////////////////////////////////////////////////////////////////
@@ -904,7 +906,7 @@ exten => 1,n,capicommand(vc|txdgain|3|0) ; Install voice command menu for volume
 exten => 1,n,capicommand(chat|test1|m|1-4)     ; Create/enter conference room 'test1'
 
 exten => 2,1,capicommand(clamping|100)         ; Activate suppression of DTMF tones
-exten => 2,1,capicommand(txdgain|-128)         ; Deactivate tx path
+exten => 2,n,capicommand(txdgain|-128)         ; Deactivate tx path
 exten => 2,n,capicommand(vc|incrxdgain|0|1.5)  ; Install voice command menu for volume control, '0' to increase volume
 exten => 2,n,capicommand(vc|incrxdgain|1|-1.5) ; Install voice command menu for volume control, '1' to decrease volume
 exten => 2,n,capicommand(vc|txdgain|2|-128) ; Install voice command menu for volume control, '2' to mute tx path
@@ -1144,6 +1146,7 @@ capicommand(chat_play|<roomname>|<options>|<filename>|controller)
   roomname   - conference room name
   options
       m - The caller will get music-on-hold while message is played
+      s - The caller will hear the same message that is played
 	filename   - Voice message file name. Should be in aLaw (uLaw) format.
   controller - CAPI controller
 
@@ -1184,9 +1187,9 @@ capicommand(chat_command|<options>|<roomname>)
 					Command does not apply to calling member and  be used by operators only.
       l - Remove all listeners from conference.
 					Command does not apply to calling member and  be used by operators only.
-			o - Remove all operators from conference.
+      o - Remove all operators from conference.
 					Command does not apply to calling member and  be used by operators only.
-			a - Remove all users from conference.
+      a - Remove all users from conference.
 					Command does not apply to calling member and  be used by operators only.
   roomname   - optional, room caller assigned to is used if not present
 

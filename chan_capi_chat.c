@@ -15,6 +15,7 @@
 #include <time.h>
 #include <errno.h>
 #include <sys/signal.h>
+#include <sys/time.h>
 
 #include "chan_capi_platform.h"
 #include "chan_capi20.h"
@@ -24,6 +25,7 @@
 #include "chan_capi_command.h"
 
 #define CHAT_FLAG_MOH      0x0001
+#define CHAT_FLAG_SAMEMSG  0x0002
 
 typedef enum {
 	RoomMemberDefault  = 0, /* Rx/Tx by default, muted by operator */
@@ -321,7 +323,7 @@ static void update_all_capi_mixers(unsigned int roomnumber)
 			}
 		}
 
-		free (segments);
+		free(segments);
 	}
 }
 
@@ -403,7 +405,7 @@ static struct capichat_s *add_chat_member(char *roomname, struct capi_pvt *i, ro
 		}
 	}
 	room->info |= PBX_CHAT_MEMBER_INFO_RECENT;
-	room->time = time(0);
+	room->time = time(NULL);
 
 	room->next = chat_list;
 	chat_list = room;
@@ -422,7 +424,8 @@ static struct capichat_s *add_chat_member(char *roomname, struct capi_pvt *i, ro
  * loop during chat
  */
 static void chat_handle_events(struct ast_channel *c, struct capi_pvt *i,
-	struct capichat_s *room, unsigned int flags, struct capi_pvt* iline, FILE* voice_message)
+	struct capichat_s *room, unsigned int flags, struct capi_pvt* iline,
+	FILE* voice_message, unsigned int hangup_timeout)
 {
 	struct ast_frame *f;
 	int ms;
@@ -434,6 +437,7 @@ static void chat_handle_events(struct ast_channel *c, struct capi_pvt *i,
 	struct ast_channel *chan = c;
 	int moh_active = 0, voice_message_moh_active = 0;
 	int write_block_nr = 2;
+	time_t alone_since = time(NULL);
 
 	if (voice_message == NULL) {
 		ast_indicate(chan, -1);
@@ -442,19 +446,17 @@ static void chat_handle_events(struct ast_channel *c, struct capi_pvt *i,
 	waitfd = i->readerfd;
 	if (i->channeltype == CAPI_CHANNELTYPE_NULL) {
 		nfds = 1;
-		if (voice_message == NULL) {
-			ast_set_read_format(chan, capi_capability);
-			ast_set_write_format(chan, capi_capability);
-		}
+		ast_set_read_format(chan, capi_capability);
+		ast_set_write_format(chan, capi_capability);
 	}
 
-	if ((flags & CHAT_FLAG_MOH) && ((room->active < 2) || (voice_message != 0))) {
+	if ((flags & CHAT_FLAG_MOH) && ((room->active < 2) || (voice_message != NULL))) {
 #if defined(CC_AST_HAS_VERSION_1_6) || defined(CC_AST_HAS_VERSION_1_4)
 		ast_moh_start(chan, NULL, NULL);
 #else
 		ast_moh_start(chan, NULL);
 #endif
-		if (voice_message == 0) {
+		if (voice_message == NULL) {
 			moh_active = 1;
 		} else {
 			voice_message_moh_active = 1;
@@ -476,6 +478,8 @@ static void chat_handle_events(struct ast_channel *c, struct capi_pvt *i,
 		if (rchan) {
 			f = ast_read(chan);
 			if (!f) {
+				if (voice_message != NULL)
+					continue;
 				cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: chat: no frame, hangup.\n",
 					i->vname);
 				break;
@@ -488,16 +492,16 @@ static void chat_handle_events(struct ast_channel *c, struct capi_pvt *i,
 			} else if (f->frametype == AST_FRAME_VOICE) {
 				cc_verbose(5, 1, VERBOSE_PREFIX_3 "%s: chat: voice frame.\n",
 					i->vname);
-				if ((voice_message == 0) && (i->channeltype == CAPI_CHANNELTYPE_NULL)) {
+				if ((voice_message == NULL) && (i->channeltype == CAPI_CHANNELTYPE_NULL)) {
 					capi_write_frame(i, f);
-				} else if (iline != 0) {
+				} else if ((iline != NULL) && (!(flags & CHAT_FLAG_SAMEMSG))) {
 					capi_write_frame(iline, f);
 				}
 			} else if (f->frametype == AST_FRAME_NULL) {
 				/* ignore NULL frame */
 				cc_verbose(5, 1, VERBOSE_PREFIX_3 "%s: chat: NULL frame, ignoring.\n",
 					i->vname);
-			} else if ((f->frametype == AST_FRAME_DTMF_END) && (voice_message == 0))  {
+			} else if ((f->frametype == AST_FRAME_DTMF_END) && (voice_message == NULL))  {
 				pbx_capi_voicecommand_process_digit (i, c, f->subclass);
 			} else {
 				cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: chat: unhandled frame %d/%d.\n",
@@ -512,9 +516,10 @@ static void chat_handle_events(struct ast_channel *c, struct capi_pvt *i,
 			}
 			f = capi_read_pipeframe(i);
 			if (f->frametype == AST_FRAME_VOICE) {
-				if (voice_message == 0) {
+				if (voice_message == NULL) {
 					ast_write(chan, f);
 				} else {
+					struct ast_frame *fr2;
 					char* p = f->FRAME_DATA_PTR;
 					int len;
 
@@ -523,6 +528,15 @@ static void chat_handle_events(struct ast_channel *c, struct capi_pvt *i,
 							if (len < f->datalen) {
 								memset (&p[len], 0x00, f->datalen-len);
 								len = 0;
+							}
+							if (flags & CHAT_FLAG_SAMEMSG) {
+								fr2 = ast_frdup(f);
+								if (iline != NULL) {
+									capi_write_frame(iline, fr2);
+								} else {
+									ast_write(chan, fr2);
+									ast_frfree(fr2);
+								}
 							}
 							capi_write_frame(i, f);
 						}
@@ -549,6 +563,17 @@ static void chat_handle_events(struct ast_channel *c, struct capi_pvt *i,
 			ast_moh_stop(chan);
 			moh_active = 0;
 		}
+		if (hangup_timeout > 0) {
+			if (room->active > 1) {
+				alone_since = time(NULL);
+			} else {
+				if ((alone_since + hangup_timeout) < time(NULL)) {
+					cc_verbose(3, 1, VERBOSE_PREFIX_3 "%s: chat: reached (alone) hangup timeout.\n",
+						i->vname);
+					break;
+				}
+			}
+		}
 	}
 	if (voice_message_moh_active != 0) {
 		ast_moh_stop(chan);
@@ -567,6 +592,7 @@ int pbx_capi_chat(struct ast_channel *c, char *param)
 	ast_group_t tmpcntr;
 	unsigned long long contr = 0;
 	unsigned int flags = 0;
+	unsigned int hangup_timeout = 0;
 	room_member_type_t room_member_type = RoomMemberDefault;
 
 	roomname = strsep(&param, "|");
@@ -591,6 +617,14 @@ int pbx_capi_chat(struct ast_channel *c, char *param)
 		case 'm':
 			flags |= CHAT_FLAG_MOH;
 			break;
+		case 'h':
+			hangup_timeout = 0;
+			while (isdigit(options[1])) {
+				hangup_timeout *= 10;
+				hangup_timeout += (options[1] - '0');
+				options++;
+			}
+			break;
 		case 'l':
 			room_member_type = RoomMemberListener;
 			break;
@@ -607,8 +641,8 @@ int pbx_capi_chat(struct ast_channel *c, char *param)
 	}
 
 	cc_verbose(3, 1, VERBOSE_PREFIX_3 CC_MESSAGE_NAME " chat: %s: roomname=%s "
-		"options=%s controller=%s (0x%llx)\n",
-		c->name, roomname, options, controller, contr);
+		"options=%s hangup_timeout=%d controller=%s (0x%llx)\n",
+		c->name, roomname, options, hangup_timeout, controller, contr);
 
 	if (c->tech == &capi_tech) {
 		i = CC_CHANNEL_PVT(c); 
@@ -641,7 +675,7 @@ int pbx_capi_chat(struct ast_channel *c, char *param)
 	}
 
 	/* main loop */
-	chat_handle_events(c, i, room, flags, 0, 0);
+	chat_handle_events(c, i, room, flags, 0, 0, hangup_timeout);
 
 	del_chat_member(room);
 
@@ -701,13 +735,20 @@ int pbx_capi_chat_play(struct ast_channel *c, char *param)
 		case 'm':
 			flags |= CHAT_FLAG_MOH;
 			break;
-
+		case 's':
+			flags |= CHAT_FLAG_SAMEMSG;
+			break;
 		default:
 			cc_log(LOG_WARNING, "Unknown chat option '%c'.\n",
 				*options);
 			break;
 		}
 		options++;
+	}
+
+	if ((flags & (CHAT_FLAG_MOH | CHAT_FLAG_SAMEMSG)) == (CHAT_FLAG_MOH | CHAT_FLAG_SAMEMSG)) {
+		cc_log(LOG_WARNING, "chat_play: option 's' overrides 'm'.\n");
+		flags &= ~CHAT_FLAG_MOH;
 	}
 
 	f = fopen(file_name, "rb");
@@ -765,7 +806,7 @@ int pbx_capi_chat_play(struct ast_channel *c, char *param)
 	}
 
 	/* main loop */
-	chat_handle_events(c, i, room, flags, (c->tech == &capi_tech) ? (CC_CHANNEL_PVT(c)) : 0, f);
+	chat_handle_events(c, i, room, flags, (c->tech == &capi_tech) ? (CC_CHANNEL_PVT(c)) : 0, f, 0);
 
 	del_chat_member(room);
 
@@ -776,7 +817,7 @@ out:
 	return 0;
 }
 
-int pbx_capi_chat_command (struct ast_channel *c, char *param)
+int pbx_capi_chat_command(struct ast_channel *c, char *param)
 {
 	struct capichat_s *room, *tmproom;
 	struct capi_pvt *i;
