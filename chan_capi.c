@@ -40,8 +40,8 @@
 #include "chan_capi_chat.h"
 #include "chan_capi_command.h"
 
-/* #define CC_VERSION "x.y.z" */
-#define CC_VERSION "$Revision$"
+#define CC_VERSION "1.1.4"
+/* #define CC_VERSION "$Revision$" */
 
 /*
  * personal stuff
