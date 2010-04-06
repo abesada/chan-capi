@@ -70,7 +70,7 @@ void cc_verbose_internal(char *text, ...)
 #endif
 
 	cc_mutex_lock(&verbose_lock);
-	cc_pbx_verbose(line);
+	cc_pbx_verbose("%s", line);
 	cc_mutex_unlock(&verbose_lock);	
 }
 
@@ -1297,7 +1297,7 @@ struct ast_frame *capi_read_pipeframe(struct capi_pvt *i)
 
 	f = &i->f;
 	f->frametype = AST_FRAME_NULL;
-	f->subclass = 0;
+	FRAME_SUBCLASS_INTEGER(f->subclass) = 0;
 
 	readsize = read(i->readerfd, f, sizeof(struct ast_frame));
 	if ((readsize != sizeof(struct ast_frame)) && (readsize > 0)) {
@@ -1308,7 +1308,8 @@ struct ast_frame *capi_read_pipeframe(struct capi_pvt *i)
 	f->mallocd = 0;
 	f->FRAME_DATA_PTR = NULL;
 
-	if ((f->frametype == AST_FRAME_CONTROL) && (f->subclass == AST_CONTROL_HANGUP)) {
+	if ((f->frametype == AST_FRAME_CONTROL) &&
+		(FRAME_SUBCLASS_INTEGER(f->subclass) == AST_CONTROL_HANGUP)) {
 		return NULL;
 	}
 
@@ -1367,6 +1368,10 @@ int capi_write_frame(struct capi_pvt *i, struct ast_frame *f)
 	if (unlikely(f->frametype == AST_FRAME_NULL)) {
 		return 0;
 	}
+	if (unlikely((!f->FRAME_DATA_PTR) || (!f->datalen))) {
+		/* prodding from Asterisk, just returning */
+		return 0;
+	}
 	if (unlikely(f->frametype == AST_FRAME_DTMF)) {
 		cc_log(LOG_ERROR, "dtmf frame should be written\n");
 		return 0;
@@ -1380,15 +1385,12 @@ int capi_write_frame(struct capi_pvt *i, struct ast_frame *f)
 			i->vname);
 		return 0;
 	}
-	if (unlikely((!f->FRAME_DATA_PTR) || (!f->datalen))) {
-		cc_log(LOG_DEBUG, "No data for FRAME_VOICE %s\n", i->vname);
-		return 0;
-	}
 	if (i->isdnstate & CAPI_ISDN_STATE_RTP) {
-		if (unlikely((!(f->subclass & i->codec)) &&
-		    (f->subclass != capi_capability))) {
+		if (unlikely((!(FRAME_SUBCLASS_CODEC(f->subclass) & i->codec)) &&
+		    (FRAME_SUBCLASS_CODEC(f->subclass) != capi_capability))) {
 			cc_log(LOG_ERROR, "don't know how to write subclass %s(%d)\n",
-				ast_getformatname(f->subclass), f->subclass);
+				ast_getformatname(FRAME_SUBCLASS_CODEC(f->subclass)),
+					FRAME_SUBCLASS_INTEGER(f->subclass));
 			return 0;
 		}
 		return capi_write_rtp(i, f);
