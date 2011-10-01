@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
+#include <ctype.h>
 #include <sys/types.h>
 #include "chan_capi_platform.h"
 #include "xlaw.h"
@@ -25,6 +26,22 @@
 #include "chan_capi_rtp.h"
 #include "chan_capi_utils.h"
 #include "chan_capi_supplementary.h"
+
+#ifdef DIVA_STREAMING
+#include "platform.h"
+#include "diva_streaming_result.h"
+#include "diva_streaming_messages.h"
+#include "diva_streaming_vector.h"
+#include "diva_streaming_manager.h"
+#include "chan_capi_divastreaming_utils.h"
+#endif
+#ifdef DIVA_STATUS
+#include "divastatus_ifc.h"
+#define CC_HW_STATE_OK(__x__) ((pbx_capi_get_controller((__x__)) == NULL) || \
+																(pbx_capi_get_controller((__x__))->hwState != (int)DivaStatusHardwareStateERROR))
+#else
+#define CC_HW_STATE_OK(__x__) (1)
+#endif
 
 int capidebug = 0;
 char *emptyid = "\0";
@@ -123,7 +140,7 @@ void capi_remove_nullif(struct capi_pvt *i)
 			cc_mutex_destroy(&i->lock);
 			ast_cond_destroy(&i->event_trigger);
 			controller_nullplcis[i->controller - 1]--;
-			free(i);
+			ast_free(i);
 			break;
 		}
 		tmp = ii;
@@ -158,7 +175,7 @@ struct capi_pvt *capi_mknullif(struct ast_channel *c, unsigned long long control
 		controllermask);
 	/* find the next controller of mask with least plcis used */	
 	for (contrcount = 0; contrcount < maxcontr; contrcount++) {
-		if ((controllermask & (1ULL << contrcount)) != 0) {
+		if (((controllermask & (1ULL << contrcount)) != 0) && CC_HW_STATE_OK(contrcount + 1)) {
 			if (controller_nullplcis[contrcount] < channelcount) {
 				channelcount = controller_nullplcis[contrcount];
 				controller = contrcount + 1;
@@ -166,7 +183,7 @@ struct capi_pvt *capi_mknullif(struct ast_channel *c, unsigned long long control
 		}
 	}
 
-	tmp = malloc(sizeof(struct capi_pvt));
+	tmp = ast_malloc(sizeof(struct capi_pvt));
 	if (!tmp) {
 		return NULL;
 	}
@@ -175,13 +192,15 @@ struct capi_pvt *capi_mknullif(struct ast_channel *c, unsigned long long control
 	cc_mutex_init(&tmp->lock);
 	ast_cond_init(&tmp->event_trigger, NULL);
 	
-	snprintf(tmp->name, sizeof(tmp->name) - 1, "%s-NULLPLCI", c->name);
+	snprintf(tmp->name, sizeof(tmp->name) - 1, "%s-NULLPLCI", (c != 0) ? c->name : "BRIDGE");
 	snprintf(tmp->vname, sizeof(tmp->vname) - 1, "%s", tmp->name);
 
 	tmp->channeltype = CAPI_CHANNELTYPE_NULL;
 
 	tmp->used = c;
 	tmp->peer = c;
+	if (c == NULL)
+		tmp->virtualBridgePeer = 1;
 
 	tmp->cip = CAPI_CIPI_SPEECH;
 	tmp->transfercapability = PRI_TRANS_CAP_SPEECH;
@@ -198,9 +217,11 @@ struct capi_pvt *capi_mknullif(struct ast_channel *c, unsigned long long control
 	tmp->txgain = 1.0;
 	capi_gains(&tmp->g, 1.0, 1.0);
 
-	if (!(capi_create_reader_writer_pipe(tmp))) {
-		free(tmp);
-		return NULL;
+	if (c != 0) {
+		if (!(capi_create_reader_writer_pipe(tmp))) {
+			ast_free(tmp);
+			return NULL;
+		}
 	}
 
 	tmp->bproto = CC_BPROTO_TRANSPARENT;	
@@ -219,19 +240,45 @@ struct capi_pvt *capi_mknullif(struct ast_channel *c, unsigned long long control
 	tmp->state = CAPI_STATE_CONNECTPENDING;
 	tmp->MessageNumber = get_capi_MessageNumber();
 
-	capi_sendf(NULL, 0, CAPI_CONNECT_REQ, controller, tmp->MessageNumber,
+#ifdef DIVA_STREAMING
+	tmp->diva_stream_entry = 0;
+	if (pbx_capi_streaming_supported (tmp) != 0) {
+		capi_DivaStreamingOn(tmp, 1, tmp->MessageNumber);
+	}
+#endif
+
+	if (c == NULL) {
+		cc_mutex_lock(&tmp->lock);
+	}
+	capi_sendf((c != NULL) ? NULL : tmp, c == NULL, CAPI_CONNECT_REQ, controller, tmp->MessageNumber,
 		"w()()()()(www()()()())()()()((wwbbb)()()())",
 		 0,       1,1,0,              3,0,0,0,0);
-
-	cc_verbose(3, 1, VERBOSE_PREFIX_4 "%s: created null-interface on controller %d.\n",
-		tmp->vname, tmp->controller);
+	if (c == NULL) {
+		cc_mutex_unlock(&tmp->lock);
+		if (tmp->PLCI == 0) {
+			cc_log(LOG_WARNING, "%s: failed to create\n", tmp->vname);
+			capi_remove_nullif(tmp);
+			tmp = NULL;
+		}
+	}
+	if (tmp != NULL) {
+		cc_verbose(3, 1, VERBOSE_PREFIX_4 "%s: created null-interface on controller %d.\n",
+				tmp->vname, tmp->controller);
+	}
 
 	return tmp;
 }
 
-struct capi_pvt *capi_mkresourceif(struct ast_channel *c, unsigned long long controllermask, struct capi_pvt *data_plci_ifc) {
+struct capi_pvt *capi_mkresourceif(
+	struct ast_channel *c,
+	unsigned long long controllermask,
+	struct capi_pvt *data_plci_ifc,
+	cc_format_t codecs,
+	int all)
+{
 	struct capi_pvt *data_ifc /*, *line_ifc */;
 	unsigned int controller = 1;
+	int fmt = 0;
 
 	if (data_plci_ifc == 0) {
 		int contrcount;
@@ -244,7 +291,7 @@ struct capi_pvt *capi_mkresourceif(struct ast_channel *c, unsigned long long con
 
 		/* find the next controller of mask with least plcis used */	
 		for (contrcount = 0; contrcount < maxcontr; contrcount++) {
-			if ((controllermask & (1ULL << contrcount)) != 0) {
+			if (((controllermask & (1ULL << contrcount)) != 0) && CC_HW_STATE_OK(contrcount + 1)) {
 				if (controller_nullplcis[contrcount] < channelcount) {
 					channelcount = controller_nullplcis[contrcount];
 					controller = contrcount + 1;
@@ -253,9 +300,13 @@ struct capi_pvt *capi_mkresourceif(struct ast_channel *c, unsigned long long con
 		}
 	} else {
 		controller = data_plci_ifc->controller;
+		codecs = (all != 0) ? pbx_capi_get_controller_codecs (controller) : codecs;
+		fmt = pbx_capi_get_controller_codecs (controller) & codecs & c->nativeformats;
+		if (fmt != 0)
+			fmt = ast_best_codec(fmt);
 	}
 
-	data_ifc = malloc(sizeof(struct capi_pvt));
+	data_ifc = ast_malloc(sizeof(struct capi_pvt));
 	if (data_ifc == 0) {
 		return NULL;
 	}
@@ -282,7 +333,8 @@ struct capi_pvt *capi_mkresourceif(struct ast_channel *c, unsigned long long con
 	data_ifc->ecTail = EC_DEFAULT_TAIL;
 	data_ifc->isdnmode = CAPI_ISDNMODE_MSN;
 	data_ifc->ecSelector = FACILITYSELECTOR_ECHO_CANCEL;
-	data_ifc->capability = capi_capability;
+	data_ifc->capability = (fmt != 0 && data_plci_ifc != 0) ? fmt : capi_capability;
+	data_ifc->codec      = (fmt != 0 && data_plci_ifc != 0) ? fmt : data_ifc->codec;
 
 	data_ifc->rxgain = 1.0;
 	data_ifc->txgain = 1.0;
@@ -290,7 +342,7 @@ struct capi_pvt *capi_mkresourceif(struct ast_channel *c, unsigned long long con
 
 	if (data_plci_ifc == 0) {
 		if (!(capi_create_reader_writer_pipe(data_ifc))) {
-			free(data_ifc);
+			ast_free(data_ifc);
 			return NULL;
 		}
 	} else {
@@ -298,7 +350,7 @@ struct capi_pvt *capi_mkresourceif(struct ast_channel *c, unsigned long long con
 		data_ifc->writerfd = -1;
 	}
 
-	data_ifc->bproto = CC_BPROTO_TRANSPARENT;	
+	data_ifc->bproto = (fmt != 0 && data_plci_ifc != 0) ? CC_BPROTO_VOCODER : CC_BPROTO_TRANSPARENT;
 	data_ifc->doB3 = CAPI_B3_DONT;
 	data_ifc->smoother = ast_smoother_new(CAPI_MAX_B3_BLOCK_SIZE);
 	data_ifc->isdnstate |= CAPI_ISDN_STATE_PBX;
@@ -315,18 +367,31 @@ struct capi_pvt *capi_mkresourceif(struct ast_channel *c, unsigned long long con
 	data_ifc->MessageNumber = get_capi_MessageNumber();
 
 	cc_mutex_lock(&data_ifc->lock);
+
+#ifdef DIVA_STREAMING
+	data_ifc->diva_stream_entry = 0;
+	if (data_plci_ifc == 0) {
+		capi_DivaStreamingStreamNotUsed(data_ifc, 1, data_ifc->MessageNumber);
+	} else {
+		if (pbx_capi_streaming_supported (data_ifc) != 0) {
+			capi_DivaStreamingOn(data_ifc, 1, data_ifc->MessageNumber);
+		}
+	}
+#endif
+
 	capi_sendf(data_ifc,
 		1,
 		CAPI_MANUFACTURER_REQ,
 		controller,
 		data_ifc->MessageNumber,
-		"dw(wbb(www()()()()))",
+		"dw(wbb(wwws()()()))",
 		_DI_MANU_ID,
 		_DI_ASSIGN_PLCI,
 		(data_plci_ifc == 0) ? 4 : 5, /* data */
 		(data_plci_ifc == 0) ? 0 : (unsigned char)(data_plci_ifc->PLCI >> 8), /* bchannel */
 		1, /* connect */
-		1, 1, 0);
+		(data_ifc->bproto == CC_BPROTO_VOCODER) ? 0x1f : 1, 1, 0,
+		diva_get_b1_conf(data_ifc));
 	cc_mutex_unlock(&data_ifc->lock);
 
 	if (data_plci_ifc != 0) {
@@ -529,7 +594,11 @@ MESSAGE_EXCHANGE_ERROR capidev_check_wait_get_cmsg(_cmsg *CMSG)
 	struct timeval tv;
 
 	tv.tv_sec = 0;
+#ifdef DIVA_STREAMING
+	tv.tv_usec = 5000;
+#else
 	tv.tv_usec = 500000;
+#endif
 
 	Info = capi20_waitformessage(capi_ApplID, &tv);
 
@@ -906,6 +975,8 @@ char *capi_info_string(unsigned int info)
 		return "No call suspended";
 	case 0x34D6:
 		return "Call having the requested call identity has been cleared";
+	case 0x34D7:
+		return "User not a member of CUG";
 	case 0x34D8:
 		return "Incompatible destination";
 	case 0x34DB:
@@ -1339,6 +1410,7 @@ int capi_write_frame(struct capi_pvt *i, struct ast_frame *f)
 	struct ast_frame *fsmooth;
 	int txavg=0;
 	int ret = 0;
+	int B3Blocks = 1;
 
 	if (unlikely(!i)) {
 		cc_log(LOG_ERROR, "channel has no interface\n");
@@ -1395,24 +1467,49 @@ int capi_write_frame(struct capi_pvt *i, struct ast_frame *f)
 		}
 		return capi_write_rtp(i, f);
 	}
+
 	if (unlikely(i->B3count >= CAPI_MAX_B3_BLOCKS)) {
 		cc_verbose(3, 1, VERBOSE_PREFIX_4 "%s: B3count is full, dropping packet.\n",
 			i->vname);
 		return 0;
 	}
 
-	if (i->bproto == CC_BPROTO_VOCODER) {
-		buf = &(i->send_buffer[(i->send_buffer_handle % CAPI_MAX_B3_BLOCKS) *
-			(CAPI_MAX_B3_BLOCK_SIZE + AST_FRIENDLY_OFFSET)]);
-		i->send_buffer_handle++;
+	if (i->bproto == CC_BPROTO_VOCODER || (i->line_plci != 0 && i->line_plci->bproto == CC_BPROTO_VOCODER)) {
+#ifdef DIVA_STREAMING
+		capi_DivaStreamLock();
+		if (i->diva_stream_entry != 0) {
+			int written = 0, ready = 0;
 
-		memcpy (buf, f->FRAME_DATA_PTR, f->datalen);
+			B3Blocks = 0;
+			if ((ready = (i->diva_stream_entry->diva_stream_state == DivaStreamActive)) &&
+					(i->diva_stream_entry->diva_stream->get_tx_free (i->diva_stream_entry->diva_stream) > 2*CAPI_MAX_B3_BLOCK_SIZE+128)) {
+				written = i->diva_stream_entry->diva_stream->write (i->diva_stream_entry->diva_stream, 8U << 8 | DIVA_STREAM_MESSAGE_TX_IDI_REQUEST, f->FRAME_DATA_PTR, f->datalen);
+				i->diva_stream_entry->diva_stream->flush_stream(i->diva_stream_entry->diva_stream);
+			}
+			capi_DivaStreamUnLock ();
 
-		error = capi_sendf(NULL, 0, CAPI_DATA_B3_REQ, i->NCCI, get_capi_MessageNumber(),
-			"dwww", buf, f->datalen, i->send_buffer_handle, 0);
+			error = written != f->datalen;
+			if (unlikely(error != 0)) {
+				cc_verbose(3, 1, VERBOSE_PREFIX_4 "%s: stream is %s, dropping packet.\n", i->vname, (ready != 0) ? "full" : "not ready");
+			}
+		} else
+#endif
+		{
+#ifdef DIVA_STREAMING
+			capi_DivaStreamUnLock ();
+#endif
+			buf = &(i->send_buffer[(i->send_buffer_handle % CAPI_MAX_B3_BLOCKS) *
+				(CAPI_MAX_B3_BLOCK_SIZE + AST_FRIENDLY_OFFSET)]);
+			i->send_buffer_handle++;
+
+			memcpy (buf, f->FRAME_DATA_PTR, f->datalen);
+
+			error = capi_sendf(NULL, 0, CAPI_DATA_B3_REQ, i->NCCI, get_capi_MessageNumber(),
+				"dwww", buf, f->datalen, i->send_buffer_handle, 0);
+		}
 		if (likely(error == 0)) {
 			cc_mutex_lock(&i->lock);
-			i->B3count++;
+			i->B3count += B3Blocks;
 			i->B3q -= f->datalen;
 			if (i->B3q < 0)
 				i->B3q = 0;
@@ -1460,10 +1557,31 @@ int capi_write_frame(struct capi_pvt *i, struct ast_frame *f)
 			}
 		}
    
-   		error = 1; 
+		error = 1; 
 		if (i->B3q > 0) {
-			error = capi_sendf(NULL, 0, CAPI_DATA_B3_REQ, i->NCCI, get_capi_MessageNumber(),
-				"dwww", buf, fsmooth->datalen, i->send_buffer_handle, 0);
+#if defined(DIVA_STREAMING)
+			if (i->diva_stream_entry != 0) {
+				int written = 0, ready = 0;
+
+				B3Blocks = 0;
+				capi_DivaStreamLock();
+				if ((ready = (i->diva_stream_entry->diva_stream_state == DivaStreamActive)) &&
+						(i->diva_stream_entry->diva_stream->get_tx_free (i->diva_stream_entry->diva_stream) > 2*CAPI_MAX_B3_BLOCK_SIZE+128)) {
+					written = i->diva_stream_entry->diva_stream->write (i->diva_stream_entry->diva_stream, 8U << 8 | DIVA_STREAM_MESSAGE_TX_IDI_REQUEST, buf, fsmooth->datalen);
+					i->diva_stream_entry->diva_stream->flush_stream(i->diva_stream_entry->diva_stream);
+				}
+				capi_DivaStreamUnLock ();
+
+				error = written != fsmooth->datalen;
+				if (unlikely(error != 0)) {
+					cc_verbose(3, 1, VERBOSE_PREFIX_4 "%s: stream is %s, dropping packet.\n", i->vname, (ready != 0) ? "full" : "not ready");
+				}
+			} else
+#endif
+			{
+				error = capi_sendf(NULL, 0, CAPI_DATA_B3_REQ, i->NCCI, get_capi_MessageNumber(),
+					"dwww", buf, fsmooth->datalen, i->send_buffer_handle, 0);
+			}
 		} else {
 			cc_verbose(3, 1, VERBOSE_PREFIX_4 "%s: too much voice to send for NCCI=%#x\n",
 				i->vname, i->NCCI);
@@ -1471,7 +1589,7 @@ int capi_write_frame(struct capi_pvt *i, struct ast_frame *f)
 
 		if (likely(!error)) {
 			cc_mutex_lock(&i->lock);
-			i->B3count++;
+			i->B3count += B3Blocks;
 			i->B3q -= fsmooth->datalen;
 			if (i->B3q < 0)
 				i->B3q = 0;
@@ -1481,3 +1599,97 @@ int capi_write_frame(struct capi_pvt *i, struct ast_frame *f)
 	return ret;
 }
 
+/*
+	 ast_channel_lock(chan) to be held while
+	 while accessing returned pointer
+	*/
+const char* pbx_capi_get_cid(const struct ast_channel* c, const char* notAvailableVisual)
+{
+	const char* cid;
+
+#ifdef CC_AST_HAS_VERSION_1_8
+	cid = S_COR(c->caller.id.number.valid, c->caller.id.number.str, notAvailableVisual);
+#else
+	cid = c->cid.cid_num;
+#endif
+
+	return (cid);
+}
+
+/*
+	 ast_channel_lock(chan) to be held while
+	 while accessing returned pointer
+	*/
+const char* pbx_capi_get_callername(const struct ast_channel* c, const char* notAvailableVisual)
+{
+	const char* name;
+
+#ifdef CC_AST_HAS_VERSION_1_8
+	name = S_COR(c->caller.id.name.valid, c->caller.id.name.str, notAvailableVisual);
+#else
+	name = (c->cid.cid_name) ? c->cid.cid_name : notAvailableVisual;
+#endif
+
+	return (name);
+}
+
+/*
+	 ast_channel_lock(chan) to be held while
+	 while accessing returned pointer
+	*/
+const char* pbx_capi_get_connectedname(const struct ast_channel* c, const char* notAvailableVisual)
+{
+	const char* name;
+
+#ifdef CC_AST_HAS_VERSION_1_8
+	name = S_COR(c->connected.id.name.valid, c->connected.id.name.str, notAvailableVisual);
+#else
+	name = (c->cid.cid_name) ? c->cid.cid_name : notAvailableVisual;
+#endif
+
+	return (name);
+}
+
+const struct capi_pvt *pbx_capi_get_nulliflist(void)
+{
+	return nulliflist;
+}
+
+void pbx_capi_nulliflist_lock(void)
+{
+	cc_mutex_lock(&nullif_lock);
+}
+
+void pbx_capi_nulliflist_unlock(void)
+{
+	cc_mutex_unlock(&nullif_lock);
+}
+
+/*!
+		\brief get list of controllers. Stop parsing
+						after non digit detected after separator
+						character or end of string is reached
+	*/
+char* pbx_capi_strsep_controller_list (char** param)
+{
+	char *src, *p;
+
+	if ((param == NULL) || (*param == NULL) || (**param == 0))
+		return NULL;
+
+	if (strchr(*param, '|') != NULL)
+		return (strsep(param, "|"));
+
+	src = *param;
+	p = src - 1;
+	do {
+		p = strchr(p+1, ',');
+	} while ((p != NULL) && (isdigit(p[1]) != 0));
+
+	if (p != NULL)
+		*p++ = 0;
+
+	*param = p;
+
+	return src;
+}

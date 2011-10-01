@@ -54,11 +54,15 @@ extern int cc_add_peer_link_id(struct ast_channel *c);
 extern struct ast_channel *cc_get_peer_link_id(const char *p);
 extern void capi_remove_nullif(struct capi_pvt *i);
 extern struct capi_pvt *capi_mknullif(struct ast_channel *c, unsigned long long controllermask);
-struct capi_pvt *capi_mkresourceif(struct ast_channel *c, unsigned long long controllermask, struct capi_pvt *data_plci_ifc);
+struct capi_pvt *capi_mkresourceif(struct ast_channel *c, unsigned long long controllermask, struct capi_pvt *data_plci_ifc, cc_format_t codecs, int all);
 extern int capi_create_reader_writer_pipe(struct capi_pvt *i);
 extern struct ast_frame *capi_read_pipeframe(struct capi_pvt *i);
 extern int capi_write_frame(struct capi_pvt *i, struct ast_frame *f);
 extern int capi_verify_resource_plci(const struct capi_pvt *i);
+extern const char* pbx_capi_get_cid (const struct ast_channel* c, const char *notAvailableVisual);
+extern const char* pbx_capi_get_callername (const struct ast_channel* c, const char *notAvailableVisual);
+const char* pbx_capi_get_connectedname (const struct ast_channel* c, const char *notAvailableVisual);
+char* pbx_capi_strsep_controller_list (char** param);
 
 #define capi_number(data, strip) \
   capi_number_func(data, strip, alloca(AST_MAX_EXTENSION))
@@ -76,5 +80,18 @@ typedef struct capi_prestruct_s {
 extern MESSAGE_EXCHANGE_ERROR capi_sendf(
 	struct capi_pvt *capii, int waitconf,
 	_cword command, _cdword Id, _cword Number, char * format, ...);
+
+/*!
+	\brief nulliflist
+	*/
+const struct capi_pvt *pbx_capi_get_nulliflist(void);
+/*!
+		\brief cc_mutex_lock(&nullif_lock)
+	*/
+void pbx_capi_nulliflist_lock(void);
+/*!
+		\brief cc_mutex_unlock(&nullif_lock)
+	*/
+void pbx_capi_nulliflist_unlock(void);
 
 #endif

@@ -49,11 +49,17 @@
 #ifndef _PBX_CAPI_H
 #define _PBX_CAPI_H
 
+#ifdef DIVA_STREAMING
+struct _diva_stream_scheduling_entry;
+#endif
+struct _pbx_capi_conference_bridge;
+
 #define CAPI_MAX_CONTROLLERS             64
 #define CAPI_MAX_B3_BLOCKS                7
 
 /* was : 130 bytes Alaw = 16.25 ms audio not suitable for VoIP */
 /* now : 160 bytes Alaw = 20 ms audio */
+/* now : 640 bytes slinear 16000Hz = 20 ms audio */
 /* you can tune this to your need. higher value == more latency */
 #define CAPI_MAX_B3_BLOCK_SIZE          160
 
@@ -66,17 +72,25 @@
 
 #define CAPI_MAX_FACILITYDATAARRAY_SIZE 300
 
+#define COMMANDSEPARATOR "|,"
+
+#ifdef CC_AST_HAS_FORMAT_T
+typedef format_t cc_format_t;
+#else
+typedef int cc_format_t;
+#endif
+
 /* some helper functions */
 static inline void write_capi_word(void *m, unsigned short val)
 {
 	((unsigned char *)m)[0] = val & 0xff;
 	((unsigned char *)m)[1] = (val >> 8) & 0xff;
 }
-static inline unsigned short read_capi_word(void *m)
+static inline unsigned short read_capi_word(const void *m)
 {
 	unsigned short val;
 
-	val = ((unsigned char *)m)[0] | (((unsigned char *)m)[1] << 8);	
+	val = ((const unsigned char *)m)[0] | (((const unsigned char *)m)[1] << 8);	
 	return (val);
 }
 static inline void write_capi_dword(void *m, unsigned int val)
@@ -86,12 +100,12 @@ static inline void write_capi_dword(void *m, unsigned int val)
 	((unsigned char *)m)[2] = (val >> 16) & 0xff;
 	((unsigned char *)m)[3] = (val >> 24) & 0xff;
 }
-static inline unsigned int read_capi_dword(void *m)
+static inline unsigned int read_capi_dword(const void *m)
 {
 	unsigned int val;
 
-	val = ((unsigned char *)m)[0] | (((unsigned char *)m)[1] << 8) |	
-	      (((unsigned char *)m)[2] << 16) | (((unsigned char *)m)[3] << 24);	
+	val = ((const unsigned char *)m)[0] | (((const unsigned char *)m)[1] << 8) |	
+	      (((const unsigned char *)m)[2] << 16) | (((const unsigned char *)m)[3] << 24);	
 	return (val);
 }
 
@@ -223,6 +237,16 @@ typedef struct fax3proto3 B3_PROTO_FAXG3;
 #define EC_ECHOCANCEL_PATH_IP           2 /* Activate EC for IP */
 #define EC_ECHOCANCEL_PATH_BITS         (EC_ECHOCANCEL_PATH_IFC | EC_ECHOCANCEL_PATH_IP)
 
+/*
+	Control EC on transit connectionss
+	*/
+#define EC_ECHOCANCEL_TRANSIT_OFF       0 /* EC deactivated on transit connection, default */
+#define EC_ECHOCANCEL_TRANSIT_A         1 /* EC activated on side A of transsit connection */
+#define EC_ECHOCANCEL_TRANSIT_B         2 /* EC activated on side B of transsit connection */
+#define EC_ECHOCANCEL_TRANSIT_AB        (EC_ECHOCANCEL_TRANSIT_A | EC_ECHOCANCEL_TRANSIT_B)
+#define EC_ECHOCANCEL_TRANSIT_BITS      (EC_ECHOCANCEL_TRANSIT_A | EC_ECHOCANCEL_TRANSIT_B)
+
+
 #define CC_HOLDTYPE_LOCAL               0
 #define CC_HOLDTYPE_HOLD                1
 #define CC_HOLDTYPE_NOTIFY              2
@@ -288,6 +312,9 @@ struct cc_capi_gains {
 #define CAPI_ISDN_STATE_3PTY          0x10000000
 #define CAPI_ISDN_STATE_PBX_DONT      0x40000000
 #define CAPI_ISDN_STATE_PBX           0x80000000
+
+#define CAPI_ISDN_STATE2_PROCEEDING         0x00000001
+#define CAPI_ISDN_STATE2_PROCEEDING_PENDING 0x00000002
 
 #define CAPI_CHANNELTYPE_B            0
 #define CAPI_CHANNELTYPE_D            1
@@ -377,6 +404,7 @@ struct capi_pvt {
 
 	/* the state of the line */
 	unsigned int isdnstate;
+	unsigned int isdnstate2;
 	int cause;
 
 	/* which b-protocol is active */
@@ -455,6 +483,10 @@ struct capi_pvt {
 	unsigned int FaxState;
 	/* Window for fax detection */
 	unsigned int faxdetecttime;
+	/* custom fax context,exten,prio */
+	char faxcontext[AST_MAX_EXTENSION+1];
+	char faxexten[AST_MAX_EXTENSION+1];
+	int faxpriority;
 
 	/* handle for CCBS/CCNR callback */
 	unsigned int ccbsnrhandle;
@@ -474,6 +506,7 @@ struct capi_pvt {
 	float txmin;
 
 	unsigned short divaAudioFlags;
+	unsigned short divaDataStubAudioFlags;
 	unsigned short divaDigitalRxGain;
 	float divaDigitalRxGainDB;
 	unsigned short divaDigitalTxGain;
@@ -513,17 +546,14 @@ struct capi_pvt {
 #else
 	struct ast_rtp *rtp;
 #endif
-#ifdef CC_AST_HAS_FORMAT_T
-	format_t capability;
-#else
-	int capability;
-#endif
+	cc_format_t capability;
 	int rtpcodec;
 	int codec;
 	unsigned int timestamp;
 
 	/* Q.SIG features */
 	int qsigfeat;
+	int divaqsig;
 	struct cc_qsig_data qsig_data;
 
 	/* Resource PLCI data */
@@ -533,7 +563,14 @@ struct capi_pvt {
 	struct capi_pvt *line_plci;
 	/* Resource PLCI data data if line */
 	struct capi_pvt *data_plci;
-	
+
+#ifdef DIVA_STREAMING
+	struct _diva_stream_scheduling_entry* diva_stream_entry;
+#endif
+	/* Connection between two conference rooms. NULL PLCI */
+	int virtualBridgePeer;
+	struct capi_pvt *bridgePeer;
+
 	/*! Next channel in list */
 	struct capi_pvt *next;
 };
@@ -580,9 +617,14 @@ struct cc_capi_conf {
 	int bridge;
 	int amaflags;
 	int qsigfeat;
+	int divaqsig;
 	struct cc_capi_qsig_conf qsigconf;
 	unsigned int faxsetting;
 	unsigned int faxdetecttime;
+	/* custom fax context,exten,prio */
+	char faxcontext[AST_MAX_EXTENSION+1];
+	char faxexten[AST_MAX_EXTENSION+1];
+	int faxpriority;
 	ast_group_t callgroup;
 	ast_group_t pickupgroup;
 	ast_group_t group;
@@ -600,7 +642,37 @@ struct cc_capi_conf {
 	char mohinterpret[MAX_MUSICCLASS];
 #endif
 	int echocancelpath;
+	int econtransitconn;
+
+	int mwifacptynrtype;
+	int mwifacptynrton;
+	int mwifacptynrpres;
+	int mwibasicservice;
+	int mwiinvocation;
+
+	char* mwimailbox;
+
+	int hlimit;
+	int slimit;
 };
+
+struct cc_capi_controller;
+struct _cc_capi_mwi_mailbox;
+typedef struct _cc_capi_mwi_mailbox {
+	AST_LIST_ENTRY(_cc_capi_mwi_mailbox) link;
+	const struct cc_capi_controller *controller;
+	unsigned short basicService;
+	unsigned short invocationMode;
+	unsigned char *mailboxNumber;
+	char          *mailboxContext;
+	unsigned char *controllingUserNumber;
+	unsigned char *controllingUserProvidedNumber;
+#if defined(CC_AST_HAS_EVENT_MWI)
+	struct ast_event_sub* mwiSubscribtion;
+#else
+	void* mwiSubscribtion;
+#endif
+} cc_capi_mwi_mailbox_t;
 
 struct cc_capi_controller {
 	/* which controller is this? */
@@ -611,6 +683,13 @@ struct cc_capi_controller {
 	int nbchannels;
 	/* free bchans */
 	int nfreebchannels;
+	/* Controller considered BUSY amount if free channels below
+		of this level */
+	int nfreebchannelsHardThr;
+	/* If amount of free channels is below this level then
+		try to allocate call on other controler in group
+		where this level is not reached or difference is less */
+	int nfreebchannelsSoftThr;
 	/* features: */
 	int broadband;
 	int dtmf;
@@ -634,20 +713,17 @@ struct cc_capi_controller {
 
 	int divaExtendedFeaturesAvailable;
 	int ecPath;
+	int ecOnTransit;
 	int fax_t30_extended;
+#ifdef DIVA_STREAMING
+	int divaStreaming;
+#endif
+	AST_LIST_HEAD_NOLOCK(, _cc_capi_mwi_mailbox) mwiSubscribtions;
+#ifdef DIVA_STATUS
+	int interfaceState;
+	int hwState;
+#endif
 };
-
-
-/* ETSI 300 102-1 information element identifiers */
-#define CAPI_ETSI_IE_CAUSE                      0x08
-#define CAPI_ETSI_IE_PROGRESS_INDICATOR         0x1e
-#define CAPI_ETSI_IE_CALLED_PARTY_NUMBER        0x70
-#define CAPI_ETSI_IE_FACILITY                   0x1c
-
-/* ETIS 300 102-1 message types */
-#define CAPI_ETSI_ALERTING                      0x01
-#define CAPI_ETSI_SETUP_ACKKNOWLEDGE            0x0d
-#define CAPI_ETSI_DISCONNECT                    0x45
 
 /* ETSI 300 102-1 Numbering Plans */
 #define CAPI_ETSI_NPLAN_SUBSCRIBER              0x40
@@ -701,7 +777,7 @@ extern void cc_start_b3(struct capi_pvt *i);
 extern unsigned char capi_tcap_is_digital(unsigned short tcap);
 extern void capi_queue_cause_control(struct capi_pvt *i, int control);
 extern void capidev_handle_connection_conf(struct capi_pvt **i, unsigned int PLCI,
-    unsigned short wInfo, unsigned short wMsgNum);
+    unsigned short wInfo, unsigned short wMsgNum, struct ast_channel** interface_owner);
 extern void capi_wait_for_answered(struct capi_pvt *i);
 extern int capi_wait_for_b3_up(struct capi_pvt *i);
 extern void capi_activehangup(struct capi_pvt *i, int state);
@@ -712,6 +788,51 @@ extern char chatinfo_usage[];
 
 typedef int (*pbx_capi_command_proc_t)(struct ast_channel *, char *);
 pbx_capi_command_proc_t pbx_capi_lockup_command_by_name(const char* name);
+/*!
+ * \brief returns list of supported by this controller RTP codecs
+ */
+cc_format_t pbx_capi_get_controller_codecs(int controller);
+_cstruct diva_get_b1_conf(struct capi_pvt *i);
+/*!
+	\brief &capi_controllers[controller]
+	*/
+const struct cc_capi_controller *pbx_capi_get_controller(int controller);
+/*!
+	\brief capi_num_controllers
+	*/
+int pbx_capi_get_num_controllers(void);
+/*!
+	\brief tdesc
+	*/
+const char* pbx_capi_get_module_description(void);
+/*!
+	\brief cc_mutex_lock(&iflock)
+	*/
+void pbx_capi_lock_interfaces(void);
+/*!
+	\brief cc_mutex_unlock(&iflock)
+	*/
+void pbx_capi_unlock_interfaces(void);
+/*!
+	\brief Exec cappicommand using CLI
+ */
+int pbx_capi_cli_exec_capicommand(struct ast_channel *chan, const char *data);
+
+/*!
+	\brief EC control
+	*/
+void capi_echo_canceller(struct capi_pvt *i, int function);
+
+#ifdef DIVA_STREAMING
+struct _diva_streaming_vector;
+void capidev_handle_data_b3_indication_vector (struct capi_pvt *i,
+																							 struct _diva_streaming_vector* vind,
+																							 int vind_nr);
+/*!
+ * \brief Return true if Diva streaming supported by CAPI controller
+ */
+int pbx_capi_streaming_supported (struct capi_pvt *i);
+#endif
 
 /* DIVA specific MANUFACTURER definitions */
 #define _DI_MANU_ID         0x44444944
@@ -719,5 +840,16 @@ pbx_capi_command_proc_t pbx_capi_lockup_command_by_name(const char* name);
 #define _DI_DSP_CTRL        0x0003
 #define _DI_OPTIONS_REQUEST 0x0009
 
+#if (!defined(CC_AST_HAS_VERSION_1_4) && !defined(CC_AST_HAS_VERSION_1_6) && !defined(CC_AST_HAS_VERSION_1_8))
+
+#define ast_malloc(__x__)          malloc((__x__))
+#define ast_free(__x__)            free((__x__))
+#define ast_strdup(__x__)          strdup((__x__))
+#define ast_channel_trylock(__x__) ast_mutex_trylock(&(__x__)->lock)
+#define ast_channel_unlock(__x__)  ast_mutex_unlock(&(__x__)->lock)
+#define ast_devstate_prov_add(__a__,__b__) (-1)
+#define ast_devstate_prov_del(__x__) do{}while(0)
+
+#endif
 
 #endif

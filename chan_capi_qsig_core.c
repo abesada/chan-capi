@@ -222,7 +222,7 @@ unsigned char *cc_qsig_asn1_oid2str(unsigned char *data, int size)
 	*s++ = 0;
 	
 	s = buf;
-	return (unsigned char *) strdup((char*)s);
+	return (unsigned char *) ast_strdup((char*)s);
 	
 }
 
@@ -580,7 +580,7 @@ signed int cc_qsig_identifyinvoke(struct cc_qsig_invokedata *invoke, int protoco
 						oidstr = cc_qsig_asn1_oid2str(invoke->oid_bin, invoke->oid_len);
 						if (oidstr) {
 							cc_qsig_verbose( 1, VERBOSE_PREFIX_3 "QSIG: INVOKE OP (%s)\n", oidstr);
-							free(oidstr);
+							ast_free(oidstr);
 						} else {
 							cc_qsig_verbose( 1, VERBOSE_PREFIX_3 "QSIG: INVOKE OP (unknown - OID not displayable)\n");
 						}
@@ -614,7 +614,7 @@ signed int cc_qsig_identifyinvoke(struct cc_qsig_invokedata *invoke, int protoco
 						oidstr = cc_qsig_asn1_oid2str(invoke->oid_bin, invoke->oid_len);
 						if (oidstr) {
 							cc_qsig_verbose( 1, VERBOSE_PREFIX_3 "QSIG: INVOKE OP (%s)\n", oidstr);
-							free(oidstr);
+							ast_free(oidstr);
 						} else {
 							cc_qsig_verbose( 1, VERBOSE_PREFIX_3 "QSIG: INVOKE OP (unknown - OID not displayable)\n");
 						}
@@ -698,16 +698,16 @@ static void pbx_capi_qsig_handle_ctc(struct cc_qsig_invokedata *invoke, struct c
 				switch (ii->state) {
 					case CAPI_STATE_ALERTING:
 						cc_qsig_verbose( 1, VERBOSE_PREFIX_3 "QSIG: peer is in state ALERTING, PATH REPLACE follows after CONNECT...\n");
- 						ii->qsig_data.pr_propose_cid = strdup("123");	/* HACK: need an dynamic ID */
- 						ii->qsig_data.pr_propose_pn = strdup(i->qsig_data.if_pr_propose_pn);
+ 						ii->qsig_data.pr_propose_cid = ast_strdup("123");	/* HACK: need an dynamic ID */
+ 						ii->qsig_data.pr_propose_pn = ast_strdup(i->qsig_data.if_pr_propose_pn);
  						ii->qsig_data.pr_propose_doinboundbridge = 1;
 						i->qsig_data.pr_propose_doinboundbridge = 1;
 						i->qsig_data.partner_plci = ii->PLCI;
 						break;
 					case CAPI_STATE_CONNECTED:
 						cc_qsig_verbose( 1, VERBOSE_PREFIX_3 "QSIG: peer is CONNECTED...\n");
- 						i->qsig_data.pr_propose_cid = strdup("123");	/* HACK: need an dynamic ID */
- 						i->qsig_data.pr_propose_pn = strdup(i->qsig_data.if_pr_propose_pn);
+ 						i->qsig_data.pr_propose_cid = ast_strdup("123");	/* HACK: need an dynamic ID */
+ 						i->qsig_data.pr_propose_pn = ast_strdup(i->qsig_data.if_pr_propose_pn);
 						ii->qsig_data.pr_propose_doinboundbridge = 1;
   						ii->qsig_data.partner_plci = i->PLCI;
 						
@@ -1003,7 +1003,7 @@ unsigned int cc_qsig_add_call_setup_data(unsigned char *data, struct capi_pvt *i
 	}
 		
 	cc_qsig_build_facility_struct(data, &dataidx, protocolvar, APDUINTERPRETATION_IGNORE, &nfe);
-	cc_qsig_encode_ecma_name_invoke(data, &dataidx, &invoke, i, 0, i->owner->cid.cid_name);
+	cc_qsig_encode_ecma_name_invoke(data, &dataidx, &invoke, i, 0, pbx_capi_get_connectedname (i->owner, ""));
 	cc_qsig_add_invoke(data, &dataidx, &invoke, i);
 	
 	if (add_externalinfo) {
@@ -1203,7 +1203,7 @@ int pbx_capi_qsig_ct(struct ast_channel *c, char *param)
 		return -1;
 	}
 
-	marker = strsep(&param, "|");
+	marker = strsep(&param, COMMANDSEPARATOR);
 	
 	callmark = atoi(marker);
 	cc_qsig_verbose( 1, VERBOSE_PREFIX_4 "  * QSIG_CT: using call marker %i(%s)\n", callmark, marker);
@@ -1330,6 +1330,7 @@ void cc_pbx_qsig_conf_interface_value(struct cc_capi_conf *conf, struct ast_vari
 }
 
 	CONF_INTEGER(conf->qsigfeat, "qsig")
+	CONF_TRUE(conf->divaqsig, "divaqsig", 1)
 	CONF_STRING(conf->qsigconf.if_pr_propose_pn, "qsig_prnum")
 
 	
@@ -1351,15 +1352,15 @@ static void qsig_cleanup_channel(struct  capi_pvt *i)
 	i->qsig_data.pr_propose_sentback = 0;
 	i->qsig_data.pr_propose_doinboundbridge = 0;
 	if (i->qsig_data.pr_propose_cid) {
-		free(i->qsig_data.pr_propose_cid);
+		ast_free(i->qsig_data.pr_propose_cid);
 		i->qsig_data.pr_propose_cid = NULL;
 	}
 	if (i->qsig_data.pr_propose_pn) {
-		free(i->qsig_data.pr_propose_pn);
+		ast_free(i->qsig_data.pr_propose_pn);
 		i->qsig_data.pr_propose_pn = NULL;
 	}
 	if (i->qsig_data.dnameid) {
-		free(i->qsig_data.dnameid);
+		ast_free(i->qsig_data.dnameid);
 		i->qsig_data.dnameid = NULL;
 	}
 	
@@ -1528,8 +1529,8 @@ void pbx_capi_qsig_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsign
 							ii->qsig_data.pr_propose_sentback = 1;
 						} else { /* Path Replacement has to be sent back after Connect on second line */
 							ii->qsig_data.pr_propose_sendback = 1;
-							ii->qsig_data.pr_propose_cid = strdup(i->qsig_data.pr_propose_cid);
-							ii->qsig_data.pr_propose_pn = strdup(i->qsig_data.pr_propose_pn);
+							ii->qsig_data.pr_propose_cid = ast_strdup(i->qsig_data.pr_propose_cid);
+							ii->qsig_data.pr_propose_pn = ast_strdup(i->qsig_data.pr_propose_pn);
 							ii->qsig_data.pr_propose_active = 1;
 						}
 					} else 
@@ -1537,9 +1538,9 @@ void pbx_capi_qsig_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsign
 					
 
 								
-					free(i->qsig_data.pr_propose_cid);
+					ast_free(i->qsig_data.pr_propose_cid);
 					i->qsig_data.pr_propose_cid = NULL;
-					free(i->qsig_data.pr_propose_pn);
+					ast_free(i->qsig_data.pr_propose_pn);
 					i->qsig_data.pr_propose_pn = NULL;
 				}
 				
@@ -1553,9 +1554,9 @@ void pbx_capi_qsig_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsign
 						ast_channel_masquerade(ii->owner, chanx);
 					}
 					
-					free(i->qsig_data.pr_propose_cid);
+					ast_free(i->qsig_data.pr_propose_cid);
 					i->qsig_data.pr_propose_cid = NULL;
-					free(i->qsig_data.pr_propose_pn);
+					ast_free(i->qsig_data.pr_propose_pn);
 					i->qsig_data.pr_propose_pn = NULL;
 				}			
 				
@@ -1612,9 +1613,9 @@ void pbx_capi_qsig_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsign
 					);
 					
 					i->qsig_data.pr_propose_sendback = 0;
- 					free(i->qsig_data.pr_propose_cid);
+ 					ast_free(i->qsig_data.pr_propose_cid);
 					i->qsig_data.pr_propose_cid = NULL;
- 					free(i->qsig_data.pr_propose_pn);
+ 					ast_free(i->qsig_data.pr_propose_pn);
 					i->qsig_data.pr_propose_pn = NULL;
 					
 					i->qsig_data.pr_propose_sentback = 1;
@@ -1640,9 +1641,9 @@ void pbx_capi_qsig_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsign
 							"()(()()()s)", fac  );
 					
 					i->qsig_data.pr_propose_sendback = 0;
-					free(i->qsig_data.pr_propose_cid);
+					ast_free(i->qsig_data.pr_propose_cid);
 					i->qsig_data.pr_propose_cid = NULL;
-					free(i->qsig_data.pr_propose_pn);
+					ast_free(i->qsig_data.pr_propose_pn);
 					i->qsig_data.pr_propose_pn = NULL;
 					
 					i->qsig_data.pr_propose_sentback = 1;

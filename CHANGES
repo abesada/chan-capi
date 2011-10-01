@@ -1,6 +1,37 @@
 CHANGES
 =======
 
+HEAD
+------------------
+- added dialplan variables ISDNPI1 and ISDNPI2
+- Support for 'divastreaming' available (Diva 4PRI PCI, Diva 2PRI PCI,
+  Diva 4PRI HS PCIe, Diva 2PRI HS PCIe, Diva 1PRI HS PCIe,
+  Diva 8PRI PCIe FS, Diva 4PRI PCIe FS)
+- Fixed memory leak in chat_play if using with 's' option
+- Add 'econtransitconn' configurations parameter. Allows to preserve
+  EC for transit connections
+- added variable DISCONNECT_IND_REASON to get real reason code from CAPI
+- added capicommand(keypad)
+- added log of FACILITY_IND for call deflect suplementary service
+- malloc,strdup,free -> ast_(malloc,strdup,free)
+- Use Diva streaming for NULL PLCI and for resource PLCI
+- Resolved http://www.ipphoneforum.eu/showthread.php?t=220051
+- Use Diva QSIG CAPI extensions for processing of Calling Party Name
+- Add Slinear
+- Add HD voice using G.722, Siren7, Siren14 and Slinear16
+- added faxdestination= to capi.conf to configure custom context,exten,prio.
+- allow capicommand option separator "|" and ",".
+- Add MWI server
+- Add MWI client
+- Improved call distribution algorithm for outgoing calls
+- Add 'capi ifcstate', 'capi exec', 'capi show resources' and
+  'chat manage remove' CLI commands
+- Add AMI 'Capichat[List,Mute,Unmute,Remove]' and 'CapiCommand' actions and
+  Capichat[List,ListComplete,Join,Leave,End] events
+- Add device state events for char rooms (capichat:[roomname]) and for
+  interface state (ISDN/I[N]/congestion)
+- Add access to Diva trace driver
+
 chan_capi-1.1.5
 ------------------
 - corrected check for Info value on CONNECT_B3_CONF

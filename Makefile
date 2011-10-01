@@ -18,6 +18,10 @@
 
 OSNAME=${shell uname}
 
+DIVA_STREAMING=0
+DIVA_STATUS=0
+DIVA_VERBOSE=0
+
 USE_OWN_LIBCAPI=yes
 
 .EXPORT_ALL_VARIABLES:
@@ -78,6 +82,16 @@ INCLUDE=
 LIBLINUX=-lcapi20
 endif
 
+ifeq (${DIVA_STREAMING},1)
+INCLUDE += -I./divastreaming -I./divastreaming/..
+endif
+
+ifeq (${DIVA_STATUS},1)
+INCLUDE += -I./divastatus -I./divastatus/..
+endif
+
+INCLUDE += -I./divaverbose
+
 DEBUG=-g #-pg
 INCLUDE+= -I$(ASTERISK_HEADER_DIR)
 ifndef C4B
@@ -100,6 +114,20 @@ CFLAGS+=$(OPTIMIZE)
 CFLAGS+=-O2
 CFLAGS+=$(shell if $(CC) -march=$(PROC) -S -o /dev/null -xc /dev/null >/dev/null 2>&1; then echo "-march=$(PROC)"; fi)
 CFLAGS+=$(shell if uname -m | grep -q "ppc\|arm\|s390"; then echo "-fsigned-char"; fi)
+ifeq (${DIVA_STREAMING},1)
+CFLAGS += -DDIVA_STREAMING=1
+endif
+ifeq (${DIVA_STATUS},1)
+CFLAGS += -DDIVA_STATUS=1
+
+CFLAGS+=$(shell echo '\#include <sys/inotify.h>' > /tmp/test.c 2>/dev/null && \
+                echo 'int main(int argc,char**argv){if(inotify_init()>=0)return 0; return 1;}' >> /tmp/test.c 2>/dev/null && \
+                $(CC) /tmp/test.c -o /tmp/test && /tmp/test >/dev/null 2>&1 && echo '-DCC_USE_INOTIFY=1'; rm -f /tmp/test.c /tmp/test)
+endif
+ifeq (${DIVA_VERBOSE},1)
+CFLAGS += -DDIVA_VERBOSE=1
+endif
+
 
 LIBS=-ldl -lpthread -lm
 CC=gcc
@@ -109,10 +137,30 @@ SHAREDOS=chan_capi.so
 
 OBJECTS=chan_capi.o chan_capi_utils.o chan_capi_rtp.o chan_capi_command.o xlaw.o dlist.o	\
 	chan_capi_qsig_core.o chan_capi_qsig_ecma.o chan_capi_qsig_asn197ade.o	\
-	chan_capi_qsig_asn197no.o chan_capi_supplementary.o chan_capi_chat.o
+	chan_capi_qsig_asn197no.o chan_capi_supplementary.o chan_capi_chat.o \
+	chan_capi_mwi.o chan_capi_cli.o chan_capi_ami.o chan_capi_management_common.o \
+	chan_capi_devstate.o
 
 ifeq (${USE_OWN_LIBCAPI},yes)
 OBJECTS += libcapi20/convert.o libcapi20/capi20.o libcapi20/capifunc.o
+endif
+
+ifeq (${DIVA_STREAMING},1)
+OBJECTS += divastreaming/diva_streaming_idi_host_ifc_impl.o \
+           divastreaming/diva_streaming_idi_host_rx_ifc_impl.o \
+           divastreaming/diva_streaming_manager.o \
+           divastreaming/diva_streaming_messages.o \
+           divastreaming/segment_alloc.o \
+           divastreaming/chan_capi_divastreaming_utils.o \
+           divastreaming/runtime.o
+endif
+
+ifeq (${DIVA_STATUS},1)
+OBJECTS += divastatus/divastatus.o
+endif
+
+ifeq (${DIVA_VERBOSE},1)
+OBJECTS += divaverbose/divaverbose.o
 endif
 
 CFLAGS+=-Wno-missing-prototypes -Wno-missing-declarations
@@ -131,6 +179,15 @@ clean:
 	rm -f config.h
 	rm -f *.so *.o
 	rm -f libcapi20/*.o
+	rm -f divastreaming/*.o
+	rm -f divastatus/*.o
+	rm -f divaverbose/*.o
+
+distclean: clean
+	rm -f $(MODULES_DIR)/$(SHAREDOS)
+
+sysclean: distclean
+	rm -f $(MODULES_DIR)/*.so
 
 config.h:
 	./create_config.sh "$(ASTERISK_HEADER_DIR)"

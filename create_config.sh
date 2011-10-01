@@ -50,8 +50,16 @@ echo "#define CHAN_CAPI_CONFIG_H" >>$CONFIGFILE
 echo >>$CONFIGFILE
 
 case "$AVERSIONNUM" in
+	108*)
+		echo "#define CC_AST_HAS_VERSION_1_6" >>$CONFIGFILE
+		echo "#define CC_AST_HAS_VERSION_1_8" >>$CONFIGFILE
+		echo "#define CC_AST_HAS_EVENT_MWI"   >>$CONFIGFILE
+		echo " * found Asterisk version 1.8"
+		VER=1_8
+		;;
 	106*)
 		echo "#define CC_AST_HAS_VERSION_1_6" >>$CONFIGFILE
+		echo "#define CC_AST_HAS_EVENT_MWI"   >>$CONFIGFILE
 		echo " * found Asterisk version 1.6"
 		VER=1_6
 		;;
@@ -235,6 +243,15 @@ check_version_onesix()
 		echo "#undef CC_AST_HAS_RTP_ENGINE_H" >>$CONFIGFILE
 		echo " * no rtp_engine.h"
 	fi
+	if [ -f $INCLUDEDIR/netsock2.h ]; then
+		if grep -q "struct ast_sockaddr " $INCLUDEDIR/netsock2.h; then
+			echo "#define CC_AST_HAS_AST_SOCKADDR" >>$CONFIGFILE
+			echo " * found ast_sockaddr structure"
+		else
+			echo "#undef CC_AST_HAS_AST_SOCKADDR" >>$CONFIGFILE
+			echo " * no ast_sockaddr structure"
+		fi
+	fi
 }
 
 case $VER in
@@ -248,6 +265,10 @@ case $VER in
 		;;
 	1_6)
 		echo "Using Asterisk 1.6 API"
+		check_version_onesix
+		;;
+	1_8)
+		echo "Using Asterisk 1.8 API"
 		check_version_onesix
 		;;
 	*)
