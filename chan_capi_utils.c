@@ -135,8 +135,10 @@ void capi_remove_nullif(struct capi_pvt *i)
 			}
 			cc_verbose(3, 1, VERBOSE_PREFIX_4 "%s: removed null-interface from controller %d.\n",
 				i->vname, i->controller);
-			if (i->smoother)
+			if (i->smoother) {
 				ast_smoother_free(i->smoother);
+				i->smoother = 0;
+			}
 			cc_mutex_destroy(&i->lock);
 			ast_cond_destroy(&i->event_trigger);
 			controller_nullplcis[i->controller - 1]--;
@@ -301,9 +303,9 @@ struct capi_pvt *capi_mkresourceif(
 	} else {
 		controller = data_plci_ifc->controller;
 		codecs = (all != 0) ? pbx_capi_get_controller_codecs (controller) : codecs;
-		fmt = pbx_capi_get_controller_codecs (controller) & codecs & c->nativeformats;
+		fmt = pbx_capi_get_controller_codecs (controller) & codecs & cc_get_formats_as_bits(c->nativeformats);
 		if (fmt != 0)
-			fmt = ast_best_codec(fmt);
+			fmt = cc_get_best_codec_as_bits(fmt);
 	}
 
 	data_ifc = ast_malloc(sizeof(struct capi_pvt));
@@ -1458,10 +1460,10 @@ int capi_write_frame(struct capi_pvt *i, struct ast_frame *f)
 		return 0;
 	}
 	if (i->isdnstate & CAPI_ISDN_STATE_RTP) {
-		if (unlikely((!(FRAME_SUBCLASS_CODEC(f->subclass) & i->codec)) &&
-		    (FRAME_SUBCLASS_CODEC(f->subclass) != capi_capability))) {
+		if (unlikely((!(GET_FRAME_SUBCLASS_CODEC(f->subclass) & i->codec)) &&
+		    (GET_FRAME_SUBCLASS_CODEC(f->subclass) != capi_capability))) {
 			cc_log(LOG_ERROR, "don't know how to write subclass %s(%d)\n",
-				ast_getformatname(FRAME_SUBCLASS_CODEC(f->subclass)),
+				cc_getformatname(GET_FRAME_SUBCLASS_CODEC(f->subclass)),
 					FRAME_SUBCLASS_INTEGER(f->subclass));
 			return 0;
 		}
