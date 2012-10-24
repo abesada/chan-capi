@@ -60,8 +60,8 @@ struct _diva_streaming_vector* vind;
 #include "chan_capi_devstate.h"
 #include "divaverbose.h"
 
-/* #define CC_VERSION "x.y.z" */
-#define CC_VERSION "$Revision$"
+#define CC_VERSION "1.1.6"
+/* #define CC_VERSION "$Revision$" */
 
 /*
  * personal stuff
