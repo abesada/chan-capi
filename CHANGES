@@ -9,6 +9,7 @@ HEAD
 - added 't' option to select in-band tones available indication as Q.931
   (thanks to Maciej S. Szmigiero <mail@maciej.szmigiero.name>)
 - support for Asterisk 13 (thanks to Michael Kuron <m.kuron@gmx.de>)
+- fixed check of asterisk version with asterisk binary if another install path is used.
 
 
 chan_capi-1.1.6

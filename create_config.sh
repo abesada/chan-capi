@@ -37,12 +37,14 @@ if [ "$AVERSION" = "" ]; then
 	# modules like chan_capi, as there's no library implementing these functions,
 	# so linking will always fail.
 	# Workaround that by trying to run asterisk -V and parse the output.
+	LD_LIBRARY_PATH=$INSTALL_PREFIX/usr/lib:$LD_LIBRARY_PATH
+	export LD_LIBRARY_PATH
 	AVERSION=$("$AST_BINARY" -V)
 
 	if [ $? -eq 0 ]; then
 		AVERSION="$(echo "$AVERSION" | sed -e 's/Asterisk //g')"
 		AVERSIONNUM="$(echo "$AVERSION" |sed -e 's/\.//g')"
-		echo $AVERSIONNUM | grep -q GIT
+		echo $AVERSIONNUM | grep -q GIT >/dev/null 2>&1
 		if [ $? -eq 0 ]; then
 			AVERSIONNUM=$(echo $AVERSIONNUM | awk -F '-' '{print $2}')
 		fi
@@ -68,6 +70,15 @@ echo "#define CHAN_CAPI_CONFIG_H" >>$CONFIGFILE
 echo >>$CONFIGFILE
 
 case "$AVERSIONNUM" in
+	14*)
+		echo "#define CC_AST_HAS_VERSION_1_6" >>$CONFIGFILE
+		echo "#define CC_AST_HAS_VERSION_1_8" >>$CONFIGFILE
+		echo "#define CC_AST_HAS_VERSION_10_0" >>$CONFIGFILE
+		echo "#define CC_AST_HAS_VERSION_11_0" >>$CONFIGFILE
+		echo "#define CC_AST_HAS_VERSION_13_0" >>$CONFIGFILE
+		echo " * found Asterisk version 14"
+		VER=14_0
+		;;
 	13*)
 		echo "#define CC_AST_HAS_VERSION_1_6" >>$CONFIGFILE
 		echo "#define CC_AST_HAS_VERSION_1_8" >>$CONFIGFILE
@@ -332,6 +343,10 @@ case $VER in
 		;;
 	13_0)
 		echo "Using Asterisk 13.0 API"
+		check_version_onesix
+		;;
+	14_0)
+		echo "Using Asterisk 14.0 API"
 		check_version_onesix
 		;;
 	*)
