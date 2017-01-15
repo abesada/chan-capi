@@ -43,6 +43,9 @@
 #ifdef CC_AST_HAS_VERSION_1_4
 #include "asterisk/abstract_jb.h"
 #endif
+#ifdef CC_AST_HAS_VERSION_13_0
+#include <asterisk/format_compatibility.h>
+#endif
 #include "asterisk/musiconhold.h"
 #include "dlist.h"
 #include "chan_capi_fmt.h"
@@ -149,15 +152,18 @@ static inline unsigned int read_capi_dword(const void *m)
 #define FRAME_DATA_PTR data
 #endif
 
-#ifdef CC_AST_HAS_UNION_SUBCLASS_IN_FRAME
+#if defined(CC_AST_HAS_UNION_SUBCLASS_IN_FRAME) || defined(CC_AST_HAS_VERSION_13_0)
 #define FRAME_SUBCLASS_INTEGER(x) x.integer
 
 #ifndef CC_AST_HAS_VERSION_10_0
 #define SET_FRAME_SUBCLASS_CODEC(__a__,__b__) do {(__a__).codec = (__b__); }while(0)
 #define GET_FRAME_SUBCLASS_CODEC(__a__) (__a__).codec
-#else
+#elif !defined(CC_AST_HAS_VERSION_13_0)
 #define SET_FRAME_SUBCLASS_CODEC(__a__,__b__) do{ ast_format_from_old_bitfield(&(__a__).format, __b__); } while(0)
 #define GET_FRAME_SUBCLASS_CODEC(__a__)       ast_format_to_old_bitfield(&(__a__).format)
+#else
+#define SET_FRAME_SUBCLASS_CODEC(__a__,__b__) do{ (__a__).format = ast_format_compatibility_bitfield2format(__b__); } while(0)
+#define GET_FRAME_SUBCLASS_CODEC(__a__)       ast_format_compatibility_format2bitfield((__a__).format)
 #endif
 
 #else
@@ -648,7 +654,9 @@ struct cc_capi_conf {
 	ast_group_t transfergroup;
 	float rxgain;
 	float txgain;
+#ifndef CC_AST_HAS_VERSION_13_0
 	struct ast_codec_pref prefs;
+#endif
 #ifdef CC_AST_HAS_FORMAT_T
 	format_t capability;
 #else

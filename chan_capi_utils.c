@@ -43,6 +43,10 @@
 #define CC_HW_STATE_OK(__x__) (1)
 #endif
 
+#ifdef CC_AST_HAS_VERSION_13_0
+#include "asterisk/smoother.h"
+#endif
+
 int capidebug = 0;
 char *emptyid = "\0";
 

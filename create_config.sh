@@ -42,6 +42,10 @@ if [ "$AVERSION" = "" ]; then
 	if [ $? -eq 0 ]; then
 		AVERSION="$(echo "$AVERSION" | sed -e 's/Asterisk //g')"
 		AVERSIONNUM="$(echo "$AVERSION" |sed -e 's/\.//g')"
+		echo $AVERSIONNUM | grep -q GIT
+		if [ $? -eq 0 ]; then
+			AVERSIONNUM=$(echo $AVERSIONNUM | awk -F '-' '{print $2}')
+		fi
 		# Set VER later automatically based on $AVERSIONNUM.
 	else
 		AVERSION="trunk"
@@ -64,6 +68,15 @@ echo "#define CHAN_CAPI_CONFIG_H" >>$CONFIGFILE
 echo >>$CONFIGFILE
 
 case "$AVERSIONNUM" in
+	13*)
+		echo "#define CC_AST_HAS_VERSION_1_6" >>$CONFIGFILE
+		echo "#define CC_AST_HAS_VERSION_1_8" >>$CONFIGFILE
+		echo "#define CC_AST_HAS_VERSION_10_0" >>$CONFIGFILE
+		echo "#define CC_AST_HAS_VERSION_11_0" >>$CONFIGFILE
+		echo "#define CC_AST_HAS_VERSION_13_0" >>$CONFIGFILE
+		echo " * found Asterisk version 13"
+		VER=13_0
+		;;
 	11*)
 		echo "#define CC_AST_HAS_VERSION_1_6" >>$CONFIGFILE
 		echo "#define CC_AST_HAS_VERSION_1_8" >>$CONFIGFILE
@@ -315,6 +328,10 @@ case $VER in
 		;;
 	11_0)
 		echo "Using Asterisk 11.0 API"
+		check_version_onesix
+		;;
+	13_0)
+		echo "Using Asterisk 13.0 API"
 		check_version_onesix
 		;;
 	*)

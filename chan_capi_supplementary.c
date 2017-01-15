@@ -373,6 +373,9 @@ static void	ccbsnr_remote_user_free(_cmsg *CMSG, char type, unsigned int PLCI, _
 	c = ast_channel_alloc(0, state, handlename, NULL,
 #ifdef CC_AST_HAS_EXT2_CHAN_ALLOC
 		0, ccbsnr->exten, ccbsnr->context,
+#ifdef CC_AST_HAS_VERSION_13_0
+		NULL, NULL,
+#endif
 #ifdef CC_AST_HAS_LINKEDID_CHAN_ALLOC
 		NULL,
 #endif
@@ -448,6 +451,10 @@ static void	ccbsnr_remote_user_free(_cmsg *CMSG, char type, unsigned int PLCI, _
 		cc_verbose(2, 1, VERBOSE_PREFIX_2 "contr%d: started PBX for CCBS/CCNR callback (%s/%s/%d)\n",
 			PLCI & 0xff, ccbsnr->context, ccbsnr->exten, ccbsnr->priority);
 	}
+
+#ifdef CC_AST_HAS_VERSION_13_0
+	ast_channel_unlock(c);
+#endif
 }
 
 /*

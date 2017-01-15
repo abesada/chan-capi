@@ -1550,8 +1550,13 @@ void pbx_capi_qsig_handle_info_indication(_cmsg *CMSG, unsigned int PLCI, unsign
 					
 					if (ii) {
 						cc_qsig_verbose( 1, VERBOSE_PREFIX_4 "  * QSIG_PATHREPLACEMENT_PROPOSE: trying to complete bridge...\n");
+#ifdef CC_AST_HAS_VERSION_13_0
+						chanx = ast_channel_bridge_peer(i->owner);
+						ast_channel_move(ii->owner, chanx);
+#else
 						chanx = ast_bridged_channel(i->owner);
 						ast_channel_masquerade(ii->owner, chanx);
+#endif
 					}
 					
 					ast_free(i->qsig_data.pr_propose_cid);
