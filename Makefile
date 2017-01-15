@@ -72,7 +72,7 @@ endif
 endif
 endif
 
-AVERSION=$(shell if grep -q "VERSION_NUM 0104" $(ASTERISK_HEADER_DIR)/asterisk/version.h; then echo V1_4; fi)
+AVERSION=$(shell if grep -q "VERSION_NUM 0104" $(ASTERISK_HEADER_DIR)/asterisk/version.h; then echo V1_4; fi 2>/dev/null)
 
 ifeq (${USE_OWN_LIBCAPI},yes)
 INCLUDE= -I./libcapi20 
