@@ -10,6 +10,7 @@ HEAD
   (thanks to Maciej S. Szmigiero <mail@maciej.szmigiero.name>)
 - support for Asterisk 13 (thanks to Michael Kuron <m.kuron@gmx.de>)
 - fixed check of asterisk version with asterisk binary if another install path is used.
+- remove codec 'none' from translation path which prevents bridge.
 
 
 chan_capi-1.1.6

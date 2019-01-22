@@ -76,6 +76,7 @@ static inline void cc_add_formats(struct ast_format_cap *fmts, unsigned int diva
 		if ((divaFormats & ccCodec) != 0) {
 #ifdef CC_AST_HAS_VERSION_13_0
 			struct ast_format * id = ccCodec2AstCodec (ccCodec);
+			ast_format_cap_remove_by_type(fmts, AST_MEDIA_TYPE_AUDIO);
 			ast_format_cap_append(fmts, id, 0);
 #else
 			enum ast_format_id id = ccCodec2AstCodec (ccCodec);
@@ -201,6 +202,7 @@ static inline int cc_get_best_codec_as_bits(int src)
 			struct ast_format *format;
 
 			format = ast_format_compatibility_bitfield2format(mask);
+			ast_format_cap_remove_by_type(dst, AST_MEDIA_TYPE_AUDIO);
 			if (format && ast_format_cap_append(dst, format, 0)) {
 				return 0;
 			}

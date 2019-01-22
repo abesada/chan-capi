@@ -9422,6 +9422,7 @@ int load_module(void)
   } else {
 #ifdef CC_AST_HAS_VERSION_13_0
 	  struct ast_format * fmt = ast_format_alaw;
+	  ast_format_cap_remove_by_type(capi_tech.capabilities, AST_MEDIA_TYPE_AUDIO);
 	  ast_format_cap_append(capi_tech.capabilities, fmt, 0);
 #else
 		struct ast_format fmt;
