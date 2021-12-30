@@ -65,6 +65,9 @@ struct _diva_streaming_vector* vind;
 #include "chan_capi_devstate.h"
 #include "divaverbose.h"
 
+#define CAPI_DTMF_MIN_TONE_DURATION    60 //50 or 60
+#define CAPI_DTMF_MIN_GAP_DURATION     80
+
 /* #define CC_VERSION "x.y.z" */
 #define CC_VERSION "$Revision$"
 
@@ -859,8 +862,8 @@ static int capi_detect_dtmf(struct capi_pvt *i, int flag)
 		"w(www()())",
 		((i->channeltype != CAPI_CHANNELTYPE_NULL) || (i->line_plci != 0)) ?  FACILITYSELECTOR_DTMF : PRIV_SELECTOR_DTMF_ONDATA,
 		(flag == 1) ? 1:2,  /* start/stop DTMF listen */
-		CAPI_DTMF_DURATION,
-		CAPI_DTMF_DURATION
+		CAPI_DTMF_MIN_TONE_DURATION,
+		CAPI_DTMF_MIN_GAP_DURATION
 	);
 
 	if (error != 0) {
@@ -1023,8 +1026,8 @@ static int capi_send_dtmf_digits(struct capi_pvt *i, char digit)
 		"w(www(b)())",
 		FACILITYSELECTOR_DTMF,
 		3,	/* send DTMF digit */
-		CAPI_DTMF_DURATION,	/* XXX: duration comes from asterisk in 1.4 */
-		CAPI_DTMF_DURATION,
+		CAPI_DTMF_MIN_TONE_DURATION,	/* XXX: duration comes from asterisk in 1.4 */
+		CAPI_DTMF_MIN_GAP_DURATION,
 		digit
 	);
 		

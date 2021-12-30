@@ -1,3 +1,5 @@
+DTMF detection issue source: https://wiki.freepbx.org/pages/viewpage.action?pageId=98700176
+
 chan_capi a Common ISDN API 2.0 implementation for Asterisk
 
  Copyright (C) 2005-2010 Cytronics & Melware
